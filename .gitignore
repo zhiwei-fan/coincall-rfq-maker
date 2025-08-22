@@ -1,0 +1,21 @@
+# Environment Variables
+.env
+
+# uv virtual environment
+.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Optional: uv lock file (if not committing for reproducibility)
+uv.lock
+
+# IDE specific files
+.vscode/
+.idea/
