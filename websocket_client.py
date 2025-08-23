@@ -7,14 +7,17 @@ import logging
 import time
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.protocol import State
 
 from typing import Callable, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
-from dotenv import load_dotenv
+# Setup logging BEFORE other imports
+from logging_config import setup_logging
+setup_logging()
 
-# Configure logging
+# Get logger for this module
 logger = logging.getLogger(__name__)
 
 class ConnectionState(Enum):
@@ -41,7 +44,7 @@ class WebSocketConfig:
     """Configuration for WebSocket connection"""
     api_key: str
     api_secret: str
-    base_url: str = "wss://ws.coincall.com/options"
+    base_url: str = "wss://betaws.seizeyouralpha.com/options"
     heartbeat_interval: int = 30
     reconnect_delay: int = 5
     max_reconnect_attempts: int = 10
@@ -183,7 +186,7 @@ class WebSocketManager:
     
     async def subscribe(self, data_type: str):
         """Subscribe to a specific data channel"""
-        if not self.ws or self.ws.closed:
+        if not self.ws or self.ws.state != State.OPEN:
             logger.error("Cannot subscribe: WebSocket not connected")
             return False
         
@@ -204,7 +207,7 @@ class WebSocketManager:
     
     async def unsubscribe(self, data_type: str):
         """Unsubscribe from a data channel"""
-        if not self.ws or self.ws.closed:
+        if not self.ws or self.ws.state != State.OPEN:
             return False
         
         try:
@@ -223,7 +226,7 @@ class WebSocketManager:
     
     async def send_message(self, message: dict[str, Any]):
         """Send a message through WebSocket"""
-        if not self.ws or self.ws.closed:
+        if not self.ws or self.ws.state != State.OPEN:
             logger.error("Cannot send message: WebSocket not connected")
             return False
         
@@ -241,7 +244,7 @@ class WebSocketManager:
         """Send periodic heartbeat messages"""
         while self.running:
             try:
-                if self.ws and not self.ws.closed:
+                if self.ws and self.ws.state == State.OPEN:
                     await self.send_message({"action": "heartbeat"})
                     self.last_heartbeat_time = time.time()
                     
@@ -255,7 +258,7 @@ class WebSocketManager:
         """Main message handling loop"""
         while self.running:
             try:
-                if not self.ws or self.ws.closed:
+                if not self.ws or self.ws.state != State.OPEN:
                     await asyncio.sleep(1)
                     continue
                 
@@ -298,14 +301,14 @@ class WebSocketManager:
         """Process and route incoming messages"""
         try:
             data = json.loads(raw_message)
+            logger.debug(f"Raw message: {raw_message}")
             
             # Determine message type
-            dt = data.get('dt')
-            msg_type = self._get_message_type(dt)
+            msg_type = self._get_message_type(data)
             
             # Log message based on type
-            if msg_type != MessageType.HEARTBEAT:
-                logger.debug(f"Received {msg_type.name}: {data.get('c', 'unknown code')}")
+            if msg_type == MessageType.ERROR:
+                logger.info(f"Received unknown message: {raw_message}")
             
             # Execute callbacks
             if msg_type in self.callbacks:
@@ -333,16 +336,28 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Callback execution failed: {e}")
     
-    def _get_message_type(self, dt: Optional[int]) -> MessageType:
-        """Map data type code to MessageType enum"""
-        mapping = {
-            28: MessageType.RFQ_MAKER,
-            20: MessageType.RFQ_QUOTE,
-            22: MessageType.BLOCK_TRADE_DETAIL,
-            23: MessageType.BLOCK_TRADE_PUBLIC,
-            1: MessageType.HEARTBEAT,
-        }
-        return mapping.get(dt, MessageType.ERROR)
+    def _get_message_type(self, data: dict) -> MessageType:
+        """Map message to MessageType enum"""
+        # Check for subscription success messages
+        if data.get('action') == 'SUBSCRIBE' and data.get('result') == 'success':
+            return MessageType.SUBSCRIPTION_SUCCESS
+        
+        # Check for heartbeat (c=11, rc=1)
+        if data.get('c') == 11 and data.get('rc') == 1:
+            return MessageType.HEARTBEAT
+        
+        # Check for data type field
+        dt = data.get('dt')
+        if dt is not None:
+            mapping = {
+                28: MessageType.RFQ_MAKER,
+                20: MessageType.RFQ_QUOTE,
+                22: MessageType.BLOCK_TRADE_DETAIL,
+                23: MessageType.BLOCK_TRADE_PUBLIC,
+            }
+            return mapping.get(dt, MessageType.ERROR)
+        
+        return MessageType.ERROR
     
     async def _reconnect(self):
         """Handle reconnection logic"""
@@ -375,7 +390,7 @@ class WebSocketManager:
             try:
                 await asyncio.sleep(10)  # Check every 10 seconds
                 
-                if self.ws and not self.ws.closed:
+                if self.ws and self.ws.state == State.OPEN:
                     # Check if we're receiving heartbeats
                     time_since_heartbeat = time.time() - self.last_heartbeat_time
                     time_since_message = time.time() - self.last_message_time
@@ -463,105 +478,3 @@ class WebSocketManager:
         await self.stop()
 
 
-# Example usage with the RFQ Market Maker Bot
-class RFQMarketMakerIntegration:
-    """Example integration with RFQ Market Maker Bot"""
-    
-    def __init__(self, api_key: str, api_secret: str):
-        # Configure WebSocket
-        ws_config = WebSocketConfig(
-            api_key=api_key,
-            api_secret=api_secret,
-            heartbeat_interval=30,
-            reconnect_delay=5,
-            max_reconnect_attempts=10
-        )
-        
-        self.ws_manager = WebSocketManager(ws_config)
-        
-        # Register callbacks for different message types
-        self.ws_manager.register_callback(
-            MessageType.RFQ_MAKER,
-            self.handle_rfq
-        )
-        self.ws_manager.register_callback(
-            MessageType.RFQ_QUOTE,
-            self.handle_quote_update
-        )
-        self.ws_manager.register_callback(
-            MessageType.BLOCK_TRADE_DETAIL,
-            self.handle_trade
-        )
-    
-    async def handle_rfq(self, data: dict):
-        """Handle incoming RFQ"""
-        rfq_data = data.get('d', {})
-        request_id = rfq_data.get('requestId')
-        state = rfq_data.get('state')
-        
-        logger.info(f"Received RFQ {request_id} with state {state}")
-        
-        # Process RFQ for quoting
-        if state == "ACTIVE":
-            # Your RFQ processing logic here
-            pass
-    
-    async def handle_quote_update(self, data: dict):
-        """Handle quote status updates"""
-        quote_data = data.get('d', {})
-        quote_id = quote_data.get('quoteId')
-        state = quote_data.get('state')
-        
-        logger.info(f"Quote {quote_id} updated to {state}")
-        
-        # Update internal quote tracking
-        # Your quote management logic here
-    
-    async def handle_trade(self, data: dict):
-        """Handle executed trades"""
-        trade_data = data.get('d', {})
-        trade_id = trade_data.get('blockTradeId')
-        
-        logger.info(f"Trade executed: {trade_id}")
-        
-        # Update positions and risk
-        # Your trade processing logic here
-    
-    async def run(self):
-        """Run the market maker"""
-        async with self.ws_manager:
-            # Get initial stats
-            stats = self.ws_manager.get_stats()
-            logger.info(f"WebSocket Stats: {stats}")
-            
-            # Keep running
-            while True:
-                await asyncio.sleep(60)
-                
-                # Periodically log stats
-                stats = self.ws_manager.get_stats()
-                logger.info(f"Uptime: {stats['uptime_seconds']:.0f}s, "
-                          f"Messages: {stats['messages_received']}, "
-                          f"Errors: {stats['errors']}")
-
-
-async def main():
-    """Example main function"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-
-    
-    # Your API credentials
-    API_KEY = "your_api_key"
-    API_SECRET = "your_api_secret"
-    
-    # Create and run market maker
-    market_maker = RFQMarketMakerIntegration(API_KEY, API_SECRET)
-    await market_maker.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
