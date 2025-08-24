@@ -19,3 +19,6 @@ uv.lock
 # IDE specific files
 .vscode/
 .idea/
+
+# Logs
+*.log
