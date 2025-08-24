@@ -224,7 +224,7 @@ class RfqAPI(AsyncCoincallClient):
         Get list of RFQs
         GET /open/option/blocktrade/rfqList/v1
         
-        Returns RFQs with states: ACTIVE | CANCELED | EXPIRED | FILLED | TRADED_AWAY
+        Returns RFQs with states: ACTIVE | CANCELLED | EXPIRED | FILLED | TRADED_AWAY
         Default time range: 3 days from current time
         """
         path = "/open/option/blocktrade/rfqList/v1"
@@ -301,7 +301,7 @@ class RfqAPI(AsyncCoincallClient):
         Get list of quotes
         GET /open/option/blocktrade/list-quote/v1
         
-        Returns quotes with states: OPEN | CANCELED | FILLED
+        Returns quotes with states: OPEN | CANCELLED | FILLED
         Default: Returns up to 3 days of quotes from current timestamp
         """
         path = "/open/option/blocktrade/list-quote/v1"
@@ -460,7 +460,7 @@ async def example_usage():
                 if quote_id:
                     print(f"\n=== Canceling quote {quote_id} ===")
                     cancel_resp = await api.cancel_quote(quote_id)
-                    print(f"Canceled: {cancel_resp.get('msg')}")
+                    print(f"CANCELLED: {cancel_resp.get('msg')}")
             
             # 5. Get recent private trades
             print("\n=== Recent Private Trades ===")

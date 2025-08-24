@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class RFQState(Enum):
     """RFQ States"""
     ACTIVE = "ACTIVE"
-    CANCELED = "CANCELED"
+    CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
     FILLED = "FILLED"
     TRADED_AWAY = "TRADED_AWAY"
@@ -220,7 +220,7 @@ class RFQManager:
         
         Args:
             request_id: RFQ ID to remove
-            reason: Removal reason (CANCELED, EXPIRED, FILLED, etc.)
+            reason: Removal reason (CANCELLED, EXPIRED, FILLED, etc.)
         
         Returns:
             True if removed, False if not found
@@ -266,7 +266,7 @@ class RFQManager:
             # Handle based on state
             if state == "ACTIVE":
                 self.add_or_update_rfq(rfq_data, from_websocket=True)
-            elif state in ["CANCELED", "EXPIRED", "FILLED", "TRADED_AWAY"]:
+            elif state in ["CANCELLED", "EXPIRED", "FILLED", "TRADED_AWAY"]:
                 self.remove_rfq(request_id, reason=state)
             else:
                 logger.warning(f"Unknown RFQ state: {state}")
@@ -295,9 +295,10 @@ class RFQManager:
                 state="OPEN",
                 # role="MAKER"
             )
+            logger.debug(f"Raw response: {response}")
             
             api_rfqs = {}
-            rfq_list = response.get("data", {}).get("legs", [])
+            rfq_list = response.get("data", {}).get("rfqList", [])
             
             for rfq_data in rfq_list:
                 rfq = RFQ.from_api_data(rfq_data)

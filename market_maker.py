@@ -112,7 +112,7 @@ class RFQMarketMakerIntegration:
             if quote_id in self.active_quotes:
                 del self.active_quotes[quote_id]
             self.filled_quotes[quote_id] = quote_data
-        elif state == "CANCELED":
+        elif state == "CANCELLED":
             if quote_id in self.active_quotes:
                 del self.active_quotes[quote_id]
     
