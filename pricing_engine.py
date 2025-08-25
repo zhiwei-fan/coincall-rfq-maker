@@ -3,11 +3,18 @@ import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import logging
 import math
 import numpy as np
 import random
 from scipy.stats import norm
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from quote_manager import QuoteManager
+    from rfq_manager import RFQ
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Instrument:
@@ -156,14 +163,18 @@ class PricingEngine:
     Single class design for instruments with integrated pricing.
     """
     
-    def __init__(self, update_interval_seconds: int = 5):
+    def __init__(self, quote_manager: Optional['QuoteManager'] = None, update_interval_seconds: int = 5):
         """
         Initialize the pricing engine.
         
         Args:
+            quote_manager: Optional QuoteManager for creating quotes
             update_interval_seconds: Interval between price updates in seconds
         """
+        self.quote_manager = quote_manager
         self.instruments: Dict[str, Instrument] = {}
+        self.rfq_instruments: Dict[str, Set[str]] = {}  # RFQ ID -> set of instrument names
+        self.instrument_rfqs: Dict[str, Set[str]] = {}  # instrument name -> set of RFQ IDs
         self.index_prices: Dict[str, float] = {}
         self.update_interval = update_interval_seconds
         self.bid_vol = 0.20  # 20% bid volatility
@@ -209,10 +220,17 @@ class PricingEngine:
         strike = float(parts[2])
         option_type = parts[3].upper()
         
-        # Parse expiry date (DDMMMYY format)
-        day = int(expiry_str[:2])
-        month_str = expiry_str[2:5].upper()
-        year = 2000 + int(expiry_str[5:7])
+        # Parse expiry date (D(D)MMMYY format - day can be 1 or 2 digits)
+        # Find where the month starts (first alphabetic character)
+        month_start = 0
+        for i, char in enumerate(expiry_str):
+            if char.isalpha():
+                month_start = i
+                break
+        
+        day = int(expiry_str[:month_start])
+        month_str = expiry_str[month_start:month_start+3].upper()
+        year = 2000 + int(expiry_str[month_start+3:])
         
         months = {
             'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
@@ -247,12 +265,13 @@ class PricingEngine:
             True if successful, False otherwise
         """
         try:
-            instrument = self.parse_instrument_string(instrument_str)
-            self.instruments[instrument_str] = instrument
-            print(f"Added instrument: {instrument_str}")
+            if instrument_str not in self.instruments:
+                instrument = self.parse_instrument_string(instrument_str)
+                self.instruments[instrument_str] = instrument
+                logger.info(f"Parsed instrument: {instrument_str}")
             return True
         except Exception as e:
-            print(f"Failed to add instrument: {e}")
+            logger.error(f"Failed to add instrument: {e}")
             return False
     
     def remove_instrument(self, instrument_str: str) -> bool:
@@ -267,9 +286,14 @@ class PricingEngine:
         """
         if instrument_str in self.instruments:
             del self.instruments[instrument_str]
-            print(f"Removed instrument: {instrument_str}")
+            
+            # Clean up RFQ tracking for this instrument
+            if instrument_str in self.instrument_rfqs:
+                del self.instrument_rfqs[instrument_str]
+            
+            logger.info(f"Removed instrument: {instrument_str}")
             return True
-        print(f"Instrument not found: {instrument_str}")
+        logger.debug(f"Instrument not found: {instrument_str}")
         return False
     
     def get_instruments(self) -> List[str]:
@@ -383,11 +407,11 @@ class PricingEngine:
             
             # Simulate realistic prices
             base_prices = {
-                'BTCUSD': 50000,
-                'ETHUSD': 3000,
-                'SOLUSD': 100,
+                'BTCUSD': 110000,
+                'ETHUSD': 4700,
+                'SOLUSD': 195,
                 'ADAUSD': 0.5,
-                'DOGEUSD': 0.1
+                'DOGEUSD': 0.23
             }
             
             base_price = base_prices.get(symbol, 1000)
@@ -412,13 +436,159 @@ class PricingEngine:
         self.index_prices[symbol] = price
         print(f"Updated {symbol} price to {price}")
     
+    def update_rfq_instruments(self, rfq: 'RFQ') -> None:
+        """
+        Update instruments based on RFQ legs
+        
+        Args:
+            rfq: RFQ object containing legs to price
+        """
+        request_id = rfq.requestId
+        
+        # Track instruments for this RFQ
+        if request_id not in self.rfq_instruments:
+            self.rfq_instruments[request_id] = set()
+        
+        # Add instruments from RFQ legs
+        for leg in rfq.legs:
+            instrument_name = leg.instrumentName
+            
+            # Add instrument if not already present
+            if self.add_instrument(instrument_name):
+                # Track RFQ-instrument relationship
+                self.rfq_instruments[request_id].add(instrument_name)
+                
+                if instrument_name not in self.instrument_rfqs:
+                    self.instrument_rfqs[instrument_name] = set()
+                self.instrument_rfqs[instrument_name].add(request_id)
+                
+                logger.debug(f"Added instrument {instrument_name} for RFQ {request_id}")
+    
+    def remove_rfq_instruments(self, rfq: 'RFQ') -> None:
+        """
+        Remove instruments that are no longer needed by any RFQ
+        
+        Args:
+            rfq: RFQ object being removed
+        """
+        request_id = rfq.requestId
+        
+        if request_id not in self.rfq_instruments:
+            return
+        
+        # Get instruments used by this RFQ
+        rfq_instruments = self.rfq_instruments[request_id]
+        
+        # Remove RFQ from instrument tracking
+        for instrument_name in rfq_instruments:
+            if instrument_name in self.instrument_rfqs:
+                self.instrument_rfqs[instrument_name].discard(request_id)
+                
+                # If no other RFQs need this instrument, remove it
+                if not self.instrument_rfqs[instrument_name]:
+                    self.remove_instrument(instrument_name)
+        
+        # Clean up RFQ tracking
+        del self.rfq_instruments[request_id]
+        logger.debug(f"Cleaned up instruments for RFQ {request_id}")
+    
+    async def create_quotes_for_rfq(self, rfq: 'RFQ') -> bool:
+        """
+        Create quotes for an RFQ based on current prices
+        
+        Args:
+            rfq: RFQ to quote for
+            
+        Returns:
+            True if quotes were created successfully
+        """
+        logger.debug(f"Creating quotes for for RFQ {rfq.requestId}")
+        if not self.quote_manager:
+            logger.warning("No quote manager configured")
+            return False
+        
+        if not rfq.is_active:
+            logger.debug(f"Skipping inactive RFQ {rfq.requestId}")
+            return False
+        
+        # Prepare quote legs with prices
+        quote_legs = []
+        
+        for leg in rfq.legs:
+            instrument = self.instruments.get(leg.instrumentName)
+            
+            if not instrument or not instrument.is_priced:
+                logger.warning(f"Instrument {leg.instrumentName} not priced, skipping RFQ {rfq.requestId}")
+                return False
+            
+            # Determine price based on side
+            if leg.side == "BUY":
+                # If customer is buying, we quote our ask price
+                price = instrument.ask_price
+            else:
+                # If customer is selling, we quote our bid price
+                price = instrument.bid_price
+            
+            quote_legs.append({
+                "instrumentName": leg.instrumentName,
+                "price": str(price)
+            })
+        
+        # Create the quote
+        try:
+            logger.debug(f"Calling create quote API for RFQ {rfq.requestId}")
+            quote = await self.quote_manager.create_quote(rfq.requestId, quote_legs)
+            if quote:
+                logger.info(f"Created quote {quote.quoteId} for RFQ {rfq.requestId}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to create quote for RFQ {rfq.requestId}: {e}")
+        
+        return False
+    
+    async def update_quotes_for_rfq(self, rfq: 'RFQ') -> bool:
+        """
+        Update quotes for an RFQ by cancelling existing quotes and creating new ones
+        
+        Args:
+            rfq: RFQ to update quotes for
+            
+        Returns:
+            True if quotes were updated successfully
+        """
+        logger.debug(f"Updating quotes for RFQ {rfq.requestId}")
+        
+        if not self.quote_manager:
+            logger.warning("No quote manager configured")
+            return False
+        
+        # Cancel existing quotes for this RFQ
+        try:
+            cancelled_count = await self.quote_manager.cancel_rfq_quotes(rfq.requestId)
+            if cancelled_count > 0:
+                logger.info(f"Cancelled {cancelled_count} existing quotes for RFQ {rfq.requestId}")
+        except Exception as e:
+            logger.error(f"Failed to cancel quotes for RFQ {rfq.requestId}: {e}")
+            # Continue to try creating new quotes even if cancellation fails
+        
+        # Create new quotes
+        success = await self.create_quotes_for_rfq(rfq)
+        
+        if success:
+            logger.info(f"Successfully updated quotes for RFQ {rfq.requestId}")
+        else:
+            logger.warning(f"Failed to create new quotes for RFQ {rfq.requestId}")
+        
+        return success
+
+    
     async def update_prices(self):
         """Update all prices asynchronously"""
         # Get unique underlying symbols
         symbols = set(inst.underlying for inst in self.instruments.values())
         
         if not symbols:
-            print("No instruments to price")
+            logger.debug("No instruments to price")
             return
         
         # Fetch latest index prices
@@ -433,55 +603,33 @@ class PricingEngine:
         
         # Log summary
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{timestamp}] Priced {priced_count}/{len(self.instruments)} instruments")
+        logger.info(f"[{timestamp}] Priced {priced_count}/{len(self.instruments)} instruments")
         
         # Show sample prices (first 5)
         for i, instrument in enumerate(self.get_priced_instruments()[:5]):
             if instrument.bid_price is not None:
-                print(f"  {instrument.instrument_str}: "
-                      f"Bid=${instrument.bid_price:.2f}, "
-                      f"Ask=${instrument.ask_price:.2f}, "
-                      f"Mid=${instrument.mid_price:.2f}")
+                logger.debug(f"  {instrument.instrument_str}: "
+                           f"Bid=${instrument.bid_price:.2f}, "
+                           f"Ask=${instrument.ask_price:.2f}, "
+                           f"Mid=${instrument.mid_price:.2f}")
     
-    async def _run_update_loop(self):
-        """Internal method to run periodic updates asynchronously"""
-        try:
-            while self._running:
-                await self.update_prices()
-                await asyncio.sleep(self.update_interval)
-        except asyncio.CancelledError:
-            print("Update loop cancelled")
-        except Exception as e:
-            print(f"Error in update loop: {e}")
-            self._running = False
     
     async def start(self):
-        """Start automatic pricing updates"""
+        """Start the pricing engine (initialize only, no automatic updates)"""
         if self._running:
             print("Pricing engine already running")
             return
         
-        print(f"Starting pricing engine with {self.update_interval}s interval")
+        print(f"Starting pricing engine")
         self._running = True
         
         # Initial price update
         await self.update_prices()
-        
-        # Create and store the update task
-        self._update_task = asyncio.create_task(self._run_update_loop())
     
     async def stop(self):
-        """Stop automatic pricing updates"""
+        """Stop the pricing engine"""
         self._running = False
-        
-        if self._update_task:
-            self._update_task.cancel()
-            try:
-                await self._update_task
-            except asyncio.CancelledError:
-                pass
-            self._update_task = None
-            print("Pricing engine stopped")
+        print("Pricing engine stopped")
     
     def set_volatility(self, bid_vol: float, ask_vol: float):
         """
@@ -518,7 +666,9 @@ class PricingEngine:
             'bid_volatility': self.bid_vol,
             'ask_volatility': self.ask_vol,
             'risk_free_rate': self.risk_free_rate,
-            'update_interval': self.update_interval
+            'update_interval': self.update_interval,
+            'rfqs_tracked': len(self.rfq_instruments),
+            'instruments_with_rfqs': len(self.instrument_rfqs)
         }
     
     def export_prices(self) -> List[Dict]:

@@ -7,6 +7,10 @@ from enum import Enum
 import time
 
 from api_client import RfqAPI, CoincallCredential, RFQLeg, CcAPIException
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pricing_engine import PricingEngine
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,7 @@ class RFQ:
         for leg_data in data.get("legs", []):
             legs.append(RFQLeg(
                 instrumentName=leg_data["instrumentName"],
-                side=leg_data["tradeSide"], # TODO: to update to side=leg_data["side"]
+                side=leg_data["side"],
                 quantity=str(leg_data.get("quantity", ""))
             ))
         
@@ -107,15 +111,17 @@ class RFQManager:
     - Monitor RFQ expiry
     """
     
-    def __init__(self, api_client: RfqAPI, sync_interval: int = 60):
+    def __init__(self, api_client: RfqAPI, pricing_engine: Optional['PricingEngine'] = None, sync_interval: int = 60):
         """
         Initialize RFQ Manager
         
         Args:
             api_client: RfqAPI client for API calls
+            pricing_engine: Optional PricingEngine for instrument management and quoting
             sync_interval: Seconds between API syncs (default 60)
         """
         self.api_client = api_client
+        self.pricing_engine = pricing_engine
         self.sync_interval = sync_interval
         self.rfqs: Dict[str, RFQ] = {}
         self.last_sync_time = 0
@@ -156,6 +162,9 @@ class RFQManager:
                 rfq = RFQ.from_api_data(rfq_data)
                 if rfq.is_active:
                     self.rfqs[rfq.requestId] = rfq
+                    # Update pricing engine with instruments
+                    if self.pricing_engine:
+                        self.pricing_engine.update_rfq_instruments(rfq)
                     logger.debug(f"Loaded RFQ {rfq.requestId} (expires in {rfq.time_to_expiry:.0f}s)")
             
             self.last_sync_time = time.time()
@@ -201,13 +210,21 @@ class RFQManager:
                 return False
             
             # Add or update
-            if request_id in self.rfqs:
-                logger.debug(f"Updated RFQ {request_id}")
-            else:
+            is_new = request_id not in self.rfqs
+            if is_new:
                 logger.info(f"Added new RFQ {request_id} (expires in {rfq.time_to_expiry:.0f}s)")
                 self.stats["total_received"] += 1
+            else:
+                logger.debug(f"Updated RFQ {request_id}")
             
             self.rfqs[request_id] = rfq
+            
+            # Update pricing engine with instruments
+            if self.pricing_engine and is_new:
+                self.pricing_engine.update_rfq_instruments(rfq)
+                # Optionally create quotes immediately
+                asyncio.create_task(self._try_create_quote(rfq))
+            
             return True
             
         except Exception as e:
@@ -227,6 +244,11 @@ class RFQManager:
         """
         if request_id in self.rfqs:
             rfq = self.rfqs[request_id]
+            
+            # Remove instruments from pricing engine
+            if self.pricing_engine:
+                self.pricing_engine.remove_rfq_instruments(rfq)
+            
             del self.rfqs[request_id]
             
             logger.info(f"Removed RFQ {request_id} (reason: {reason})")
@@ -309,6 +331,9 @@ class RFQManager:
             for request_id, rfq in api_rfqs.items():
                 if request_id not in self.rfqs:
                     self.rfqs[request_id] = rfq
+                    # Update pricing engine with instruments
+                    if self.pricing_engine:
+                        self.pricing_engine.update_rfq_instruments(rfq)
                     sync_stats["added"] += 1
                     logger.info(f"Sync: Added missing RFQ {request_id}")
                 else:
@@ -436,6 +461,23 @@ class RFQManager:
         """Async context manager entry"""
         await self.start()
         return self
+    
+    async def _try_create_quote(self, rfq: RFQ) -> None:
+        """
+        Try to create a quote for an RFQ if pricing engine is available
+        
+        Args:
+            rfq: RFQ to quote for
+        """
+        if self.pricing_engine and rfq.is_active:
+            try:
+                success = await self.pricing_engine.create_quotes_for_rfq(rfq)
+                if success:
+                    logger.info(f"Created quote for RFQ {rfq.requestId}")
+                else:
+                    logger.debug(f"Could not create quote for RFQ {rfq.requestId}")
+            except Exception as e:
+                logger.error(f"Error creating quote for RFQ {rfq.requestId}: {e}")
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
