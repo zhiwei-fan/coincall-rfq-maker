@@ -302,14 +302,17 @@ class QuoteManager:
         """
         try:
             response = await self.api_client.cancel_all_quotes()
-            cancelled_count = response.get("data", {}).get("cancelledCount", 0)
+            logger.debug(f"Cancelled all quotes: {response}")
+            # cancelled_count = response.get("data", {}).get("cancelledCount", 0)
             
             # Update local state for all open quotes
+            cancelled_count = 0
             for quote in self.quotes.values():
                 if quote.is_open:
                     quote.state = QuoteState.CANCELLED
                     quote.updateTime = int(time.time() * 1000)
                     self.stats["total_cancelled"] += 1
+                    cancelled_count += 1
             
             logger.info(f"Cancelled all quotes ({cancelled_count} cancelled)")
             return cancelled_count
