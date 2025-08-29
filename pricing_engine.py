@@ -6,13 +6,15 @@ import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import numpy as np
 from scipy.stats import norm
 
-from interfaces import IPricingService, IInstrumentRepository, IMarketDataProvider
-from models import Instrument, PricedInstrument, PriceQuote, MarketData
+from api_client import FuturesAPI
+from interfaces import IPricingService, IInstrumentRepository
+from models import Instrument, PricedInstrument, PriceQuote
+from market_data import CoincallMarketDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -189,57 +191,6 @@ class InstrumentRepository(IInstrumentRepository):
         """Get priced instrument"""
         return self.priced_instruments.get(instrument_name)
 
-
-# ============================================================================
-# Market Data Provider
-# ============================================================================
-
-class SimpleMarketDataProvider(IMarketDataProvider):
-    """Simple market data provider with caching"""
-    
-    def __init__(self):
-        self.cached_prices: Dict[str, float] = {}
-        self.last_fetch: Optional[datetime] = None
-    
-    async def fetch_index_prices(self, symbols: List[str]) -> Dict[str, float]:
-        """Fetch latest index prices (mock implementation)"""
-        import random
-        
-        # Simulate async fetch
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-        
-        # Default prices for demo
-        base_prices = {
-            'BTCUSD': 110000,
-            'ETHUSD': 4700,
-            'SOLUSD': 195,
-            'ADAUSD': 0.5,
-            'DOGEUSD': 0.23
-        }
-        
-        new_prices = {}
-        for symbol in symbols:
-            base_price = base_prices.get(symbol, 1000)
-            # Add market volatility (±5%)
-            variation = 1 + (random.random() - 0.5) * 0.1
-            new_prices[symbol] = base_price * variation
-        
-        # Update cache
-        self.cached_prices.update(new_prices)
-        self.last_fetch = datetime.now()
-        
-        return new_prices
-    
-    def get_cached_price(self, symbol: str) -> Optional[float]:
-        """Get cached price for symbol"""
-        return self.cached_prices.get(symbol)
-    
-    def set_price(self, symbol: str, price: float) -> None:
-        """Manually set a price"""
-        self.cached_prices[symbol] = price
-        logger.info(f"Set {symbol} price to {price}")
-
-
 # ============================================================================
 # Main Pricing Service
 # ============================================================================
@@ -251,13 +202,14 @@ class SimplePricingService(IPricingService):
     """
     
     def __init__(self, 
+                 futures_api: FuturesAPI,
                  repository: Optional[InstrumentRepository] = None,
                  pricer: Optional[BlackScholesPricer] = None,
-                 market_data: Optional[SimpleMarketDataProvider] = None):
+                 market_data: Optional[CoincallMarketDataProvider] = None):
         """Initialize with dependencies"""
         self.repository = repository or InstrumentRepository(InstrumentParser())
         self.pricer = pricer or BlackScholesPricer()
-        self.market_data = market_data or SimpleMarketDataProvider()
+        self.market_data = market_data or CoincallMarketDataProvider(futures_api)
     
     async def calculate_price(self, instrument_name: str) -> Optional[PriceQuote]:
         """Calculate current price for an instrument"""

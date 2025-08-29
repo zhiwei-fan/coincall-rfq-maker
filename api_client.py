@@ -208,6 +208,57 @@ class AsyncCoincallClient:
             raise CcRequestException(f"Unsupported method '{method}'")
 
 
+class FuturesAPI(AsyncCoincallClient):
+    """Futures API endpoints for market data operations."""
+    
+    async def get_orderbook(
+        self,
+        symbol: str,
+        depth: Optional[int] = None
+    ) -> dict:
+        """
+        Get orderbook data for a futures symbol
+        GET /open/futures/market/orderbook
+        
+        Args:
+            symbol: Trading symbol (required, e.g., "BTC-USD")
+            depth: Order book depth (optional, default=1)
+        
+        Returns:
+            Orderbook data with bids and asks
+        """
+        path = "/open/futures/market/orderbook"
+        params = {"symbol": symbol}
+        
+        if depth is not None:
+            params["depth"] = depth
+            
+        return await self._request("GET", path, params)
+    
+    async def get_symbol_info(
+        self,
+        symbol: Optional[str] = None
+    ) -> dict:
+        """
+        Get symbol information for futures
+        GET /open/futures/market/symbol/v1
+        
+        Args:
+            symbol: Trading symbol (optional, e.g., "BTCUSD")
+                   If not provided, returns all symbols
+        
+        Returns:
+            Symbol information including contract specifications
+        """
+        path = "/open/futures/market/symbol/v1"
+        params = {}
+        
+        if symbol is not None:
+            params["symbol"] = symbol
+            
+        return await self._request("GET", path, params)
+
+
 class RfqAPI(AsyncCoincallClient):
     """RFQ Maker API endpoints for block trade operations."""
     
@@ -414,7 +465,7 @@ class RfqAPI(AsyncCoincallClient):
 
 
 async def example_usage():
-    """Example usage of the RFQ API"""
+    """Example usage of the RFQ and Futures APIs"""
     load_dotenv()
     API_KEY = os.environ.get("API_KEY")
     API_SECRET = os.environ.get("API_SECRET")
@@ -424,6 +475,30 @@ async def example_usage():
     
     cred = CoincallCredential(api_key=API_KEY, secret_key=API_SECRET)
     
+    # Example with Futures API
+    async with FuturesAPI(credential=cred) as futures_api:
+        try:
+            print("\n=== Futures Symbol Info ===")
+            # Get specific symbol info
+            symbol_info = await futures_api.get_symbol_info("BTCUSD")
+            print(f"BTCUSD Symbol Info: {symbol_info}")
+            
+            # Get all symbols
+            all_symbols = await futures_api.get_symbol_info()
+            print(f"Total symbols available: {len(all_symbols.get('data', []))}")
+            
+            print("\n=== Futures Orderbook ===")
+            # Get orderbook with default depth
+            orderbook = await futures_api.get_orderbook("BTCUSD")
+            print(f"BTCUSD Orderbook (depth=1): {orderbook}")
+            
+            # Get orderbook with specific depth
+            orderbook_deep = await futures_api.get_orderbook("BTCUSD", depth=10)
+            print(f"BTCUSD Orderbook (depth=10): {orderbook_deep}")
+        except CcAPIException as e:
+            print(f"Futures API Error: {e}")
+    
+    # Example with RFQ API
     async with RfqAPI(credential=cred) as api:
         try:
             # 1. Get active RFQs as a maker

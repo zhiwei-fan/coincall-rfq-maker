@@ -10,7 +10,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Set
 
-from api_client import RfqAPI, CoincallCredential
+from api_client import RfqAPI, FuturesAPI, CoincallCredential
 from interfaces import (
     IPricingService, IQuoteService,
     IQuoteOrchestrator, IRFQInstrumentTracker
@@ -219,9 +219,10 @@ class RFQMarketMaker:
         # API Client
         credential = CoincallCredential(api_key=api_key, secret_key=api_secret)
         self.api_client = RfqAPI(credential=credential)
+        self.futures_api = FuturesAPI(credential=credential)
         
         # Core Services (each with single responsibility)
-        self.pricing_service = SimplePricingService()
+        self.pricing_service = SimplePricingService(self.futures_api)
         self.rfq_service = SimpleRFQService(self.api_client)
         self.quote_service = QuoteManager(self.api_client)
         
@@ -496,29 +497,30 @@ class RFQMarketMaker:
         
         # Start services
         async with self.api_client:
-            async with self.quote_service:
-                async with self.rfq_service:
-                    async with self.ws_manager:
-                        # Initialize market maker state
-                        await self.initialize_market_maker()
-                        
-                        # Start background tasks
-                        self._running = True
-                        self._pricing_task = asyncio.create_task(self._pricing_update_loop())
-                        self._quoting_task = asyncio.create_task(self._quote_update_loop())
-                        
-                        logger.info("=" * 50)
-                        logger.info("Market Maker Started")
-                        logger.info(f"Auto-quoting: {'ENABLED' if self.enable_auto_quoting else 'DISABLED'}")
-                        logger.info(f"Pricing interval: {self.pricing_update_interval}s")
-                        logger.info("=" * 50)
-                        
-                        # Main loop
-                        while True:
-                            await asyncio.sleep(30)
+            async with self.futures_api:
+                async with self.quote_service:
+                    async with self.rfq_service:
+                        async with self.ws_manager:
+                            # Initialize market maker state
+                            await self.initialize_market_maker()
                             
-                            # Log statistics
-                            self._log_statistics()
+                            # Start background tasks
+                            self._running = True
+                            self._pricing_task = asyncio.create_task(self._pricing_update_loop())
+                            self._quoting_task = asyncio.create_task(self._quote_update_loop())
+                            
+                            logger.info("=" * 50)
+                            logger.info("Market Maker Started")
+                            logger.info(f"Auto-quoting: {'ENABLED' if self.enable_auto_quoting else 'DISABLED'}")
+                            logger.info(f"Pricing interval: {self.pricing_update_interval}s")
+                            logger.info("=" * 50)
+                            
+                            # Main loop
+                            while True:
+                                await asyncio.sleep(30)
+                                
+                                # Log statistics
+                                self._log_statistics()
         
         # Cleanup
         self._running = False
