@@ -1,0 +1,267 @@
+"""Orchestration glue: RFQ store + instrument tracking, and the dispatcher
+that wires WS/market-data events to the RFQ, quote, and trade consumers.
+
+Deviation from the spec's package layout: the Data flow section describes an
+"RFQ service (owns RFQ store + instrument tracking, prunes orphaned
+instruments)" but the layout lists no module for it. Bolting it onto the
+pure `domain/rfq.py` state machine would give it I/O side effects; cramming
+it into `cli.py` would blow past a readable file size. It lives here
+instead, as the single-writer owner of RFQ state and the glue between
+pricing, risk, and the quote lifecycle actor.
+"""
+
+import logging
+import time
+
+from coincall_rfq_maker.adapters.rest import CoincallApiError, CoincallRestClient
+from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
+from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
+from coincall_rfq_maker.events import (
+    PricesRefreshed,
+    QuoteUpdated,
+    RfqReceived,
+    RfqTerminated,
+    TradeExecuted,
+)
+from coincall_rfq_maker.marketdata.service import MarketDataService
+from coincall_rfq_maker.persistence.store import PersistenceStore
+from coincall_rfq_maker.pricing.engine import PricingModel
+from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.strategy import build_quote_intent
+from coincall_rfq_maker.risk.gate import RiskGate
+
+logger = logging.getLogger(__name__)
+
+DispatchEvent = RfqReceived | RfqTerminated | QuoteUpdated | TradeExecuted | PricesRefreshed
+
+
+class RfqStore:
+    """In-memory RFQ repository + instrument tracking.
+
+    Single-writer: only `Orchestrator` (running on the dispatcher task)
+    mutates this.
+    """
+
+    def __init__(self) -> None:
+        self._rfqs: dict[str, Rfq] = {}
+        self._instrument_holders: dict[str, set[str]] = {}
+
+    def upsert(self, rfq: Rfq) -> None:
+        self._rfqs[rfq.request_id] = rfq
+        for name in rfq.instrument_names():
+            self._instrument_holders.setdefault(name, set()).add(rfq.request_id)
+
+    def get(self, request_id: str) -> Rfq | None:
+        return self._rfqs.get(request_id)
+
+    def active(self) -> list[Rfq]:
+        return [rfq for rfq in self._rfqs.values() if not rfq.is_terminal_status]
+
+    def active_for_underlying(self, underlying: str) -> list[Rfq]:
+        matches = []
+        for rfq in self.active():
+            for name in rfq.instrument_names():
+                try:
+                    if parse_instrument(name).underlying == underlying:
+                        matches.append(rfq)
+                        break
+                except InstrumentParseError:
+                    continue
+        return matches
+
+    def mark_terminal(self, request_id: str, status: RfqStatus, now_ms: int) -> Rfq | None:
+        rfq = self._rfqs.get(request_id)
+        if rfq is None:
+            return None
+        updated = rfq.with_status(status, now_ms)
+        self._rfqs[request_id] = updated
+        return updated
+
+    def orphaned_instruments(self, request_id: str) -> set[str]:
+        """Instruments referenced ONLY by `request_id` (call after marking it terminal)."""
+        rfq = self._rfqs.get(request_id)
+        if rfq is None:
+            return set()
+        orphaned = set()
+        for name in rfq.instrument_names():
+            holders = self._instrument_holders.get(name)
+            if holders is None:
+                continue
+            holders.discard(request_id)
+            if holders:
+                self._instrument_holders[name] = holders
+            else:
+                del self._instrument_holders[name]
+                orphaned.add(name)
+        return orphaned
+
+
+class Orchestrator:
+    """Owns the RFQ store and drives price -> risk -> quote for active RFQs."""
+
+    def __init__(
+        self,
+        rest_client: CoincallRestClient,
+        market_data: MarketDataService,
+        pricing_model: PricingModel,
+        risk_gate: RiskGate,
+        quote_lifecycle: QuoteLifecycle,
+        persistence: PersistenceStore | None = None,
+    ) -> None:
+        self._rest = rest_client
+        self._market_data = market_data
+        self._pricing_model = pricing_model
+        self._risk_gate = risk_gate
+        self._quotes = quote_lifecycle
+        self._persistence = persistence
+        self.rfq_store = RfqStore()
+
+    async def handle_event(self, event: object) -> None:
+        match event:
+            case RfqReceived(rfq=rfq):
+                await self._handle_rfq_received(rfq)
+            case RfqTerminated():
+                await self._handle_rfq_terminated(event)
+            case QuoteUpdated():
+                await self._handle_quote_updated(event)
+            case TradeExecuted():
+                await self._handle_trade(event)
+            case PricesRefreshed():
+                await self._handle_prices_refreshed(event)
+
+    async def _handle_rfq_received(self, rfq: Rfq) -> None:
+        self.rfq_store.upsert(rfq)
+        for name in rfq.instrument_names():
+            try:
+                underlying = parse_instrument(name).underlying
+            except InstrumentParseError:
+                logger.warning("Skipping unparseable instrument %s on RFQ %s", name, rfq.request_id)
+                continue
+            self._market_data.track(underlying)
+        if self._persistence is not None:
+            await self._persistence.record_rfq(rfq, _now_ms())
+        await self._reprice_and_quote(rfq.request_id)
+
+    async def _handle_rfq_terminated(self, event: RfqTerminated) -> None:
+        now_ms = _now_ms()
+        updated = self.rfq_store.mark_terminal(event.request_id, event.status, now_ms)
+        if updated is None:
+            return
+        await self._quotes.cancel_for_rfq(event.request_id)
+        for instrument_name in self.rfq_store.orphaned_instruments(event.request_id):
+            try:
+                underlying = parse_instrument(instrument_name).underlying
+            except InstrumentParseError:
+                continue
+            if not self.rfq_store.active_for_underlying(underlying):
+                self._market_data.untrack(underlying)
+        if self._persistence is not None:
+            await self._persistence.record_rfq(updated, now_ms)
+
+    async def _handle_quote_updated(self, event: QuoteUpdated) -> None:
+        updated = self._quotes.apply_ws_update(event)
+        if updated is not None and self._persistence is not None:
+            await self._persistence.record_quote(updated, None, _now_ms())
+
+    async def _handle_trade(self, event: TradeExecuted) -> None:
+        logger.info("Trade executed: block_trade=%s quote=%s", event.block_trade_id, event.quote_id)
+        if self._persistence is not None:
+            await self._persistence.record_fill(event, _now_ms())
+
+    async def _handle_prices_refreshed(self, event: PricesRefreshed) -> None:
+        for underlying in event.underlyings:
+            for rfq in self.rfq_store.active_for_underlying(underlying):
+                await self._reprice_and_quote(rfq.request_id)
+
+    async def reprice_all_active(self) -> None:
+        """Force a reprice/requote pass over every active RFQ (the quote-refresh timer)."""
+        for rfq in self.rfq_store.active():
+            await self._reprice_and_quote(rfq.request_id)
+
+    async def _reprice_and_quote(self, request_id: str) -> None:
+        rfq = self.rfq_store.get(request_id)
+        if rfq is None or rfq.is_terminal_status:
+            return
+
+        leg_prices = {}
+        ages: dict[str, float] = {}
+        for name in rfq.instrument_names():
+            try:
+                instrument = parse_instrument(name)
+            except InstrumentParseError:
+                logger.warning("Cannot price unparseable instrument %s", name)
+                return
+            underlying_price = self._market_data.get_price(instrument.underlying)
+            if underlying_price is None:
+                logger.debug("No price yet for %s (RFQ %s)", instrument.underlying, request_id)
+                return
+            leg_prices[name] = self._pricing_model.price(instrument, underlying_price)
+            ages[name] = self._market_data.age_seconds(instrument.underlying)
+
+        intent = build_quote_intent(rfq, leg_prices)
+        if intent is None:
+            return
+
+        if rfq.stage is RfqStage.RECEIVED:
+            rfq = rfq.with_stage(RfqStage.PRICED)
+            self.rfq_store.upsert(rfq)
+
+        now_ms = _now_ms()
+        decision = self._risk_gate.evaluate(rfq, intent, ages, now_ms)
+        if not decision.approved:
+            logger.warning("Not quoting RFQ %s: %s", request_id, decision.reason)
+            return
+
+        try:
+            quote = await self._quotes.reconcile(intent)
+            self._risk_gate.record_api_success()
+        except CoincallApiError:
+            logger.exception("REST error quoting RFQ %s", request_id)
+            self._risk_gate.record_api_failure()
+            return
+
+        if rfq.stage is RfqStage.PRICED:
+            rfq = rfq.with_stage(RfqStage.QUOTED)
+            self.rfq_store.upsert(rfq)
+
+        if self._persistence is not None:
+            snapshot: dict[str, float] = {}
+            for name in rfq.instrument_names():
+                maybe_instrument = _safe_parse(name)
+                if maybe_instrument is None:
+                    continue
+                underlying_price = self._market_data.get_price(maybe_instrument.underlying)
+                if underlying_price is not None:
+                    snapshot[maybe_instrument.underlying] = underlying_price
+            await self._persistence.record_quote(quote, snapshot, now_ms)
+
+    async def reconcile_with_exchange(self) -> None:
+        """Periodic reconciler: true local RFQ state against the exchange's open RFQ list."""
+        try:
+            response = await self._rest.get_rfq_list(state="OPEN")
+        except CoincallApiError:
+            logger.exception("Reconciler failed to fetch RFQ list")
+            return
+        remote_ids = {
+            item.get("requestId")
+            for item in (response.get("data") or {}).get("rfqList", [])
+            if item.get("requestId")
+        }
+        for rfq in self.rfq_store.active():
+            if rfq.request_id not in remote_ids:
+                logger.info(
+                    "Reconciler: RFQ %s no longer open on exchange, marking terminal",
+                    rfq.request_id,
+                )
+                await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, RfqStatus.EXPIRED))
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_parse(name: str) -> Instrument | None:
+    try:
+        return parse_instrument(name)
+    except InstrumentParseError:
+        return None
