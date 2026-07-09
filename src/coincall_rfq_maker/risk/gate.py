@@ -47,11 +47,6 @@ class NullExposureProvider:
         return ExposureSnapshot(exposures_by_underlying={})
 
 
-@dataclass(frozen=True, slots=True)
-class _RiskEvaluationContext:
-    exposure: ExposureSnapshot
-
-
 class RiskGate:
     def __init__(
         self,
@@ -115,9 +110,9 @@ class RiskGate:
         if self._kill_switch_tripped:
             return self._reject("kill switch tripped")
 
-        context = _RiskEvaluationContext(exposure=self._exposure_provider.current_exposure())
-        if not context.exposure.usable:
-            reason = context.exposure.reason or "unusable or stale exposure data"
+        exposure = self._exposure_provider.current_exposure()
+        if not exposure.usable:
+            reason = exposure.reason or "unusable or stale exposure data"
             return self._reject(f"exposure data unavailable: {reason}")
 
         time_to_expiry_hours = (rfq.expiry_time_ms - now_ms) / 1000 / 3600

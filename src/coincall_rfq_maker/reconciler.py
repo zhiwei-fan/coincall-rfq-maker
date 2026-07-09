@@ -1,6 +1,7 @@
 """Periodic reconciliation against exchange RFQ and quote snapshots."""
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from coincall_rfq_maker.core.adapters.rest import (
@@ -32,12 +33,8 @@ class RfqRepository(Protocol):
     def received_at_ms(self, request_id: str) -> int | None: ...
 
 
-class RfqBackfillHandler(Protocol):
-    async def __call__(self, rfq: Rfq) -> None: ...
-
-
-class TerminalRfqHandler(Protocol):
-    async def __call__(self, request_id: str, status: RfqStatus) -> None: ...
+RfqBackfillHandler = Callable[[Rfq], Awaitable[None]]
+TerminalRfqHandler = Callable[[str, RfqStatus], Awaitable[None]]
 
 
 class Reconciler:
