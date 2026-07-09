@@ -25,3 +25,8 @@ uv.lock
 
 # Logs
 *.log
+
+# Local runtime SQLite DB (maker DB_PATH default: rfq_maker.db)
+*.db
+*.db-wal
+*.db-shm
