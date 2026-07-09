@@ -75,12 +75,28 @@ class SignalShutdownWsClient:
         shutdown.set()
 
 
+class StopAwareWsClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event) -> None:
+        await shutdown.wait()
+
+
 class StopAwareMarketData:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
 
     async def run(self, shutdown: asyncio.Event, interval_seconds: float) -> None:
         await shutdown.wait()
+
+
+class FailingMarketData:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event, interval_seconds: float) -> None:
+        raise RuntimeError("market-data task failed")
 
 
 class ShutdownRaceMarketData:
@@ -98,6 +114,16 @@ class NoopOrchestrator:
 
     async def handle_event(self, event: object) -> None:
         pass
+
+
+class FailsFirstOrchestrator:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def handle_event(self, event: object) -> None:
+        self.events.append(event)
+        if len(self.events) == 1:
+            raise RuntimeError("bad event")
 
 
 class ShutdownOnPutQueue:
@@ -209,6 +235,34 @@ async def test_signal_shutdown_taskgroup_shutdown_race_attempts_cancel_all_once(
 
 
 @pytest.mark.asyncio
+async def test_taskgroup_failure_without_signal_attempts_cancel_all_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = False
+    RecordingQuoteLifecycle.cancel_all_exception = None
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", StopAwareWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", FailingMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = Settings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=True,
+    )
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 1
+    assert any(isinstance(exc, RuntimeError) for exc in exc_info.value.exceptions)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancel_all_non_coincall_failure_exits_cleanly(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -296,3 +350,20 @@ async def test_startup_backfill_tick_is_enqueued_before_timer_events() -> None:
     await queue.put(RepriceTick())
 
     assert isinstance(await queue.get(), ReconcileTick)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_loop_logs_bad_event_and_processes_next() -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    orchestrator = FailsFirstOrchestrator()
+    first = object()
+    second = object()
+    await queue.put(first)
+    await queue.put(second)
+
+    task = asyncio.create_task(cli._dispatch_loop(queue, orchestrator))  # type: ignore[arg-type]
+    await asyncio.wait_for(queue.join(), timeout=1.0)
+    queue.shutdown()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert orchestrator.events == [first, second]

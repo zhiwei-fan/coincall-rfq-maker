@@ -68,6 +68,10 @@ async def _dispatch_loop(events: "asyncio.Queue[object]", orchestrator: Orchestr
             return
         try:
             await orchestrator.handle_event(event)
+        except asyncio.QueueShutDown:
+            raise
+        except Exception:
+            logger.exception("Unhandled exception while dispatching %s", type(event).__name__)
         finally:
             events.task_done()
 
@@ -212,7 +216,7 @@ async def run_async(settings: Settings) -> None:
                 _log_task_failures(eg.exceptions)
                 task_failure_group = eg
         finally:
-            if shutdown.is_set() and settings.cancel_all_on_stop:
+            if settings.cancel_all_on_stop:
                 await _cancel_all_on_graceful_stop(quote_lifecycle)
 
         if task_failure_group is not None:

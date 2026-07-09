@@ -92,6 +92,7 @@ class MarketDataService:
                 continue
             try:
                 response = await self._rest.get_symbol_info(underlying)
+                info = SymbolInfoPayload.model_validate(response.get("data") or {})
             except Exception:
                 logger.exception("Failed to fetch symbol info for %s", underlying)
                 self._drain_commands()
@@ -101,7 +102,6 @@ class MarketDataService:
             if underlying not in self._tracked:
                 continue
 
-            info = SymbolInfoPayload.model_validate(response.get("data") or {})
             price = info.underlying_price
             if price is None:
                 logger.warning("No index/mark price in symbol info for %s", underlying)

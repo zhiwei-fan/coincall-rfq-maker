@@ -69,6 +69,12 @@ def test_dt_20_quote_update_produces_quote_updated() -> None:
     assert event.block_trade_id == "bt-1"
 
 
+def test_malformed_dt_20_quote_update_ignored() -> None:
+    raw = json.dumps({"dt": 20, "d": {"requestId": "rfq-1", "state": "FILLED"}})
+
+    assert parse_ws_message(raw) is None
+
+
 def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
     raw = json.dumps(
         {"dt": 22, "d": {"blockTradeId": "bt-1", "quoteId": "q-1", "requestId": "rfq-1"}}
@@ -77,6 +83,12 @@ def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
     assert isinstance(event, TradeExecuted)
     assert event.block_trade_id == "bt-1"
     assert event.quote_id == "q-1"
+
+
+def test_malformed_dt_22_block_trade_detail_ignored() -> None:
+    raw = json.dumps({"dt": 22, "d": {"quoteId": "q-1", "requestId": "rfq-1"}})
+
+    assert parse_ws_message(raw) is None
 
 
 def test_dt_23_block_trade_public_ignored() -> None:
@@ -101,6 +113,10 @@ def test_heartbeat_ignored() -> None:
 
 def test_non_json_message_ignored() -> None:
     assert parse_ws_message("not json{{{") is None
+
+
+def test_non_object_json_message_ignored() -> None:
+    assert parse_ws_message(json.dumps([])) is None
 
 
 class ShutdownQueue:

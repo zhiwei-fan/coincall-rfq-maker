@@ -15,6 +15,7 @@ from enum import IntEnum
 from typing import Protocol
 
 import websockets
+from pydantic import ValidationError
 
 from coincall_rfq_maker.adapters.schemas import (
     BlockTradePayload,
@@ -79,7 +80,11 @@ def parse_ws_message(raw: str) -> WsEvent | None:
         logger.warning("Received non-JSON WS message: %.100s", raw)
         return None
 
-    envelope = WsEnvelope.model_validate(obj)
+    try:
+        envelope = WsEnvelope.model_validate(obj)
+    except ValidationError as exc:
+        logger.warning("Malformed WS envelope: %s", exc)
+        return None
 
     if envelope.dt is None:
         if envelope.action and envelope.result:
@@ -135,7 +140,11 @@ def _parse_rfq_event(data: dict[str, object]) -> RfqReceived | RfqTerminated | N
 
 
 def _parse_quote_event(data: dict[str, object]) -> QuoteUpdated | None:
-    payload = QuotePayload.model_validate(data)
+    try:
+        payload = QuotePayload.model_validate(data)
+    except ValidationError as exc:
+        logger.warning("Malformed quote WS payload: %s", exc)
+        return None
     stage = _WIRE_QUOTE_STATE_TO_STAGE.get(payload.state)
     if stage is None:
         logger.warning("Unknown quote state %r for %s", payload.state, payload.quote_id)
@@ -151,8 +160,12 @@ def _parse_quote_event(data: dict[str, object]) -> QuoteUpdated | None:
     )
 
 
-def _parse_trade_event(data: dict[str, object]) -> TradeExecuted:
-    payload = BlockTradePayload.model_validate(data)
+def _parse_trade_event(data: dict[str, object]) -> TradeExecuted | None:
+    try:
+        payload = BlockTradePayload.model_validate(data)
+    except ValidationError as exc:
+        logger.warning("Malformed trade WS payload: %s", exc)
+        return None
     return TradeExecuted(
         block_trade_id=payload.block_trade_id,
         quote_id=payload.quote_id or "",

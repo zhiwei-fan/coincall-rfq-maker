@@ -16,6 +16,17 @@ class FakeFuturesRest:
         return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
 
 
+class PayloadFuturesRest:
+    def __init__(self, payloads: dict[str, dict[str, Any]]) -> None:
+        self._payloads = payloads
+        self.calls: list[str] = []
+
+    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+        assert symbol is not None
+        self.calls.append(symbol)
+        return self._payloads[symbol]
+
+
 class BlockingFuturesRest:
     def __init__(self, prices: dict[str, float]) -> None:
         self._prices = prices
@@ -137,6 +148,29 @@ async def test_prices_refreshed_queue_shutdown_race_does_not_crash_task_group() 
         tg.create_task(service.refresh_once(now_ms=1_000))
 
     assert service.get_price("BTCUSD") == 50_000.0
+
+
+@pytest.mark.asyncio
+async def test_malformed_symbol_info_payload_does_not_abort_other_underlyings() -> None:
+    rest = PayloadFuturesRest(
+        {
+            "BTCUSD": {"code": 0, "data": {"symbol": "BTCUSD", "indexPrice": 50_000.0}},
+            "ETHUSD": {"code": 0, "data": {"symbol": "ETHUSD", "indexPrice": {}}},
+        }
+    )
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    service = MarketDataService(rest, queue)  # type: ignore[arg-type]
+    service.track("BTCUSD")
+    service.track("ETHUSD")
+
+    await service.refresh_once(now_ms=1_000)
+
+    event = queue.get_nowait()
+    assert isinstance(event, PricesRefreshed)
+    assert event.underlyings == ("BTCUSD",)
+    assert service.get_price("BTCUSD") == 50_000.0
+    assert service.get_price("ETHUSD") is None
+    assert sorted(rest.calls) == ["BTCUSD", "ETHUSD"]
 
 
 @pytest.mark.asyncio
