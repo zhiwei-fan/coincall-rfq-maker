@@ -20,5 +20,8 @@ uv.lock
 .vscode/
 .idea/
 
+# macOS
+.DS_Store
+
 # Logs
 *.log

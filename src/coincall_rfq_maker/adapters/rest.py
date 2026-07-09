@@ -60,6 +60,10 @@ class CoincallRequestError(CoincallError):
     """Raised for client-side misuse (e.g. session not started)."""
 
 
+class CoincallMalformedResponseError(CoincallRequestError):
+    """Raised when an HTTP-200 response body is not the expected JSON object."""
+
+
 class CoincallAmbiguousError(CoincallRequestError):
     """Raised when a state-changing request may have reached the exchange."""
 
@@ -139,7 +143,7 @@ class CoincallRestClient:
                         raise CoincallRequestError(f"Unsupported method {method!r}")
             except CoincallApiError:
                 raise
-            except (TimeoutError, aiohttp.ClientError) as exc:
+            except (TimeoutError, aiohttp.ClientError, CoincallMalformedResponseError) as exc:
                 last_error = exc
                 logger.warning(
                     "Request %s %s failed (attempt %d/%d): %s",
@@ -166,7 +170,14 @@ class CoincallRestClient:
         text = await resp.text()
         if resp.status != 200:
             raise CoincallApiError(resp.status, None, text)
-        data: dict[str, Any] = json.loads(text)
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise CoincallMalformedResponseError("Malformed HTTP-200 response body") from exc
+        if not isinstance(data, dict):
+            raise CoincallMalformedResponseError(
+                f"Malformed HTTP-200 response body: expected object, got {type(data).__name__}"
+            )
         if data.get("code") != 0:
             raise CoincallApiError(resp.status, data.get("code"), data.get("msg", "Unknown error"))
         return data
@@ -220,7 +231,15 @@ class CoincallRestClient:
         )
 
     async def execute_quote(self, request_id: str, quote_id: str) -> ExecuteQuoteResult:
-        """Accept a quote and execute the resulting block trade."""
+        """Accept a quote and execute the resulting block trade.
+
+        A returned ``_request`` response means HTTP 200 + ``code==0``: the accept
+        SUCCEEDED and the block trade FILLED. That fill must NEVER be discarded,
+        so a payload that fails validation does NOT raise (raising would lose a
+        real fill); instead we log and return a best-effort result carrying
+        whatever ``blockTradeId`` can be salvaged (else the ``"UNKNOWN"``
+        sentinel), so the caller always has a fill to audit.
+        """
         response = await self._request(
             "POST",
             "/open/option/blocktrade/request/accept/v1",
@@ -228,10 +247,28 @@ class CoincallRestClient:
             idempotent=False,
             form_encoded=True,
         )
+        data = response.get("data")
+        raw = data if isinstance(data, dict) else {}
         try:
-            return ExecuteQuoteResult.model_validate(response.get("data") or {})
+            return ExecuteQuoteResult.model_validate(raw)
         except ValidationError as exc:
-            raise CoincallRequestError("Malformed execute-quote response") from exc
+            raw_block_trade_id = raw.get("blockTradeId")
+            block_trade_id = str(raw_block_trade_id) if raw_block_trade_id else "UNKNOWN"
+            logger.error(
+                "Accept for quote %s (RFQ %s) SUCCEEDED (code==0) but its response failed "
+                "validation; recording a best-effort fill (blockTradeId=%s) rather than "
+                "discarding it: %s",
+                quote_id,
+                request_id,
+                block_trade_id,
+                exc,
+            )
+            return ExecuteQuoteResult.model_construct(
+                block_trade_id=block_trade_id,
+                request_id=request_id,
+                quote_id=quote_id,
+                legs=[],
+            )
 
     async def get_quotes_received(self, request_id: str | None = None) -> tuple[QuotePayload, ...]:
         """GET /open/option/blocktrade/request/getQuotesReceived/v1"""

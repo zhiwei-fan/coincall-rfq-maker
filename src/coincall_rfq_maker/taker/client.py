@@ -1,19 +1,20 @@
 """Thin taker-side client over the Phase-1 REST endpoints.
 
 `TakerClient` wraps a `CoincallRestClient` (structurally, via `TakerRestPort`)
-and exposes only the SAFE, non-trade RFQ surface: list instruments, create an
-RFQ, view quotes received, cancel an RFQ, and list your RFQs. Trade execution
-is intentionally absent (Phase 2b).
+and exposes the RFQ surface the taker CLI needs: list instruments, create an
+RFQ, view quotes received, cancel an RFQ, re-validate a received quote, and
+execute (accept) a quote. There is no taker list-RFQs endpoint (rfqList 404s
+for the taker account) — the audit log is the orphan-recovery mechanism.
 """
 
 from collections.abc import Sequence
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from coincall_rfq_maker.adapters.schemas import (
+    ExecuteQuoteResult,
     OptionInstrument,
     QuotePayload,
     RfqCreateResult,
-    RfqListSnapshot,
 )
 
 
@@ -34,14 +35,7 @@ class TakerRestPort(Protocol):
 
     async def cancel_rfq(self, request_id: str) -> dict[str, Any]: ...
 
-    async def get_rfq_list(
-        self,
-        request_id: str | None = None,
-        state: Literal["OPEN", "CLOSED"] | None = None,
-        role: Literal["TAKER", "MAKER"] | None = None,
-        start_time: int | None = None,
-        end_time: int | None = None,
-    ) -> RfqListSnapshot: ...
+    async def execute_quote(self, request_id: str, quote_id: str) -> ExecuteQuoteResult: ...
 
 
 class TakerClient:
@@ -113,5 +107,29 @@ class TakerClient:
     async def cancel_rfq(self, request_id: str) -> None:
         await self._rest.cancel_rfq(request_id)
 
-    async def list_rfqs(self, state: Literal["OPEN", "CLOSED"] | None = "OPEN") -> RfqListSnapshot:
-        return await self._rest.get_rfq_list(role="TAKER", state=state)
+    async def execute_quote(self, request_id: str, quote_id: str) -> ExecuteQuoteResult:
+        """Accept ``quote_id`` for ``request_id`` — places a REAL block trade.
+
+        ``execute_quote`` is non-idempotent and MUST NOT be retried; a transport
+        failure surfaces as ``CoincallAmbiguousError`` for the caller to handle.
+        """
+        return await self._rest.execute_quote(request_id, quote_id)
+
+    async def find_received_quote(self, request_id: str, quote_id: str) -> QuotePayload | None:
+        """Return the still-live received quote matching both ids, else ``None``.
+
+        Used for pre-execute re-validation: the quote must still exist and belong
+        to this RFQ. Returns ``None`` when it has expired off the book or the ids
+        do not line up.
+        """
+        quotes = await self._rest.get_quotes_received(request_id)
+        for quote in quotes:
+            # Tolerate a quote that omits requestId (the live getQuotesReceived
+            # response may not echo it per quote) — else every execute would
+            # refuse as not_found. A PRESENT-but-mismatched requestId is still
+            # rejected.
+            if quote.quote_id == quote_id and (
+                quote.request_id is None or quote.request_id == request_id
+            ):
+                return quote
+        return None

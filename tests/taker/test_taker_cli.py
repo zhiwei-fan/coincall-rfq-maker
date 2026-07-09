@@ -1,5 +1,6 @@
 import asyncio
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -8,11 +9,10 @@ from coincall_rfq_maker.adapters.schemas import (
     OptionInstrument,
     QuotePayload,
     RfqCreateResult,
-    RfqListSnapshot,
-    RfqPayload,
 )
 from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker import cli
+from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
 
 BETA_URL = "https://betaapi.coincall.com"
@@ -48,21 +48,11 @@ QUOTE = QuotePayload.model_validate(
     }
 )
 
-RFQ = RfqPayload.model_validate(
-    {
-        "requestId": "r1",
-        "state": "ACTIVE",
-        "createTime": 1761650457000,
-        "legs": [{"instrumentName": "BTCUSD-9JUL26-56000-C", "side": "BUY", "quantity": "0.2"}],
-    }
-)
-
 
 class FakeRest:
     def __init__(self) -> None:
         self.created_legs: list[dict[str, str]] | None = None
         self.cancelled: list[str] = []
-        self.rfq_list_calls: list[dict[str, Any]] = []
 
     async def get_option_instruments(self, base_currency: str) -> tuple[OptionInstrument, ...]:
         assert base_currency == "BTC"
@@ -78,17 +68,6 @@ class FakeRest:
     async def cancel_rfq(self, request_id: str) -> dict[str, Any]:
         self.cancelled.append(request_id)
         return {"code": 0, "data": {"cancelled": True}}
-
-    async def get_rfq_list(
-        self,
-        request_id: str | None = None,
-        state: Literal["OPEN", "CLOSED"] | None = None,
-        role: Literal["TAKER", "MAKER"] | None = None,
-        start_time: int | None = None,
-        end_time: int | None = None,
-    ) -> RfqListSnapshot:
-        self.rfq_list_calls.append({"state": state, "role": role})
-        return RfqListSnapshot((RFQ,))
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -157,12 +136,18 @@ def test_beta_host_with_taker_creds_builds_client() -> None:
 
 
 def test_create_rfq_preflights_legs_and_prints_request_id(
-    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake = FakeRest()
     client = TakerClient(fake)
 
-    asyncio.run(cli._cmd_create_rfq(client, ["BTCUSD-9JUL26-56000-C:BUY:0.2"]))
+    asyncio.run(
+        cli._cmd_create_rfq(
+            client,
+            AuditLog(tmp_path / "audit.jsonl"),
+            ["BTCUSD-9JUL26-56000-C:BUY:0.2"],
+        )
+    )
 
     assert fake.created_legs == [
         {"instrumentName": "BTCUSD-9JUL26-56000-C", "side": "BUY", "qty": "0.2"}
@@ -170,6 +155,9 @@ def test_create_rfq_preflights_legs_and_prints_request_id(
     out = capsys.readouterr().out
     assert "requestId: REQ123" in out
     assert "next: rfq-taker quotes --request-id REQ123" in out
+    audit_text = (tmp_path / "audit.jsonl").read_text()
+    assert "create_attempt" in audit_text
+    assert "create_rfq" in audit_text
 
 
 def test_quotes_render_sample_payload(capsys: pytest.CaptureFixture[str]) -> None:
@@ -195,24 +183,16 @@ def test_quotes_render_empty(capsys: pytest.CaptureFixture[str]) -> None:
     assert "No quotes received yet." in capsys.readouterr().out
 
 
-def test_rfqs_render_and_request_taker_role(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cancel_rfq_confirms(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fake = FakeRest()
 
-    asyncio.run(cli._cmd_rfqs(TakerClient(fake), "OPEN"))
-
-    assert fake.rfq_list_calls == [{"state": "OPEN", "role": "TAKER"}]
-    out = capsys.readouterr().out
-    assert "requestId=r1" in out
-    assert "BUY 0.2 BTCUSD-9JUL26-56000-C" in out
-
-
-def test_cancel_rfq_confirms(capsys: pytest.CaptureFixture[str]) -> None:
-    fake = FakeRest()
-
-    asyncio.run(cli._cmd_cancel_rfq(TakerClient(fake), "r1"))
+    asyncio.run(cli._cmd_cancel_rfq(TakerClient(fake), AuditLog(tmp_path / "audit.jsonl"), "r1"))
 
     assert fake.cancelled == ["r1"]
     assert "cancelled RFQ r1" in capsys.readouterr().out
+    audit_text = (tmp_path / "audit.jsonl").read_text()
+    assert "cancel_attempt" in audit_text
+    assert "cancel_rfq" in audit_text
 
 
 def test_instruments_render_active_only(capsys: pytest.CaptureFixture[str]) -> None:
@@ -223,14 +203,36 @@ def test_instruments_render_active_only(capsys: pytest.CaptureFixture[str]) -> N
     assert "symbolName" in out
 
 
-def test_help_lists_safe_surface_and_no_trade(
+def test_help_lists_full_surface_and_drops_rfqs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(["--help"])
 
     out = capsys.readouterr().out
-    for command in ("instruments", "create-rfq", "quotes", "cancel-rfq", "rfqs"):
+    for command in ("instruments", "create-rfq", "quotes", "cancel-rfq", "execute", "trade"):
         assert command in out
-    assert "execute" not in out
-    assert "trade" not in out
+    # The rfqs verb was removed (rfqList 404s for takers); the subcommand line
+    # must not offer it.
+    subcommands = out.split("...", 1)[0]
+    assert "rfqs" not in subcommands
+
+
+def test_parse_args_rejects_non_positive_poll() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["trade", "--leg", "BTCUSD-9JUL26-56000-C:BUY:0.2", "--poll", "0"])
+
+    assert exc_info.value.code == 2
+
+
+def test_parse_args_rejects_non_positive_timeout() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["trade", "--leg", "BTCUSD-9JUL26-56000-C:BUY:0.2", "--timeout", "-1"])
+
+    assert exc_info.value.code == 2
+
+
+def test_parse_args_accepts_positive_poll() -> None:
+    args = cli.parse_args(["trade", "--leg", "BTCUSD-9JUL26-56000-C:BUY:0.2", "--poll", "0.1"])
+
+    assert args.poll == 0.1

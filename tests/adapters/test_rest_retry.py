@@ -93,6 +93,26 @@ class ApiErrorGetSession:
         return ResponseContext(200, '{"code":400001,"msg":"application rejected"}')
 
 
+class StaticPostSession:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.post_attempts = 0
+
+    def post(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        self.post_attempts += 1
+        return ResponseContext(200, self._text)
+
+
+class StaticGetSession:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.get_attempts = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        self.get_attempts += 1
+        return ResponseContext(200, self._text)
+
+
 @pytest.mark.asyncio
 async def test_state_changing_post_timeout_is_not_retried_and_is_ambiguous() -> None:
     session = TimeoutPostSession()
@@ -138,6 +158,49 @@ async def test_application_error_response_is_not_retried() -> None:
     assert session.get_attempts == 1
     assert exc_info.value.status == 200
     assert exc_info.value.code == 400001
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_execute_non_json_200_body_is_ambiguous() -> None:
+    session = StaticPostSession("not json")
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallAmbiguousError):
+        await client.execute_quote("rfq-1", "quote-1")
+
+    assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_execute_json_array_200_body_is_ambiguous() -> None:
+    session = StaticPostSession('["not", "an", "object"]')
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallAmbiguousError):
+        await client.execute_quote("rfq-1", "quote-1")
+
+    assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_get_non_json_200_body_retries_then_request_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = StaticGetSession("not json")
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr("coincall_rfq_maker.adapters.rest.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
+        await client._request("GET", "/open/option/blocktrade/rfqList/v1")
+
+    assert session.get_attempts == _MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
