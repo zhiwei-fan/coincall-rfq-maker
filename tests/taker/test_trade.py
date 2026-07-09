@@ -4,8 +4,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from coincall_rfq_maker.adapters.rest import CoincallAmbiguousError, CoincallApiError
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.rest import CoincallAmbiguousError, CoincallApiError
+from coincall_rfq_maker.core.adapters.schemas import (
     ExecuteQuoteResult,
     OptionInstrument,
     QuotePayload,

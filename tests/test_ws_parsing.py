@@ -7,11 +7,11 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from coincall_rfq_maker.adapters import ws
-from coincall_rfq_maker.adapters.ws import CoincallWsClient, parse_ws_message
+import coincall_rfq_maker.ws as ws
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
+from coincall_rfq_maker.ws import CoincallWsClient, parse_ws_message
 
 
 def test_dt_28_active_rfq_produces_rfq_received() -> None:
@@ -266,7 +266,7 @@ async def test_run_redacts_signed_url_from_connection_error_log(
     monkeypatch.setattr(ws.websockets, "connect", fake_connect)
     client = CoincallWsClient("wss://example.test/ws", "maker-key", "secret", asyncio.Queue())
 
-    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.adapters.ws"):
+    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.ws"):
         await client.run(shutdown)
 
     signed_query = urlparse(captured_url).query

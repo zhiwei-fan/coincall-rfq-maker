@@ -5,12 +5,12 @@ from typing import Any
 
 import pytest
 
-from coincall_rfq_maker.adapters.rest import (
+from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRestClient,
 )
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     ExecuteQuoteResult,
     QuotePayload,
 )

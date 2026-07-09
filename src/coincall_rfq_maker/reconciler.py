@@ -3,9 +3,9 @@
 import logging
 from typing import Protocol
 
-from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import rfq_from_payload
-from coincall_rfq_maker.clock import get_timestamp_ms
+from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.core.adapters.schemas import rfq_from_payload
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStatus
 from coincall_rfq_maker.persistence.store import PersistenceStore

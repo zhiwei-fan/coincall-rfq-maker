@@ -8,20 +8,20 @@ exchange — intents are computed and logged only.
 import logging
 from dataclasses import replace
 
-from coincall_rfq_maker.adapters.rest import (
+from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallError,
     CoincallRequestError,
     CoincallRestClient,
 )
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     QuotePayload,
     coalesce,
     find_remote_quote,
     find_salvaged_quote_id,
     quote_from_payload,
 )
-from coincall_rfq_maker.clock import current_time_ms
+from coincall_rfq_maker.core.clock import current_time_ms
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.api_accounting import ApiOutcomeBoundary, ApiOutcomeReporter

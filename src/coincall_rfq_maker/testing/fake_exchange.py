@@ -5,8 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from coincall_rfq_maker.adapters.rest import CoincallApiError, CoincallRequestError
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.rest import CoincallApiError, CoincallRequestError
+from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
     QuoteListSnapshot,
     QuotePayload,

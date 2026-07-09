@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from coincall_rfq_maker.adapters.rest import CoincallApiError
+from coincall_rfq_maker.core.adapters.rest import CoincallApiError
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqLeg, Side
 from coincall_rfq_maker.events import QuoteUpdated

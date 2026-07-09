@@ -22,8 +22,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from coincall_rfq_maker.adapters.rest import CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import OptionInstrument, QuotePayload
+from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.core.adapters.schemas import OptionInstrument, QuotePayload
 from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient

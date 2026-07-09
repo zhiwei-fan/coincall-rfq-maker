@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 import aiohttp
 from pydantic import ValidationError
 
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
     ExecuteQuoteResult,
     OptionInstrument,
@@ -28,11 +28,11 @@ from coincall_rfq_maker.adapters.schemas import (
     SymbolInfoPayload,
     rfq_status_from_wire,
 )
-from coincall_rfq_maker.adapters.signing import (
+from coincall_rfq_maker.core.adapters.signing import (
     encode_query_params,
     sign_rest_request,
 )
-from coincall_rfq_maker.clock import get_timestamp_ms
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 
 logger = logging.getLogger(__name__)
 

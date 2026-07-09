@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from coincall_rfq_maker.adapters.rest import CoincallRestClient
-from coincall_rfq_maker.adapters.signing import sign_rest_request
+from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.core.adapters.signing import sign_rest_request
 
 _FIXED_TS = 1_700_000_000_000
 _SIGNED_HEADER_KEYS = ("sign", "ts", "X-CC-APIKEY", "X-REQ-TS-DIFF")
@@ -65,7 +65,7 @@ class CapturePostSession:
 
 @pytest.fixture
 def _fixed_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("coincall_rfq_maker.adapters.rest.get_timestamp_ms", lambda: _FIXED_TS)
+    monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.get_timestamp_ms", lambda: _FIXED_TS)
 
 
 def _expected_signed_headers(

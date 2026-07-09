@@ -4,14 +4,14 @@ from typing import Any
 import pytest
 
 from coincall_rfq_maker import reconciler
-from coincall_rfq_maker.adapters.rest import (
+from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
     _parse_quote_list,
     _parse_rfq_list,
 )
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
     QuoteListSnapshot,
     RfqListSnapshot,

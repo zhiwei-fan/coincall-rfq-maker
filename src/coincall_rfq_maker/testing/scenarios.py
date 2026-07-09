@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast, runtime_checkable
 
-from coincall_rfq_maker.adapters.rest import CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import QuotePayload
+from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.core.adapters.schemas import QuotePayload
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqLeg, Side
 from coincall_rfq_maker.marketdata.service import MarketDataService

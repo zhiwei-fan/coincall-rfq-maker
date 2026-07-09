@@ -1,7 +1,7 @@
 import pytest
 
-from coincall_rfq_maker.adapters.rest import CoincallRequestError
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
+from coincall_rfq_maker.core.adapters.schemas import (
     QuoteListSnapshot,
     QuotePayload,
     SymbolInfoPayload,

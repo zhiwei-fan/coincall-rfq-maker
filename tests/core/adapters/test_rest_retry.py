@@ -5,7 +5,7 @@ from typing import Any
 import aiohttp
 import pytest
 
-from coincall_rfq_maker.adapters.rest import (
+from coincall_rfq_maker.core.adapters.rest import (
     _MAX_ATTEMPTS,
     _RETRY_BACKOFF_SECONDS,
     CoincallAmbiguousError,
@@ -137,7 +137,7 @@ async def test_idempotent_get_transient_failure_retries_max_attempts_then_raises
     async def fake_sleep(delay: float) -> None:
         sleeps.append(delay)
 
-    monkeypatch.setattr("coincall_rfq_maker.adapters.rest.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.asyncio.sleep", fake_sleep)
 
     with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
         await client._request("GET", "/open/option/blocktrade/rfqList/v1")
@@ -195,7 +195,7 @@ async def test_idempotent_get_non_json_200_body_retries_then_request_error(
     async def fake_sleep(delay: float) -> None:
         pass
 
-    monkeypatch.setattr("coincall_rfq_maker.adapters.rest.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.asyncio.sleep", fake_sleep)
 
     with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
         await client._request("GET", "/open/option/blocktrade/rfqList/v1")

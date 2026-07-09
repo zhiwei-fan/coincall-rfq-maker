@@ -1,6 +1,6 @@
 import pytest
 
-from coincall_rfq_maker.adapters.schemas import OptionInstrument
+from coincall_rfq_maker.core.adapters.schemas import OptionInstrument
 from coincall_rfq_maker.taker.client import TakerClient, TakerInputError
 
 

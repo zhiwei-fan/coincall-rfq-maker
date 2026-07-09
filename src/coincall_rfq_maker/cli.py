@@ -15,8 +15,7 @@ from collections.abc import Sequence
 
 from pydantic import ValidationError
 
-from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
-from coincall_rfq_maker.adapters.ws import CoincallWsClient
+from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
@@ -26,6 +25,7 @@ from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.risk.gate import NullExposureProvider, RiskGate
 from coincall_rfq_maker.settings import Settings
+from coincall_rfq_maker.ws import CoincallWsClient
 
 logger = logging.getLogger(__name__)
 

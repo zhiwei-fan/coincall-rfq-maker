@@ -5,7 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol
 
-from coincall_rfq_maker.adapters.rest import CoincallError
+from coincall_rfq_maker.core.adapters.rest import CoincallError
 
 
 @dataclass

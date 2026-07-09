@@ -16,8 +16,8 @@ because it makes interleaving races structurally impossible.
 
 import logging
 
-from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
-from coincall_rfq_maker.clock import get_timestamp_ms
+from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus

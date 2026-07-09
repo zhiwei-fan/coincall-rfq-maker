@@ -10,7 +10,7 @@ for the taker account) — the audit log is the orphan-recovery mechanism.
 from collections.abc import Sequence
 from typing import Any, Protocol
 
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     ExecuteQuoteResult,
     OptionInstrument,
     QuotePayload,

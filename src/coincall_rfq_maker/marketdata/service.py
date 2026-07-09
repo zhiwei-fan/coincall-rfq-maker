@@ -14,7 +14,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from coincall_rfq_maker.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
 from coincall_rfq_maker.events import PricesRefreshed
 
 logger = logging.getLogger(__name__)

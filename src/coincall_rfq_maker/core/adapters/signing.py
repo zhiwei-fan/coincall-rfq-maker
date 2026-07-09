@@ -12,7 +12,7 @@ import json
 from typing import Any
 from urllib.parse import quote
 
-from coincall_rfq_maker.clock import get_timestamp_ms as _get_timestamp_ms
+from coincall_rfq_maker.core.clock import get_timestamp_ms as _get_timestamp_ms
 
 
 def get_timestamp_ms() -> int:

@@ -288,7 +288,7 @@ def find_salvaged_quote_id(remote_quotes: QuoteListSnapshot, request_id: str) ->
 def quote_from_payload(current: Quote, payload: QuotePayload) -> Quote:
     stage = quote_stage_from_wire(payload.state)
     if stage is None:
-        from coincall_rfq_maker.adapters.rest import CoincallRequestError
+        from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
 
         raise CoincallRequestError(
             f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"

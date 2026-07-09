@@ -6,8 +6,8 @@ timestamp=1750000000000, diff=5000) before those files were deleted. If these
 ever need to change, re-derive against a live account — do not hand-edit them.
 """
 
-from coincall_rfq_maker.adapters.schemas import CreateQuoteResult
-from coincall_rfq_maker.adapters.signing import (
+from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult
+from coincall_rfq_maker.core.adapters.signing import (
     build_rest_headers,
     build_rest_prehash,
     build_ws_signed_url,

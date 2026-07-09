@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Self
 import pytest
 
 from coincall_rfq_maker import cli
-from coincall_rfq_maker.adapters.rest import CoincallRequestError
+from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.settings import Settings
 

@@ -18,7 +18,7 @@ from typing import Protocol
 import websockets
 from pydantic import ValidationError
 
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.schemas import (
     BlockTradePayload,
     QuotePayload,
     RfqPayload,
@@ -27,7 +27,7 @@ from coincall_rfq_maker.adapters.schemas import (
     rfq_from_payload,
     rfq_status_from_wire,
 )
-from coincall_rfq_maker.adapters.signing import build_ws_signed_url
+from coincall_rfq_maker.core.adapters.signing import build_ws_signed_url
 from coincall_rfq_maker.domain.rfq import RfqStatus
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
 

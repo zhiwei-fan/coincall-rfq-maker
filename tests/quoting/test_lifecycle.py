@@ -4,13 +4,13 @@ from typing import Any
 
 import pytest
 
-from coincall_rfq_maker.adapters.rest import (
+from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
     _parse_quote_list,
 )
-from coincall_rfq_maker.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
+from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle

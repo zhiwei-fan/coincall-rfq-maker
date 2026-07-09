@@ -13,7 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from coincall_rfq_maker.clock import get_timestamp_ms
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 
 
 class AuditLog:

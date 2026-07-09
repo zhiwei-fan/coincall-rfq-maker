@@ -5,8 +5,8 @@ from typing import Any
 import aiohttp
 import pytest
 
-from coincall_rfq_maker.adapters.rest import CoincallAmbiguousError, CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import (
+from coincall_rfq_maker.core.adapters.rest import CoincallAmbiguousError, CoincallRestClient
+from coincall_rfq_maker.core.adapters.schemas import (
     ExecuteQuoteResult,
     OptionInstrument,
     QuotePayload,
