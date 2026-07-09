@@ -53,9 +53,14 @@ def load_settings_or_exit() -> Settings:
     try:
         return Settings()  # type: ignore[call-arg]
     except ValidationError as exc:
+        details = "\n".join(
+            f"- {'.'.join(str(part) for part in error['loc']) or 'settings'}: "
+            f"{error['msg']} ({error['type']})"
+            for error in exc.errors(include_input=False)
+        )
         sys.stderr.write(
             "Configuration error: API_KEY and API_SECRET must be set (via environment "
-            f"or .env) before starting rfq-maker.\n{exc}\n"
+            f"or .env) before starting rfq-maker.\n{details}\n"
         )
         raise SystemExit(1) from exc
 

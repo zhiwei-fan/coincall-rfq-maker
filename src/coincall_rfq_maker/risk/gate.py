@@ -144,9 +144,18 @@ class RiskGate:
         if notional > self._max_notional:
             return self._reject(f"quote notional {notional:.2f} exceeds max {self._max_notional}")
 
-        for instrument_name, age in market_data_ages_seconds.items():
+        checked_instruments: set[str] = set()
+        for intent_leg in intent.legs:
+            if intent_leg.instrument_name in checked_instruments:
+                continue
+            checked_instruments.add(intent_leg.instrument_name)
+            age = market_data_ages_seconds.get(intent_leg.instrument_name)
+            if age is None:
+                return self._reject(f"missing market data age for {intent_leg.instrument_name}")
             if age > self._stale_seconds:
-                return self._reject(f"market data for {instrument_name} stale ({age:.1f}s)")
+                return self._reject(
+                    f"market data for {intent_leg.instrument_name} stale ({age:.1f}s)"
+                )
 
         return RiskDecision(approved=True)
 

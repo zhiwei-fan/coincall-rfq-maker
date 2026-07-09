@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 from types import TracebackType
 from typing import Any, Self
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -77,12 +79,25 @@ def test_malformed_dt_20_quote_update_ignored() -> None:
 
 def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
     raw = json.dumps(
-        {"dt": 22, "d": {"blockTradeId": "bt-1", "quoteId": "q-1", "requestId": "rfq-1"}}
+        {
+            "dt": 22,
+            "d": {
+                "blockTradeId": "bt-1",
+                "quoteId": "q-1",
+                "requestId": "rfq-1",
+                "filledPrice": 22.5,
+                "filledQuantity": 1.0,
+                "fillTime": 123456,
+            },
+        }
     )
     event = parse_ws_message(raw)
     assert isinstance(event, TradeExecuted)
     assert event.block_trade_id == "bt-1"
     assert event.quote_id == "q-1"
+    assert event.filled_price == 22.5
+    assert event.filled_quantity == 1.0
+    assert event.fill_time_ms == 123456
 
 
 def test_malformed_dt_22_block_trade_detail_ignored() -> None:
@@ -232,6 +247,36 @@ async def test_heartbeat_sent_after_subscribe_and_stops_on_shutdown(
     await asyncio.sleep(0.03)
 
     assert len(connection.sent) == stopped_at
+
+
+@pytest.mark.asyncio
+async def test_run_redacts_signed_url_from_connection_error_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    shutdown = asyncio.Event()
+    captured_url = ""
+
+    async def fake_connect(url: str, *args: Any, **kwargs: Any) -> BlockingConnection:
+        nonlocal captured_url
+        captured_url = url
+        shutdown.set()
+        raise RuntimeError(f"bad signed URL: {url}")
+
+    monkeypatch.setattr(ws.websockets, "connect", fake_connect)
+    client = CoincallWsClient("wss://example.test/ws", "maker-key", "secret", asyncio.Queue())
+
+    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.adapters.ws"):
+        await client.run(shutdown)
+
+    signed_query = urlparse(captured_url).query
+    values = parse_qs(signed_query)
+    assert captured_url
+    assert captured_url not in caplog.text
+    assert signed_query not in caplog.text
+    assert "maker-key" not in caplog.text
+    assert values["sign"][0] not in caplog.text
+    assert "apiKey=maker-key" not in caplog.text
 
 
 @pytest.mark.asyncio

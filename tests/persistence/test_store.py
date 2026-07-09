@@ -1,3 +1,4 @@
+import aiosqlite
 import pytest
 
 from coincall_rfq_maker.domain.quote import Quote, QuoteLeg, QuoteStage
@@ -36,6 +37,9 @@ async def test_quote_round_trip_with_market_snapshot(tmp_path) -> None:  # type:
         legs=(QuoteLeg(instrument_name=INSTRUMENT, price=22.5),),
         create_time_ms=0,
         quote_id="q-1",
+        filled_price=22.5,
+        filled_quantity=1.0,
+        fill_time_ms=123456,
     )
     async with PersistenceStore(db_path) as store:
         await store.record_quote(quote, {"BTCUSD": 50_000.0}, now_ms=100)
@@ -43,17 +47,85 @@ async def test_quote_round_trip_with_market_snapshot(tmp_path) -> None:  # type:
     assert len(history) == 1
     assert history[0]["quote_id"] == "q-1"
     assert history[0]["market_snapshot"] == {"BTCUSD": 50_000.0}
+    assert history[0]["filled_price"] == 22.5
+    assert history[0]["filled_quantity"] == 1.0
+    assert history[0]["fill_time_ms"] == 123456
 
 
 @pytest.mark.asyncio
 async def test_fill_round_trip(tmp_path) -> None:  # type: ignore[no-untyped-def]
     db_path = str(tmp_path / "test.db")
-    event = TradeExecuted(block_trade_id="bt-1", quote_id="q-1", request_id="rfq-1")
+    event = TradeExecuted(
+        block_trade_id="bt-1",
+        quote_id="q-1",
+        request_id="rfq-1",
+        filled_price=22.5,
+        filled_quantity=1.0,
+        fill_time_ms=123456,
+    )
     async with PersistenceStore(db_path) as store:
         await store.record_fill(event, now_ms=100)
         fills = await store.fetch_fills()
     assert len(fills) == 1
     assert fills[0]["block_trade_id"] == "bt-1"
+    assert fills[0]["filled_price"] == 22.5
+    assert fills[0]["filled_quantity"] == 1.0
+    assert fills[0]["fill_time_ms"] == 123456
+
+
+@pytest.mark.asyncio
+async def test_existing_database_missing_fill_columns_is_migrated(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    db_path = str(tmp_path / "test.db")
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                quote_id TEXT,
+                request_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                legs_json TEXT NOT NULL,
+                market_snapshot_json TEXT,
+                recorded_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_trade_id TEXT NOT NULL,
+                quote_id TEXT NOT NULL,
+                request_id TEXT,
+                recorded_at_ms INTEGER NOT NULL
+            );
+            """
+        )
+        await conn.commit()
+
+    quote = Quote(
+        request_id="rfq-1",
+        stage=QuoteStage.FILLED,
+        legs=(QuoteLeg(instrument_name=INSTRUMENT, price=22.5),),
+        create_time_ms=0,
+        quote_id="q-1",
+        filled_price=22.5,
+        filled_quantity=1.0,
+        fill_time_ms=123456,
+    )
+    fill = TradeExecuted(
+        block_trade_id="bt-1",
+        quote_id="q-1",
+        request_id="rfq-1",
+        filled_price=22.5,
+        filled_quantity=1.0,
+        fill_time_ms=123456,
+    )
+
+    async with PersistenceStore(db_path) as store:
+        await store.record_quote(quote, None, now_ms=100)
+        await store.record_fill(fill, now_ms=101)
+        history = await store.fetch_quote_history("rfq-1")
+        fills = await store.fetch_fills()
+
+    assert history[0]["filled_price"] == 22.5
+    assert fills[0]["filled_quantity"] == 1.0
 
 
 @pytest.mark.asyncio

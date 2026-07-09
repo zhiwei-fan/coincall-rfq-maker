@@ -43,6 +43,8 @@ from coincall_rfq_maker.risk.gate import RiskGate
 
 logger = logging.getLogger(__name__)
 
+RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS = 120.0
+
 DispatchEvent = (
     RfqReceived
     | RfqTerminated
@@ -63,9 +65,14 @@ class RfqStore:
 
     def __init__(self) -> None:
         self._rfqs: dict[str, Rfq] = {}
+        self._received_at_ms: dict[str, int] = {}
         self._instrument_holders: dict[str, set[str]] = {}
 
-    def upsert(self, rfq: Rfq) -> None:
+    def upsert(self, rfq: Rfq, received_at_ms: int | None = None) -> None:
+        if rfq.request_id not in self._rfqs:
+            self._received_at_ms[rfq.request_id] = (
+                received_at_ms if received_at_ms is not None else _now_ms()
+            )
         self._rfqs[rfq.request_id] = rfq
         for name in rfq.instrument_names():
             self._instrument_holders.setdefault(name, set()).add(rfq.request_id)
@@ -75,6 +82,9 @@ class RfqStore:
 
     def active(self) -> list[Rfq]:
         return [rfq for rfq in self._rfqs.values() if not rfq.is_terminal_status]
+
+    def received_at_ms(self, request_id: str) -> int | None:
+        return self._received_at_ms.get(request_id)
 
     def terminal(self) -> list[Rfq]:
         return [rfq for rfq in self._rfqs.values() if rfq.is_terminal_status]
@@ -121,6 +131,7 @@ class RfqStore:
         rfq = self._rfqs.pop(request_id, None)
         if rfq is None:
             return
+        self._received_at_ms.pop(request_id, None)
         for name in rfq.instrument_names():
             holders = self._instrument_holders.get(name)
             if holders is None:
@@ -170,7 +181,8 @@ class Orchestrator:
                 await self.reconcile_with_exchange()
 
     async def _handle_rfq_received(self, rfq: Rfq) -> None:
-        self.rfq_store.upsert(rfq)
+        now_ms = _now_ms()
+        self.rfq_store.upsert(rfq, received_at_ms=now_ms)
         for name in rfq.instrument_names():
             try:
                 underlying = parse_instrument(name).underlying
@@ -179,7 +191,7 @@ class Orchestrator:
                 continue
             self._market_data.track(underlying)
         if self._persistence is not None:
-            await self._persistence.record_rfq(rfq, _now_ms())
+            await self._persistence.record_rfq(rfq, now_ms)
         await self._reprice_and_quote(rfq.request_id)
 
     async def _handle_rfq_terminated(self, event: RfqTerminated) -> None:
@@ -373,8 +385,22 @@ class Orchestrator:
             logger.info("Reconciler: backfilling open RFQ %s from exchange", rfq.request_id)
             await self._handle_rfq_received(rfq)
 
+        now_ms = _now_ms()
         for rfq in self.rfq_store.active():
             if rfq.request_id not in remote_ids:
+                received_at_ms = self.rfq_store.received_at_ms(rfq.request_id)
+                age_seconds = (
+                    None if received_at_ms is None else (now_ms - received_at_ms) / 1000
+                )
+                if age_seconds is not None and age_seconds < RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS:
+                    logger.debug(
+                        "Reconciler: RFQ %s absent from exchange OPEN snapshot for %.1fs; "
+                        "within %.1fs grace",
+                        rfq.request_id,
+                        age_seconds,
+                        RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS,
+                    )
+                    continue
                 logger.info(
                     "Reconciler: RFQ %s no longer open on exchange, marking terminal",
                     rfq.request_id,

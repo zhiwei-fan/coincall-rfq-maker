@@ -135,6 +135,25 @@ class ShutdownOnPutQueue:
         raise asyncio.QueueShutDown
 
 
+def test_load_settings_error_does_not_print_secret_value(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("API_SECRET", "SUPERSECRETVALUE")
+
+    with pytest.raises(SystemExit):
+        cli.load_settings_or_exit()
+
+    stderr = capsys.readouterr().err
+    assert "API_KEY" in stderr
+    assert "Field required" in stderr
+    assert "SUPERSECRETVALUE" not in stderr
+    assert "input_value" not in stderr
+
+
 @pytest.mark.asyncio
 async def test_startup_cancel_all_failure_exits_cleanly(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

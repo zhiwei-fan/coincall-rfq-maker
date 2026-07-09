@@ -46,6 +46,9 @@ class TradeExecuted:
     block_trade_id: str
     quote_id: str
     request_id: str | None = None
+    filled_price: float | None = None
+    filled_quantity: float | None = None
+    fill_time_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

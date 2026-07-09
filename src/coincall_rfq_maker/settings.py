@@ -20,7 +20,11 @@ class Settings(BaseSettings):
     """All tunables for the market maker. See README.md for the full table."""
 
     model_config = SettingsConfigDict(
-        env_file=".env", extra="ignore", case_sensitive=False, populate_by_name=True
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+        populate_by_name=True,
+        hide_input_in_errors=True,
     )
 
     api_key: str = Field(alias="API_KEY")

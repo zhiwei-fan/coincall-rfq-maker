@@ -98,6 +98,13 @@ def test_rejects_stale_market_data() -> None:
     assert "stale" in decision.reason
 
 
+def test_rejects_missing_market_data_age_for_intent_leg() -> None:
+    gate = make_gate()
+    decision = gate.evaluate(make_rfq(), make_intent(), {}, NOW_MS)
+    assert not decision.approved
+    assert decision.reason == f"missing market data age for {INSTRUMENT}"
+
+
 def test_rejects_below_min_time_to_expiry() -> None:
     gate = make_gate(min_time_to_expiry_hours=2.0)
     rfq = make_rfq(expiry_time_ms=NOW_MS + 60 * 1000)  # 1 minute out

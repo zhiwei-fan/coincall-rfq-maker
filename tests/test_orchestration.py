@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from coincall_rfq_maker import orchestration
 from coincall_rfq_maker.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
@@ -11,7 +12,7 @@ from coincall_rfq_maker.adapters.rest import (
 from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
-from coincall_rfq_maker.orchestration import Orchestrator
+from coincall_rfq_maker.orchestration import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS, Orchestrator
 from coincall_rfq_maker.pricing.engine import LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
@@ -214,14 +215,61 @@ async def test_reconciler_marks_locally_active_rfq_terminal_when_exchange_disagr
         risk_gate=None,  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
-    orchestrator.rfq_store.upsert(make_rfq("rfq-2"))  # exchange has already dropped this one
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
+    orchestrator.rfq_store.upsert(
+        make_rfq("rfq-2"), received_at_ms=0
+    )  # exchange has already dropped this one
 
     await orchestrator.reconcile_with_exchange()
 
     assert orchestrator.rfq_store.get("rfq-1").is_terminal_status is False  # type: ignore[union-attr]
     assert orchestrator.rfq_store.get("rfq-2") is None
     assert quotes.cancelled_for == ["rfq-2"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_graces_just_received_rfq_absent_from_exchange_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = FakeRest(open_request_ids=[])
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(orchestration, "_now_ms", lambda: 1_000_000)
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=1_000_000)
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert orchestrator.rfq_store.get("rfq-1") is not None
+    assert quotes.cancelled_for == []
+
+
+@pytest.mark.asyncio
+async def test_reconciler_expires_absent_rfq_after_grace_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = FakeRest(open_request_ids=[])
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(orchestration, "_now_ms", lambda: 1_000_000)
+    received_at_ms = 1_000_000 - int((RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS + 1) * 1000)
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=received_at_ms)
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert orchestrator.rfq_store.get("rfq-1") is None
+    assert quotes.cancelled_for == ["rfq-1"]
 
 
 @pytest.mark.asyncio
@@ -236,7 +284,7 @@ async def test_reconciler_converges_when_exchange_matches_local_state() -> None:
         risk_gate=None,  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
 
     await orchestrator.reconcile_with_exchange()
 
@@ -329,7 +377,7 @@ async def test_reconciler_adopts_unknown_exchange_quote_for_local_pending_create
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
     with pytest.raises(CoincallRequestError):
         await quotes.reconcile(make_intent())
     assert quotes.get_for_rfq("rfq-1").stage is QuoteStage.PENDING_CREATE  # type: ignore[union-attr]
@@ -740,7 +788,7 @@ async def test_reconcile_tick_dispatch_reconciles_exchange_state() -> None:
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
 
     await orchestrator.handle_event(ReconcileTick())
 

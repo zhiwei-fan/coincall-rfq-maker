@@ -11,6 +11,7 @@ never touches RFQ/quote/store state directly.
 import asyncio
 import json
 import logging
+import re
 from enum import IntEnum
 from typing import Protocol
 
@@ -40,6 +41,10 @@ _INITIAL_RECONNECT_DELAY_SECONDS = 1.0
 _MAX_RECONNECT_DELAY_SECONDS = 60.0
 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 _HEARTBEAT_MESSAGE = json.dumps({"action": "heartbeat"})
+_SIGNED_URL_RE = re.compile(
+    r"(?P<prefix>\b(?:wss?|https?)://[^\s'\"<>?]+)\?(?P<query>[^\s'\"<>)]*)"
+)
+_SENSITIVE_QUERY_PARAM_RE = re.compile(r"([?&](?:apiKey|sign|ts)=)[^&\s'\"<>)]*")
 
 _WIRE_QUOTE_STATE_TO_STAGE = {
     "OPEN": QuoteStage.OPEN,
@@ -170,7 +175,23 @@ def _parse_trade_event(data: dict[str, object]) -> TradeExecuted | None:
         block_trade_id=payload.block_trade_id,
         quote_id=payload.quote_id or "",
         request_id=payload.request_id,
+        filled_price=payload.filled_price,
+        filled_quantity=payload.filled_quantity,
+        fill_time_ms=payload.fill_time,
     )
+
+
+def _redact_ws_exception_message(exc: Exception) -> str:
+    message = str(exc)
+
+    def redact_url(match: re.Match[str]) -> str:
+        query = match.group("query")
+        if "apiKey=" in query or "sign=" in query:
+            return f"{match.group('prefix')}?<redacted>"
+        return match.group(0)
+
+    message = _SIGNED_URL_RE.sub(redact_url, message)
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", message)
 
 
 class CoincallWsClient:
@@ -197,8 +218,12 @@ class CoincallWsClient:
             try:
                 await self._connect_and_read(shutdown)
                 delay = _INITIAL_RECONNECT_DELAY_SECONDS
-            except Exception:
-                logger.exception("WS connection error")
+            except Exception as exc:
+                logger.error(
+                    "WS connection error: %s: %s",
+                    type(exc).__name__,
+                    _redact_ws_exception_message(exc),
+                )
             if shutdown.is_set():
                 return
             logger.info("Reconnecting WS in %.1fs", delay)

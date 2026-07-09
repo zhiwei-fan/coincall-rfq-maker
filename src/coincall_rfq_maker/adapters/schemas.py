@@ -97,6 +97,9 @@ class BlockTradePayload(BaseModel):
     block_trade_id: str = Field(alias="blockTradeId")
     quote_id: str | None = Field(default=None, alias="quoteId")
     request_id: str | None = Field(default=None, alias="requestId")
+    filled_price: float | None = Field(default=None, alias="filledPrice")
+    filled_quantity: float | None = Field(default=None, alias="filledQuantity")
+    fill_time: int | None = Field(default=None, alias="fillTime")
 
 
 class SymbolInfoPayload(BaseModel):
