@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast, runtime_checkable
 
 from coincall_rfq_maker.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.adapters.schemas import QuotePayload
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqLeg, Side
 from coincall_rfq_maker.marketdata.service import MarketDataService
@@ -59,7 +60,7 @@ class PriceController(Protocol):
 
 @runtime_checkable
 class QuoteStateReader(Protocol):
-    async def get_quote_list(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_quote_list(self, **kwargs: Any) -> list[QuotePayload]: ...
 
 
 @dataclass(slots=True)
@@ -216,19 +217,19 @@ async def _taker_executes(taker: TakerOperations, context: AssertionContext) -> 
     )
 
     exchange_quote = await _require_exchange_quote(taker, quote_id)
-    _check(exchange_quote["state"] == "FILLED", f"exchange quote {quote_id} is {exchange_quote}")
+    _check(exchange_quote.state == "FILLED", f"exchange quote {quote_id} is {exchange_quote}")
     _check(
-        exchange_quote["filledPrice"] == expected_fill_price,
-        f"exchange quote {quote_id} filled at {exchange_quote['filledPrice']}, "
+        exchange_quote.filled_price == expected_fill_price,
+        f"exchange quote {quote_id} filled at {exchange_quote.filled_price}, "
         f"expected {expected_fill_price}",
     )
     _check(
-        exchange_quote["filledQuantity"] == 1.0,
-        f"exchange quote {quote_id} filled {exchange_quote['filledQuantity']}",
+        exchange_quote.filled_quantity == 1.0,
+        f"exchange quote {quote_id} filled {exchange_quote.filled_quantity}",
     )
     _check(
-        exchange_quote["blockTradeId"] == block_trade_id,
-        f"exchange quote {quote_id} block trade {exchange_quote['blockTradeId']}, "
+        exchange_quote.block_trade_id == block_trade_id,
+        f"exchange quote {quote_id} block trade {exchange_quote.block_trade_id}, "
         f"expected {block_trade_id}",
     )
 
@@ -262,7 +263,7 @@ async def _rfq_cancelled(taker: TakerOperations, context: AssertionContext) -> N
 
     exchange_quote = await _require_exchange_quote(taker, quote_id)
     _check(
-        exchange_quote["state"] == "CANCELLED",
+        exchange_quote.state == "CANCELLED",
         f"exchange quote {quote_id} is {exchange_quote}",
     )
 
@@ -325,13 +326,10 @@ def _last[T](values: Sequence[T], message: str) -> T:
     return values[-1]
 
 
-async def _require_exchange_quote(taker: TakerOperations, quote_id: str) -> dict[str, Any]:
+async def _require_exchange_quote(taker: TakerOperations, quote_id: str) -> QuotePayload:
     if not isinstance(taker, QuoteStateReader):
         raise ScenarioFailure("terminal quote assertions require quote-state reader support")
-    response = await taker.get_quote_list(quote_id=quote_id)
-    data = response.get("data")
-    if not isinstance(data, list):
-        raise ScenarioFailure(f"quote lookup for {quote_id} returned malformed data")
-    matches = [item for item in data if isinstance(item, dict) and item.get("quoteId") == quote_id]
+    quotes = await taker.get_quote_list(quote_id=quote_id)
+    matches = [item for item in quotes if item.quote_id == quote_id]
     _check(len(matches) == 1, f"quote lookup for {quote_id} returned {len(matches)} matches")
     return matches[0]

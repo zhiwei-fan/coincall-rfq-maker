@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass
 
 from coincall_rfq_maker.adapters.rest import CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import SymbolInfoPayload
 from coincall_rfq_maker.events import PricesRefreshed
 
 logger = logging.getLogger(__name__)
@@ -91,8 +90,7 @@ class MarketDataService:
             if underlying not in self._tracked:
                 continue
             try:
-                response = await self._rest.get_symbol_info(underlying)
-                info = SymbolInfoPayload.model_validate(response.get("data") or {})
+                info = await self._rest.get_symbol_info(underlying)
             except Exception:
                 logger.exception("Failed to fetch symbol info for %s", underlying)
                 self._drain_commands()

@@ -13,7 +13,17 @@ from types import TracebackType
 from typing import Any, Literal, Self
 
 import aiohttp
+from pydantic import ValidationError
 
+from coincall_rfq_maker.adapters.schemas import (
+    CreateQuoteResult,
+    QuoteListSnapshot,
+    QuotePayload,
+    RfqListSnapshot,
+    RfqPayload,
+    SymbolInfoPayload,
+    rfq_status_from_wire,
+)
 from coincall_rfq_maker.adapters.signing import (
     encode_query_params,
     get_timestamp_ms,
@@ -155,7 +165,7 @@ class CoincallRestClient:
         role: Literal["TAKER", "MAKER"] | None = None,
         start_time: int | None = None,
         end_time: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> RfqListSnapshot:
         """GET /open/option/blocktrade/rfqList/v1"""
         params: dict[str, Any] = {}
         if request_id:
@@ -168,16 +178,39 @@ class CoincallRestClient:
             params["startTime"] = start_time
         if end_time:
             params["endTime"] = end_time
-        return await self._request("GET", "/open/option/blocktrade/rfqList/v1", params)
+        response = await self._request("GET", "/open/option/blocktrade/rfqList/v1", params)
+        return _parse_rfq_list(response)
 
     # -- Quote endpoints --------------------------------------------------
 
-    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> dict[str, Any]:
+    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
         """POST /open/option/blocktrade/quote/create/v1"""
         payload = {"requestId": request_id, "legs": legs}
-        return await self._request(
+        response = await self._request(
             "POST", "/open/option/blocktrade/quote/create/v1", payload, idempotent=False
         )
+        data = response.get("data") or {}
+        try:
+            result = CreateQuoteResult.model_validate(data)
+        except ValidationError as exc:
+            logger.error(
+                "Create-quote response missing quoteId for RFQ %s: %s",
+                request_id,
+                response,
+            )
+            raise CoincallRequestError(
+                f"Create-quote response missing quoteId for RFQ {request_id}"
+            ) from exc
+        if not result.quote_id:
+            logger.error(
+                "Create-quote response missing quoteId for RFQ %s: %s",
+                request_id,
+                response,
+            )
+            raise CoincallRequestError(
+                f"Create-quote response missing quoteId for RFQ {request_id}"
+            )
+        return result
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         """POST /open/option/blocktrade/quote/cancel/v1"""
@@ -202,7 +235,7 @@ class CoincallRestClient:
         symbol: str | None = None,
         start_time: int | None = None,
         end_time: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> QuoteListSnapshot:
         """GET /open/option/blocktrade/list-quote/v1"""
         params: dict[str, Any] = {}
         if quote_id:
@@ -223,13 +256,93 @@ class CoincallRestClient:
             and end_time - start_time > _MAX_QUOTE_LIST_WINDOW_MS
         ):
             raise CoincallRequestError("Quote list time range cannot exceed 3 days")
-        return await self._request("GET", "/open/option/blocktrade/list-quote/v1", params)
+        response = await self._request("GET", "/open/option/blocktrade/list-quote/v1", params)
+        return _parse_quote_list(response)
 
     # -- Futures market data --------------------------------------------------
 
-    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+    async def get_symbol_info(self, symbol: str | None = None) -> SymbolInfoPayload:
         """GET /open/futures/market/symbol/v1"""
         params: dict[str, Any] = {}
         if symbol is not None:
             params["symbol"] = symbol
-        return await self._request("GET", "/open/futures/market/symbol/v1", params)
+        response = await self._request("GET", "/open/futures/market/symbol/v1", params)
+        try:
+            return SymbolInfoPayload.model_validate(response.get("data") or {})
+        except ValidationError as exc:
+            raise CoincallRequestError(f"Malformed symbol info response for {symbol}") from exc
+
+
+def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
+    data = response.get("data") or {}
+    if not isinstance(data, dict):
+        logger.warning("Malformed RFQ REST response data: expected object")
+        return RfqListSnapshot()
+    raw_items = data.get("rfqList") or []
+    if not isinstance(raw_items, list):
+        logger.warning("Malformed RFQ REST response rfqList: expected list")
+        return RfqListSnapshot()
+    payloads, malformed_request_ids = _validated_rfq_items(raw_items)
+    valid_payloads: list[RfqPayload] = []
+    for payload in payloads:
+        if rfq_status_from_wire(payload.state) is None:
+            logger.warning(
+                "Malformed RFQ REST item: unknown state %r for %s",
+                payload.state,
+                payload.request_id,
+            )
+            if payload.request_id:
+                malformed_request_ids.add(payload.request_id)
+            continue
+        valid_payloads.append(payload)
+    return RfqListSnapshot(tuple(valid_payloads), frozenset(malformed_request_ids))
+
+
+def _parse_quote_list(response: dict[str, Any]) -> QuoteListSnapshot:
+    raw_items = response.get("data") or []
+    if not isinstance(raw_items, list):
+        logger.warning("Malformed quote REST response data: expected list")
+        return QuoteListSnapshot()
+    payloads, malformed_id_pairs = _validated_quote_items(raw_items)
+    return QuoteListSnapshot(tuple(payloads), frozenset(malformed_id_pairs))
+
+
+def _validated_rfq_items(raw_items: list[Any]) -> tuple[list[RfqPayload], set[str]]:
+    items: list[RfqPayload] = []
+    malformed_request_ids: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            logger.warning("Malformed RFQ REST item: expected object")
+            continue
+        try:
+            items.append(RfqPayload.model_validate(item))
+        except ValidationError as exc:
+            request_id = _wire_id(item.get("requestId"))
+            if request_id is not None:
+                malformed_request_ids.add(request_id)
+            logger.warning("Malformed RFQ REST item: %s", exc)
+    return items, malformed_request_ids
+
+
+def _validated_quote_items(raw_items: list[Any]) -> tuple[list[QuotePayload], set[tuple[str, str]]]:
+    items: list[QuotePayload] = []
+    malformed_id_pairs: set[tuple[str, str]] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            logger.warning("Malformed quote REST item: expected object")
+            continue
+        try:
+            items.append(QuotePayload.model_validate(item))
+        except ValidationError as exc:
+            request_id = _wire_id(item.get("requestId"))
+            quote_id = _wire_id(item.get("quoteId"))
+            if request_id is not None and quote_id is not None:
+                malformed_id_pairs.add((request_id, quote_id))
+            logger.warning("Malformed quote REST item: %s", exc)
+    return items, malformed_id_pairs
+
+
+def _wire_id(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None

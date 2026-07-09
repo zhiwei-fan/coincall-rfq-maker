@@ -7,7 +7,6 @@ exchange — intents are computed and logged only.
 
 import logging
 from dataclasses import replace
-from typing import Any
 
 from coincall_rfq_maker.adapters.rest import (
     CoincallAmbiguousError,
@@ -15,7 +14,11 @@ from coincall_rfq_maker.adapters.rest import (
     CoincallRequestError,
     CoincallRestClient,
 )
-from coincall_rfq_maker.adapters.schemas import QuotePayload
+from coincall_rfq_maker.adapters.schemas import (
+    QuoteListSnapshot,
+    QuotePayload,
+    quote_stage_from_wire,
+)
 from coincall_rfq_maker.adapters.signing import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
@@ -24,12 +27,6 @@ from coincall_rfq_maker.quoting.strategy import QuoteIntent
 logger = logging.getLogger(__name__)
 
 _PRICE_TOLERANCE = 1e-9
-_WIRE_QUOTE_STATE_TO_STAGE = {
-    "OPEN": QuoteStage.OPEN,
-    "CANCELLED": QuoteStage.CANCELLED,
-    "FILLED": QuoteStage.FILLED,
-    "EXPIRED": QuoteStage.EXPIRED,
-}
 
 
 class QuoteLifecycle:
@@ -194,6 +191,8 @@ class QuoteLifecycle:
 
     def adopt_open_exchange_quote(self, request_id: str, quote_id: str) -> Quote | None:
         """Adopt an exchange-open quote that matches a known local RFQ quote."""
+        if not request_id or not quote_id:
+            return None
         existing = self._by_request.get(request_id)
         if existing is None or existing.stage not in {QuoteStage.PENDING_CREATE, QuoteStage.OPEN}:
             return None
@@ -267,7 +266,7 @@ class QuoteLifecycle:
             {"instrumentName": leg.instrument_name, "price": str(leg.price)} for leg in intent.legs
         ]
         try:
-            response = await self._rest.create_quote(intent.request_id, payload_legs)
+            result = await self._rest.create_quote(intent.request_id, payload_legs)
         except CoincallAmbiguousError as exc:
             self._ambiguous_transport_failures += 1
             logger.warning(
@@ -279,20 +278,9 @@ class QuoteLifecycle:
             logger.exception("Failed to create quote for RFQ %s", intent.request_id)
             raise
 
-        quote_id = (response.get("data") or {}).get("quoteId")
-        if not quote_id:
-            logger.error(
-                "Create-quote response missing quoteId for RFQ %s: %s",
-                intent.request_id,
-                response,
-            )
-            raise CoincallRequestError(
-                f"Create-quote response missing quoteId for RFQ {intent.request_id}"
-            )
-
-        opened = replace(pending.with_stage(QuoteStage.OPEN), quote_id=quote_id)
+        opened = replace(pending.with_stage(QuoteStage.OPEN), quote_id=result.quote_id)
         self._store(opened)
-        logger.info("Created quote %s for RFQ %s", quote_id, intent.request_id)
+        logger.info("Created quote %s for RFQ %s", result.quote_id, intent.request_id)
         return opened
 
     async def _cancel(self, quote: Quote) -> Quote:
@@ -330,16 +318,24 @@ class QuoteLifecycle:
         return opened
 
     async def _verify_pending_create(self, pending: Quote) -> Quote | None:
-        response = await self._rest.get_quote_list(request_id=pending.request_id, state="OPEN")
-        remote = _find_remote_quote(response, request_id=pending.request_id)
-        quote_id = _remote_quote_id(remote)
+        remote_quotes = await self._rest.get_quote_list(request_id=pending.request_id, state="OPEN")
+        remote = _find_remote_quote(remote_quotes, request_id=pending.request_id)
+        if remote is not None:
+            return self._adopt_open_quote(pending, remote.quote_id)
+
+        quote_id = _find_salvaged_quote_id(remote_quotes, request_id=pending.request_id)
         if quote_id is None:
             return None
+        logger.warning(
+            "Adopting quote %s for RFQ %s from malformed open-quote payload",
+            quote_id,
+            pending.request_id,
+        )
         return self._adopt_open_quote(pending, quote_id)
 
     async def _resolve_remote_quote_by_request(self, quote: Quote) -> Quote | None:
-        response = await self._rest.get_quote_list(request_id=quote.request_id)
-        remote = _find_remote_quote(response, request_id=quote.request_id)
+        remote_quotes = await self._rest.get_quote_list(request_id=quote.request_id)
+        remote = _find_remote_quote(remote_quotes, request_id=quote.request_id)
         if remote is None:
             return None
         return self._mirror_remote_quote(quote, remote)
@@ -349,8 +345,8 @@ class QuoteLifecycle:
     ) -> Quote:
         if pending_cancel.quote_id is None:
             raise exc
-        response = await self._rest.get_quote_list(quote_id=pending_cancel.quote_id)
-        remote = _find_remote_quote(response, quote_id=pending_cancel.quote_id)
+        remote_quotes = await self._rest.get_quote_list(quote_id=pending_cancel.quote_id)
+        remote = _find_remote_quote(remote_quotes, quote_id=pending_cancel.quote_id)
         if remote is None:
             raise exc
 
@@ -370,7 +366,7 @@ class QuoteLifecycle:
         if quote.quote_id:
             self._by_quote_id[quote.quote_id] = quote
 
-    def _mirror_remote_quote(self, quote: Quote, remote: dict[str, Any]) -> Quote:
+    def _mirror_remote_quote(self, quote: Quote, remote: QuotePayload) -> Quote:
         resolved = _quote_from_remote(quote, remote)
         self._store(resolved)
         logger.info(
@@ -404,34 +400,28 @@ def _matches(existing: Quote, intent: QuoteIntent) -> bool:
 
 
 def _find_remote_quote(
-    response: dict[str, Any], request_id: str | None = None, quote_id: str | None = None
-) -> dict[str, Any] | None:
-    for item in quote_items(response):
-        if request_id is not None and item.get("requestId") != request_id:
+    remote_quotes: QuoteListSnapshot,
+    request_id: str | None = None,
+    quote_id: str | None = None,
+) -> QuotePayload | None:
+    for item in remote_quotes.payloads:
+        if request_id is not None and item.request_id != request_id:
             continue
-        if quote_id is not None and item.get("quoteId") != quote_id:
+        if quote_id is not None and item.quote_id != quote_id:
             continue
         return item
     return None
 
 
-def quote_items(response: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_items = response.get("data") or []
-    if not isinstance(raw_items, list):
-        return []
-    return [item for item in raw_items if isinstance(item, dict)]
+def _find_salvaged_quote_id(remote_quotes: QuoteListSnapshot, request_id: str) -> str | None:
+    for salvaged_request_id, quote_id in remote_quotes.malformed_id_pairs:
+        if salvaged_request_id == request_id:
+            return quote_id
+    return None
 
 
-def _remote_quote_id(remote: dict[str, Any] | None) -> str | None:
-    if remote is None:
-        return None
-    quote_id = remote.get("quoteId")
-    return quote_id if isinstance(quote_id, str) and quote_id else None
-
-
-def _quote_from_remote(current: Quote, remote: dict[str, Any]) -> Quote:
-    payload = QuotePayload.model_validate(remote)
-    stage = _WIRE_QUOTE_STATE_TO_STAGE.get(payload.state)
+def _quote_from_remote(current: Quote, payload: QuotePayload) -> Quote:
+    stage = quote_stage_from_wire(payload.state)
     if stage is None:
         raise CoincallRequestError(
             f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"

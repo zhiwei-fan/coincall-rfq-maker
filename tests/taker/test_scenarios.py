@@ -38,14 +38,14 @@ async def test_fake_cancel_rfq_closes_quotes_and_rejects_execution() -> None:
         request_id,
         [{"instrumentName": "BTCUSD-09JUL27-100000-C", "price": "100.0"}],
     )
-    quote_id = response["data"]["quoteId"]
+    quote_id = response.quote_id
 
     await exchange.cancel_rfq(request_id)
 
     open_quotes = await exchange.get_quote_list(request_id=request_id, state="OPEN")
     closed_quote = await exchange.get_quote_list(quote_id=quote_id)
-    assert open_quotes["data"] == []
-    assert closed_quote["data"][0]["state"] == "CANCELLED"
+    assert open_quotes == []
+    assert closed_quote[0].state == "CANCELLED"
 
     queued_events = []
     while not events.empty():

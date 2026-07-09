@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from coincall_rfq_maker.adapters.rest import CoincallApiError, CoincallRequestError
+from coincall_rfq_maker.adapters.schemas import (
+    CreateQuoteResult,
+    QuoteListSnapshot,
+    QuotePayload,
+    RfqListSnapshot,
+    RfqPayload,
+    SymbolInfoPayload,
+)
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
@@ -55,7 +63,7 @@ class FakeExchange:
         role: Literal["TAKER", "MAKER"] | None = None,
         start_time: int | None = None,
         end_time: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> RfqListSnapshot:
         del role, start_time, end_time
         rfqs = list(self._rfqs.values())
         if request_id is not None:
@@ -64,9 +72,11 @@ class FakeExchange:
             rfqs = [rfq for rfq in rfqs if not rfq.is_terminal_status]
         elif state == "CLOSED":
             rfqs = [rfq for rfq in rfqs if rfq.is_terminal_status]
-        return {"code": 0, "data": {"rfqList": [self._rfq_payload(rfq) for rfq in rfqs]}}
+        return RfqListSnapshot(
+            tuple(RfqPayload.model_validate(self._rfq_payload(rfq)) for rfq in rfqs)
+        )
 
-    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> dict[str, Any]:
+    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
         rfq = self._rfqs.get(request_id)
         if rfq is None or rfq.is_terminal_status:
             raise CoincallRequestError(f"Cannot quote unknown or terminal RFQ {request_id}")
@@ -79,7 +89,7 @@ class FakeExchange:
             legs=[dict(leg) for leg in legs],
         )
         await self._events.put(QuoteUpdated(quote_id, request_id, QuoteStage.OPEN))
-        return {"code": 0, "data": {"quoteId": quote_id}}
+        return CreateQuoteResult.model_validate({"quoteId": quote_id})
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         quote = self._quote_or_error(quote_id)
@@ -102,7 +112,7 @@ class FakeExchange:
         symbol: str | None = None,
         start_time: int | None = None,
         end_time: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> QuoteListSnapshot:
         del start_time, end_time
         quotes = list(self._quotes.values())
         if quote_id is not None:
@@ -119,17 +129,18 @@ class FakeExchange:
                 for quote in quotes
                 if any(leg.get("instrumentName") == symbol for leg in quote.legs)
             ]
-        return {"code": 0, "data": [self._quote_payload(quote) for quote in quotes]}
+        return QuoteListSnapshot(
+            tuple(QuotePayload.model_validate(self._quote_payload(quote)) for quote in quotes)
+        )
 
-    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+    async def get_symbol_info(self, symbol: str | None = None) -> SymbolInfoPayload:
         underlying = symbol or next(iter(self._underlying_prices))
         price = self._underlying_prices.get(underlying)
         if price is None:
             raise CoincallRequestError(f"No fake price configured for {underlying}")
-        return {
-            "code": 0,
-            "data": {"symbol": underlying, "indexPrice": price, "markPrice": price},
-        }
+        return SymbolInfoPayload.model_validate(
+            {"symbol": underlying, "indexPrice": price, "markPrice": price}
+        )
 
     async def create_rfq(self, legs: tuple[RfqLeg, ...]) -> str:
         request_id = f"rfq-{self._next_rfq_id}"

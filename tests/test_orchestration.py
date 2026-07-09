@@ -8,6 +8,13 @@ from coincall_rfq_maker.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
+    _parse_quote_list,
+    _parse_rfq_list,
+)
+from coincall_rfq_maker.adapters.schemas import (
+    CreateQuoteResult,
+    QuoteListSnapshot,
+    RfqListSnapshot,
 )
 from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
@@ -35,23 +42,25 @@ class FakeRest:
         self.quote_list_calls: list[dict[str, Any]] = []
         self._next_quote_id = 1
 
-    async def get_rfq_list(self, **kwargs: Any) -> dict[str, Any]:
+    async def get_rfq_list(self, **kwargs: Any) -> RfqListSnapshot:
         if self.get_rfq_error is not None:
             raise self.get_rfq_error
         if self.rfq_list_items is not None:
-            return {"code": 0, "data": {"rfqList": self.rfq_list_items}}
-        return {
-            "code": 0,
-            "data": {"rfqList": [{"requestId": rid} for rid in self._open_request_ids or []]},
-        }
+            return _rfq_payloads(self.rfq_list_items)
+        return _rfq_payloads(
+            [
+                {"requestId": rid, "state": "ACTIVE", "legs": []}
+                for rid in self._open_request_ids or []
+            ]
+        )
 
-    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> dict[str, Any]:
+    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
         self.create_calls.append((request_id, legs))
         if self.create_error is not None:
             raise self.create_error
         quote_id = f"q-{self._next_quote_id}"
         self._next_quote_id += 1
-        return {"code": 0, "data": {"quoteId": quote_id}}
+        return CreateQuoteResult(quote_id=quote_id)
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         self.cancel_calls.append(quote_id)
@@ -59,11 +68,21 @@ class FakeRest:
             raise self.cancel_error
         return {"code": 0, "data": {}}
 
-    async def get_quote_list(self, **kwargs: Any) -> dict[str, Any]:
+    async def get_quote_list(self, **kwargs: Any) -> QuoteListSnapshot:
         self.quote_list_calls.append(kwargs)
         if self.quote_list_responses is not None:
-            return self.quote_list_responses.pop(0)
-        return self.quote_list_response
+            return _quote_payloads(self.quote_list_responses.pop(0))
+        return _quote_payloads(self.quote_list_response)
+
+
+def _rfq_payloads(items: list[dict[str, Any]]) -> RfqListSnapshot:
+    return _parse_rfq_list({"code": 0, "data": {"rfqList": items}})
+
+
+def _quote_payloads(response: dict[str, Any] | list[dict[str, Any]]) -> QuoteListSnapshot:
+    if isinstance(response, list):
+        return _parse_quote_list({"code": 0, "data": response})
+    return _parse_quote_list(response)
 
 
 class FakeMarketData:
@@ -273,6 +292,32 @@ async def test_reconciler_expires_absent_rfq_after_grace_period(
 
 
 @pytest.mark.asyncio
+async def test_reconciler_keeps_local_rfq_when_malformed_open_item_salvages_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = FakeRest()
+    rest.rfq_list_items = [{"requestId": "rfq-1", "state": "ACTIVE", "legs": "not-a-list"}]
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(orchestration, "_now_ms", lambda: 1_000_000)
+    received_at_ms = 1_000_000 - int((RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS + 1) * 1000)
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=received_at_ms)
+
+    await orchestrator.reconcile_with_exchange()
+
+    current = orchestrator.rfq_store.get("rfq-1")
+    assert current is not None
+    assert current.is_terminal_status is False
+    assert quotes.cancelled_for == []
+
+
+@pytest.mark.asyncio
 async def test_reconciler_converges_when_exchange_matches_local_state() -> None:
     rest = FakeRest(open_request_ids=["rfq-1"])
     market_data = FakeMarketData()
@@ -440,6 +485,49 @@ async def test_reconciler_resolves_local_open_quote_absent_from_exchange_open_li
     assert current.fill_time_ms == 123456
     assert current.block_trade_id == "bt-1"
     assert rest.quote_list_calls == [{"state": "OPEN"}, {"quote_id": created.quote_id}]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_treats_salvaged_malformed_quote_ids_as_remote_open() -> None:
+    rest = FakeRest(open_request_ids=["rfq-1"])
+    market_data = FakeMarketData(price=50_000.0)
+    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    created = await quotes.reconcile(make_intent())
+    assert created.quote_id is not None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": created.quote_id,
+                "state": "OPEN",
+                "filledPrice": "not-a-number",
+            },
+            {
+                "requestId": "rfq-ghost",
+                "quoteId": "q-orphan",
+                "state": "OPEN",
+                "filledPrice": "not-a-number",
+            },
+        ],
+    }
+
+    await orchestrator.reconcile_with_exchange()
+
+    current = quotes.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is QuoteStage.OPEN
+    assert current.quote_id == created.quote_id
+    assert rest.cancel_calls == []
+    assert rest.quote_list_calls == [{"state": "OPEN"}]
 
 
 @pytest.mark.asyncio

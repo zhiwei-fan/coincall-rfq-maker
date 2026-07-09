@@ -23,10 +23,12 @@ from coincall_rfq_maker.adapters.schemas import (
     QuotePayload,
     RfqPayload,
     WsEnvelope,
+    quote_stage_from_wire,
+    rfq_from_payload,
+    rfq_status_from_wire,
 )
 from coincall_rfq_maker.adapters.signing import build_ws_signed_url
-from coincall_rfq_maker.domain.quote import QuoteStage
-from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus
+from coincall_rfq_maker.domain.rfq import RfqStatus
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
 
 logger = logging.getLogger(__name__)
@@ -45,13 +47,6 @@ _SIGNED_URL_RE = re.compile(
     r"(?P<prefix>\b(?:wss?|https?)://[^\s'\"<>?]+)\?(?P<query>[^\s'\"<>)]*)"
 )
 _SENSITIVE_QUERY_PARAM_RE = re.compile(r"([?&](?:apiKey|sign|ts)=)[^&\s'\"<>)]*")
-
-_WIRE_QUOTE_STATE_TO_STAGE = {
-    "OPEN": QuoteStage.OPEN,
-    "CANCELLED": QuoteStage.CANCELLED,
-    "FILLED": QuoteStage.FILLED,
-    "EXPIRED": QuoteStage.EXPIRED,
-}
 
 _TERMINAL_RFQ_STATES = {
     RfqStatus.CANCELLED,
@@ -118,29 +113,18 @@ def parse_ws_message(raw: str) -> WsEvent | None:
 def _parse_rfq_event(data: dict[str, object]) -> RfqReceived | RfqTerminated | None:
     try:
         payload = RfqPayload.model_validate(data)
-        status = RfqStatus(payload.state)
-    except ValueError as exc:
+    except ValidationError as exc:
         logger.warning("Malformed RFQ WS payload: %s", exc)
+        return None
+    status = rfq_status_from_wire(payload.state)
+    if status is None:
+        logger.warning("Unknown RFQ state %r for %s", payload.state, payload.request_id)
         return None
 
     if status is RfqStatus.ACTIVE:
-        rfq = Rfq(
-            request_id=payload.request_id,
-            status=status,
-            legs=tuple(
-                RfqLeg(instrument_name=leg.instrument_name, side=leg.side, quantity=leg.quantity)
-                for leg in payload.legs
-            ),
-            create_time_ms=payload.create_time or 0,
-            expiry_time_ms=payload.expiry_time or 0,
-            taker_name=payload.taker_name,
-            counterparty=payload.counterparty,
-            last_update_time_ms=payload.update_time,
-        )
-        return RfqReceived(rfq=rfq)
+        return RfqReceived(rfq=rfq_from_payload(payload))
     if status in _TERMINAL_RFQ_STATES:
         return RfqTerminated(request_id=payload.request_id, status=status)
-    logger.warning("Unknown RFQ state %r for %s", payload.state, payload.request_id)
     return None
 
 
@@ -150,7 +134,7 @@ def _parse_quote_event(data: dict[str, object]) -> QuoteUpdated | None:
     except ValidationError as exc:
         logger.warning("Malformed quote WS payload: %s", exc)
         return None
-    stage = _WIRE_QUOTE_STATE_TO_STAGE.get(payload.state)
+    stage = quote_stage_from_wire(payload.state)
     if stage is None:
         logger.warning("Unknown quote state %r for %s", payload.state, payload.quote_id)
         return None

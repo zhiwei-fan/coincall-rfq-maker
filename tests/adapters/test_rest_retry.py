@@ -1,3 +1,4 @@
+import logging
 from types import TracebackType
 from typing import Any
 
@@ -50,3 +51,74 @@ async def test_get_quote_list_rejects_time_window_over_three_days() -> None:
 
     with pytest.raises(CoincallRequestError, match="cannot exceed 3 days"):
         await client.get_quote_list(start_time=0, end_time=3 * 24 * 60 * 60 * 1000 + 1)
+
+
+@pytest.mark.asyncio
+async def test_get_rfq_list_returns_valid_payloads_and_skips_malformed_items(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = CoincallRestClient("key", "secret")
+
+    async def fake_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": {
+                "rfqList": [
+                    {"requestId": "rfq-1", "state": "ACTIVE", "legs": []},
+                    {"requestId": "rfq-2", "state": "SOMETHING_NEW", "legs": []},
+                    {"state": "ACTIVE", "legs": []},
+                    "not-an-object",
+                ]
+            },
+        }
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with caplog.at_level(logging.WARNING):
+        rfqs = await client.get_rfq_list(state="OPEN")
+
+    assert [rfq.request_id for rfq in rfqs] == ["rfq-1"]
+    assert "Malformed RFQ REST item" in caplog.text
+    assert "unknown state" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_quote_list_returns_valid_payloads_and_skips_malformed_items(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = CoincallRestClient("key", "secret")
+
+    async def fake_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": [
+                {"quoteId": "q-1", "requestId": "rfq-1", "state": "OPEN"},
+                {"requestId": "rfq-2", "state": "OPEN"},
+                object(),
+            ],
+        }
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with caplog.at_level(logging.WARNING):
+        quotes = await client.get_quote_list(state="OPEN")
+
+    assert [quote.quote_id for quote in quotes] == ["q-1"]
+    assert "Malformed quote REST item" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_create_quote_missing_quote_id_raises_request_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CoincallRestClient("key", "secret")
+
+    async def fake_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"code": 0, "data": {}}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with pytest.raises(CoincallRequestError, match="missing quoteId"):
+        await client.create_quote("rfq-1", [])

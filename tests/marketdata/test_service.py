@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from coincall_rfq_maker.adapters.schemas import SymbolInfoPayload
 from coincall_rfq_maker.events import PricesRefreshed
 from coincall_rfq_maker.marketdata.service import MarketDataService
 
@@ -11,9 +12,9 @@ class FakeFuturesRest:
     def __init__(self, prices: dict[str, float]) -> None:
         self._prices = prices
 
-    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+    async def get_symbol_info(self, symbol: str | None = None) -> SymbolInfoPayload:
         assert symbol is not None
-        return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
+        return SymbolInfoPayload(symbol=symbol, index_price=self._prices[symbol])
 
 
 class PayloadFuturesRest:
@@ -21,10 +22,10 @@ class PayloadFuturesRest:
         self._payloads = payloads
         self.calls: list[str] = []
 
-    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+    async def get_symbol_info(self, symbol: str | None = None) -> SymbolInfoPayload:
         assert symbol is not None
         self.calls.append(symbol)
-        return self._payloads[symbol]
+        return SymbolInfoPayload.model_validate(self._payloads[symbol].get("data") or {})
 
 
 class BlockingFuturesRest:
@@ -33,11 +34,11 @@ class BlockingFuturesRest:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+    async def get_symbol_info(self, symbol: str | None = None) -> SymbolInfoPayload:
         assert symbol is not None
         self.started.set()
         await self.release.wait()
-        return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
+        return SymbolInfoPayload(symbol=symbol, index_price=self._prices[symbol])
 
 
 class ShutdownOnPutQueue:

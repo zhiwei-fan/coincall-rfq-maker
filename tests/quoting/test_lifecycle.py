@@ -7,7 +7,9 @@ from coincall_rfq_maker.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
+    _parse_quote_list,
 )
+from coincall_rfq_maker.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -29,13 +31,13 @@ class FakeRestClient:
         self.quote_list_response: dict[str, Any] = {"code": 0, "data": []}
         self.quote_list_calls: list[dict[str, Any]] = []
 
-    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> dict[str, Any]:
+    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
         self.create_calls.append((request_id, legs))
         if self.create_error is not None:
             raise self.create_error
         quote_id = f"q-{self._next_quote_id}"
         self._next_quote_id += 1
-        return {"code": 0, "data": {"quoteId": quote_id}}
+        return CreateQuoteResult(quote_id=quote_id)
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         self.cancel_calls.append(quote_id)
@@ -47,9 +49,13 @@ class FakeRestClient:
         self.cancel_all_calls += 1
         return {"code": 0, "data": {}}
 
-    async def get_quote_list(self, **kwargs: Any) -> dict[str, Any]:
+    async def get_quote_list(self, **kwargs: Any) -> QuoteListSnapshot:
         self.quote_list_calls.append(kwargs)
-        return self.quote_list_response
+        return _quote_payloads(self.quote_list_response)
+
+
+def _quote_payloads(response: dict[str, Any]) -> QuoteListSnapshot:
+    return _parse_quote_list(response)
 
 
 def make_intent(price: float = 100.0) -> QuoteIntent:
@@ -147,6 +153,50 @@ async def test_ambiguous_create_adopts_open_exchange_quote() -> None:
     assert quote.stage is QuoteStage.OPEN
     assert quote.quote_id == "exchange-q-1"
     assert rest.quote_list_calls == [{"request_id": "rfq-1", "state": "OPEN"}]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_create_adopts_salvaged_quote_id_from_malformed_item() -> None:
+    rest = FakeRestClient()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": "exchange-q-1",
+                "state": "OPEN",
+                "filledPrice": "not-a-number",
+            }
+        ],
+    }
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+
+    quote = await lifecycle.reconcile(make_intent())
+
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "exchange-q-1"
+    assert lifecycle.get_by_quote_id("exchange-q-1") is quote
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_create_does_not_adopt_empty_quote_id() -> None:
+    rest = FakeRestClient()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": "", "state": "OPEN"}],
+    }
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is QuoteStage.PENDING_CREATE
+    assert current.quote_id is None
+    assert lifecycle.get_by_quote_id("") is None
 
 
 @pytest.mark.asyncio

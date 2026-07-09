@@ -4,10 +4,13 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 `model_validate` raw exchange JSON directly.
 """
 
-from typing import Any
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from typing import Any, overload
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 
 
@@ -42,6 +45,53 @@ class RfqPayload(BaseModel):
     taker_name: str | None = Field(default=None, alias="takerName")
     counterparty: str | None = Field(default=None, alias="counterparty")
     update_time: int | None = Field(default=None, alias="updateTime")
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _empty_request_id_is_absent(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class RfqListSnapshot(Sequence[RfqPayload]):
+    """Typed RFQ list plus IDs salvaged from malformed REST items."""
+
+    payloads: tuple[RfqPayload, ...] = ()
+    malformed_request_ids: frozenset[str] = field(default_factory=frozenset)
+
+    def __iter__(self) -> Iterator[RfqPayload]:
+        return iter(self.payloads)
+
+    def __len__(self) -> int:
+        return len(self.payloads)
+
+    @overload
+    def __getitem__(self, index: int) -> RfqPayload: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[RfqPayload, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> RfqPayload | tuple[RfqPayload, ...]:
+        return self.payloads[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RfqListSnapshot):
+            return (
+                self.payloads == other.payloads
+                and self.malformed_request_ids == other.malformed_request_ids
+            )
+        if isinstance(other, list | tuple):
+            return list(self.payloads) == list(other)
+        return NotImplemented
+
+
+def rfq_status_from_wire(state: str) -> RfqStatus | None:
+    try:
+        return RfqStatus(state)
+    except ValueError:
+        return None
 
 
 def rfq_from_payload(payload: RfqPayload) -> Rfq:
@@ -87,6 +137,74 @@ class QuotePayload(BaseModel):
     filled_quantity: float | None = Field(default=None, alias="filledQuantity")
     fill_time: int | None = Field(default=None, alias="fillTime")
     block_trade_id: str | None = Field(default=None, alias="blockTradeId")
+
+    @field_validator("quote_id", mode="before")
+    @classmethod
+    def _empty_quote_id_is_absent(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _empty_request_id_is_absent(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteListSnapshot(Sequence[QuotePayload]):
+    """Typed quote list plus ID pairs salvaged from malformed REST items."""
+
+    payloads: tuple[QuotePayload, ...] = ()
+    malformed_id_pairs: frozenset[tuple[str, str]] = field(default_factory=frozenset)
+
+    def __iter__(self) -> Iterator[QuotePayload]:
+        return iter(self.payloads)
+
+    def __len__(self) -> int:
+        return len(self.payloads)
+
+    @overload
+    def __getitem__(self, index: int) -> QuotePayload: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[QuotePayload, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> QuotePayload | tuple[QuotePayload, ...]:
+        return self.payloads[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, QuoteListSnapshot):
+            return (
+                self.payloads == other.payloads
+                and self.malformed_id_pairs == other.malformed_id_pairs
+            )
+        if isinstance(other, list | tuple):
+            return list(self.payloads) == list(other)
+        return NotImplemented
+
+
+class CreateQuoteResult(BaseModel):
+    """Typed result for create-quote responses."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    quote_id: str = Field(alias="quoteId")
+
+
+# WIRE_QUOTE_STATE: the canonical exchange quote-state to domain-stage map.
+_QUOTE_STATE_TO_STAGE = {
+    "OPEN": QuoteStage.OPEN,
+    "CANCELLED": QuoteStage.CANCELLED,
+    "FILLED": QuoteStage.FILLED,
+    "EXPIRED": QuoteStage.EXPIRED,
+}
+
+
+def quote_stage_from_wire(state: str) -> QuoteStage | None:
+    return _QUOTE_STATE_TO_STAGE.get(state)
 
 
 class BlockTradePayload(BaseModel):
