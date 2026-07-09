@@ -11,10 +11,10 @@ from coincall_rfq_maker.core.adapters.schemas import (
     QuotePayload,
     RfqCreateResult,
 )
-from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker import execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
+from coincall_rfq_maker.taker.settings import TakerSettings
 
 REQUEST_ID = "REQ123"
 QUOTE_ID = "QID-1234"  # last 4 == "1234"
@@ -120,15 +120,15 @@ class FakeRest:
         return {"code": 0, "data": {"cancelled": True}}
 
 
-def _settings(**overrides: Any) -> Settings:
+def _settings(**overrides: Any) -> TakerSettings:
     base = {
         "_env_file": None,
-        "API_KEY": "maker-key",
-        "API_SECRET": "maker-secret",
+        "TAKER_API_KEY": "taker-key",
+        "TAKER_API_SECRET": "taker-secret",
         "REST_BASE_URL": "https://betaapi.coincall.com",
     }
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return TakerSettings(**base)  # type: ignore[arg-type]
 
 
 def _inputs(*items: Any):  # type: ignore[no-untyped-def]

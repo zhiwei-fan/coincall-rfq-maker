@@ -14,10 +14,10 @@ from coincall_rfq_maker.core.adapters.schemas import (
     ExecuteQuoteResult,
     QuotePayload,
 )
-from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker import execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
+from coincall_rfq_maker.taker.settings import TakerSettings
 
 REQUEST_ID = "r1"
 QUOTE_ID = "QID-1234"  # last 4 == "1234"
@@ -475,16 +475,16 @@ def test_execute_quote_delegates_to_rest() -> None:
 # -- execute command wiring -------------------------------------------------
 
 
-def _settings(**overrides: Any) -> Settings:
+def _settings(**overrides: Any) -> TakerSettings:
     base = {
         "_env_file": None,
-        "API_KEY": "maker-key",
-        "API_SECRET": "maker-secret",
+        "TAKER_API_KEY": "taker-key",
+        "TAKER_API_SECRET": "taker-secret",
         "REST_BASE_URL": "https://betaapi.coincall.com",
         "TAKER_MAX_NOTIONAL_USD": 4242.0,
     }
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return TakerSettings(**base)  # type: ignore[arg-type]
 
 
 def test_cmd_execute_passes_cap_and_yes_through(

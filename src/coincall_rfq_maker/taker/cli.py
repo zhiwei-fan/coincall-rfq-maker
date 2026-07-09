@@ -24,7 +24,6 @@ from pydantic import ValidationError
 
 from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
 from coincall_rfq_maker.core.adapters.schemas import OptionInstrument, QuotePayload
-from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
 from coincall_rfq_maker.taker.execute import (
@@ -35,6 +34,7 @@ from coincall_rfq_maker.taker.execute import (
     _fmt_delta,
     _now_ms,
 )
+from coincall_rfq_maker.taker.settings import TakerSettings
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -125,9 +125,9 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
-def load_settings_or_exit() -> Settings:
+def load_settings_or_exit() -> TakerSettings:
     try:
-        return Settings()  # type: ignore[call-arg]
+        return TakerSettings()  # type: ignore[call-arg]
     except ValidationError as exc:
         details = "\n".join(
             f"- {'.'.join(str(part) for part in error['loc']) or 'settings'}: "
@@ -135,25 +135,19 @@ def load_settings_or_exit() -> Settings:
             for error in exc.errors(include_input=False)
         )
         sys.stderr.write(
-            "Configuration error: API_KEY and API_SECRET must be set (via environment "
-            f"or .env) before starting rfq-taker.\n{details}\n"
+            "Configuration error: TAKER_API_KEY and TAKER_API_SECRET must be set "
+            "(via environment or .env) before starting rfq-taker. The taker will "
+            f"NEVER fall back to the maker API_KEY/API_SECRET.\n{details}\n"
         )
         raise SystemExit(1) from exc
 
 
-def _build_taker_client(settings: Settings, *, allow_prod: bool) -> CoincallRestClient:
+def _build_taker_client(settings: TakerSettings, *, allow_prod: bool) -> CoincallRestClient:
     """Return a REST client built from the TAKER creds, after the safety gates.
 
-    Raises ``SystemExit(2)`` if taker creds are absent (never falling back to
-    the maker creds) or if the REST host is non-beta without ``--allow-prod``.
+    Raises ``SystemExit(2)`` if the REST host is non-beta without ``--allow-prod``.
     """
-    creds = settings.taker_credentials()
-    if creds is None:
-        sys.stderr.write(
-            "TAKER_API_KEY and TAKER_API_SECRET must be set (env or .env) to run the taker. "
-            "It will NOT fall back to the maker API_KEY/API_SECRET.\n"
-        )
-        raise SystemExit(2)
+    creds = settings.credentials()
 
     if "beta" not in settings.rest_base_url.lower() and not allow_prod:
         sys.stderr.write(
@@ -180,7 +174,7 @@ async def _cmd_quotes(client: TakerClient, request_id: str) -> None:
     _print_quotes(quotes, _now_ms())
 
 
-async def _run_command(args: argparse.Namespace, settings: Settings) -> None:
+async def _run_command(args: argparse.Namespace, settings: TakerSettings) -> None:
     rest = _build_taker_client(settings, allow_prod=args.allow_prod)
     async with rest:
         client = TakerClient(rest)
@@ -215,7 +209,7 @@ async def _run_command(args: argparse.Namespace, settings: Settings) -> None:
             raise SystemExit(2)
 
 
-def _build_audit(settings: Settings) -> AuditLog:
+def _build_audit(settings: TakerSettings) -> AuditLog:
     return AuditLog(Path(settings.taker_audit_path).expanduser())
 
 

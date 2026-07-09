@@ -33,13 +33,16 @@ hardcoded on.
 ## Configuration
 
 All settings are read from the environment or a `.env` file (see
-`.env.example`).
+`.env.example`). One `.env` can serve both processes: `rfq-maker` loads
+`MakerSettings` and validates only `API_KEY` / `API_SECRET`, while `rfq-taker`
+loads `TakerSettings` and validates only `TAKER_API_KEY` / `TAKER_API_SECRET`.
+The taker never falls back to the maker key.
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `API_KEY` / `API_SECRET` | *(required)* | Coincall API credentials; startup fails fast with a clear error if missing |
-| `TAKER_API_KEY` / `TAKER_API_SECRET` | unset | Optional taker harness credentials; must be set together or omitted |
-| `REST_BASE_URL` | `https://betaapi.coincall.com` | REST API base URL |
+| `API_KEY` / `API_SECRET` | *(required for maker)* | Maker Coincall API credentials; `rfq-maker` startup fails fast if missing or blank |
+| `TAKER_API_KEY` / `TAKER_API_SECRET` | *(required for taker)* | Dedicated taker Coincall API credentials; `rfq-taker` startup fails fast if missing or blank |
+| `REST_BASE_URL` | `https://betaapi.coincall.com` | Shared REST API base URL |
 | `WS_URL` | `wss://betaws.seizeyouralpha.com/options` | WebSocket URL |
 | `DRY_RUN` | `true` | Compute and log quotes without submitting them |
 | `CANCEL_ALL_ON_START` | `true` | Cancel all existing quotes once at startup |
@@ -52,6 +55,8 @@ All settings are read from the environment or a `.env` file (see
 | `MAX_LEG_QTY` | `100` | Risk gate: max quantity per leg |
 | `MIN_TIME_TO_EXPIRY_HOURS` | `1` | Risk gate: minimum time-to-expiry to quote |
 | `STALE_MARKET_DATA_SECONDS` | `30` | Risk gate: reject quotes when any intent leg has missing or stale market-data age |
+| `TAKER_MAX_NOTIONAL_USD` | `5000` | Taker hard cap on gross premium accepted by `execute` / `trade` |
+| `TAKER_AUDIT_PATH` | `~/.rfq-taker/audit.jsonl` | Taker append-only JSONL audit log path |
 | `BID_VOL` / `ASK_VOL` | `0.20` / `2.00` | Black-Scholes stub volatilities |
 | `RISK_FREE_RATE` | `0.05` | Black-Scholes risk-free rate |
 | `DB_PATH` | `rfq_maker.db` | SQLite audit database path |

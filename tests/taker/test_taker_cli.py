@@ -10,10 +10,10 @@ from coincall_rfq_maker.core.adapters.schemas import (
     QuotePayload,
     RfqCreateResult,
 )
-from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker import cli, execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
+from coincall_rfq_maker.taker.settings import TakerSettings
 
 BETA_URL = "https://betaapi.coincall.com"
 PROD_URL = "https://api.coincall.com"
@@ -70,42 +70,42 @@ class FakeRest:
         return {"code": 0, "data": {"cancelled": True}}
 
 
-def _settings(**overrides: Any) -> Settings:
+def _settings(**overrides: Any) -> TakerSettings:
     base = {
         "_env_file": None,
-        "API_KEY": "maker-key",
-        "API_SECRET": "maker-secret",
+        "TAKER_API_KEY": "taker-key",
+        "TAKER_API_SECRET": "taker-secret",
         "REST_BASE_URL": BETA_URL,
     }
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return TakerSettings(**base)  # type: ignore[arg-type]
 
 
 # -- safety gate ------------------------------------------------------------
 
 
 def test_missing_taker_creds_hard_fails_with_no_fallback_message(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("API_KEY", "maker-key")
+    monkeypatch.setenv("API_SECRET", "maker-secret")
     monkeypatch.delenv("TAKER_API_KEY", raising=False)
     monkeypatch.delenv("TAKER_API_SECRET", raising=False)
-    settings = _settings()
 
     with pytest.raises(SystemExit) as exc_info:
-        cli._build_taker_client(settings, allow_prod=False)
+        cli.load_settings_or_exit()
 
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 1
     stderr = capsys.readouterr().err
     assert "TAKER_API_KEY and TAKER_API_SECRET must be set" in stderr
-    assert "NOT fall back to the maker API_KEY/API_SECRET" in stderr
+    assert "NEVER fall back to the maker API_KEY/API_SECRET" in stderr
 
 
 def test_non_beta_host_without_allow_prod_hard_fails(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    settings = _settings(
-        TAKER_API_KEY="taker-key", TAKER_API_SECRET="taker-secret", REST_BASE_URL=PROD_URL
-    )
+    settings = _settings(REST_BASE_URL=PROD_URL)
 
     with pytest.raises(SystemExit) as exc_info:
         cli._build_taker_client(settings, allow_prod=False)
@@ -115,9 +115,7 @@ def test_non_beta_host_without_allow_prod_hard_fails(
 
 
 def test_non_beta_host_with_allow_prod_builds_client() -> None:
-    settings = _settings(
-        TAKER_API_KEY="taker-key", TAKER_API_SECRET="taker-secret", REST_BASE_URL=PROD_URL
-    )
+    settings = _settings(REST_BASE_URL=PROD_URL)
 
     rest = cli._build_taker_client(settings, allow_prod=True)
 
@@ -125,7 +123,7 @@ def test_non_beta_host_with_allow_prod_builds_client() -> None:
 
 
 def test_beta_host_with_taker_creds_builds_client() -> None:
-    settings = _settings(TAKER_API_KEY="taker-key", TAKER_API_SECRET="taker-secret")
+    settings = _settings()
 
     rest = cli._build_taker_client(settings, allow_prod=False)
 

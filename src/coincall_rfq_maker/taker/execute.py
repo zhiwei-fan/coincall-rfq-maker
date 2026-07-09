@@ -23,9 +23,9 @@ from coincall_rfq_maker.core.adapters.schemas import (
 )
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import QuoteStage
-from coincall_rfq_maker.settings import Settings
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
+from coincall_rfq_maker.taker.settings import TakerSettings
 
 _QUOTE_CURRENCIES = ("USDT", "USDC", "USD")
 _TRADE_CAVEAT = (
@@ -112,7 +112,7 @@ async def _cmd_cancel_rfq(client: TakerClient, audit: AuditLog, request_id: str)
 async def _cmd_execute(
     client: TakerClient,
     audit: AuditLog,
-    settings: Settings,
+    settings: TakerSettings,
     *,
     request_id: str,
     quote_id: str,
@@ -138,7 +138,7 @@ async def _cmd_execute(
 async def _cmd_trade(
     client: TakerClient,
     audit: AuditLog,
-    settings: Settings,
+    settings: TakerSettings,
     *,
     raw_legs: list[str],
     timeout: float,

@@ -7,7 +7,7 @@ import pytest
 from coincall_rfq_maker import cli
 from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
-from coincall_rfq_maker.settings import Settings
+from coincall_rfq_maker.settings import MakerSettings
 
 
 class FakeRestContext:
@@ -161,7 +161,7 @@ async def test_startup_cancel_all_failure_exits_cleanly(
     monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
     monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
     monkeypatch.setattr(cli, "QuoteLifecycle", FailingQuoteLifecycle)
-    settings = Settings(API_KEY="key", API_SECRET="secret", CANCEL_ALL_ON_START=True)
+    settings = MakerSettings(API_KEY="key", API_SECRET="secret", CANCEL_ALL_ON_START=True)
 
     with pytest.raises(SystemExit) as exc_info:
         await cli.run_async(settings)
@@ -185,7 +185,7 @@ async def test_signal_shutdown_cancel_all_on_stop_failure_exits_cleanly(
     monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
     monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
     monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
-    settings = Settings(
+    settings = MakerSettings(
         API_KEY="key",
         API_SECRET="secret",
         CANCEL_ALL_ON_START=False,
@@ -214,7 +214,7 @@ async def test_signal_shutdown_cancel_all_on_stop_false_does_not_cancel(
     monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
     monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
     monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
-    settings = Settings(
+    settings = MakerSettings(
         API_KEY="key",
         API_SECRET="secret",
         CANCEL_ALL_ON_START=False,
@@ -240,7 +240,7 @@ async def test_signal_shutdown_taskgroup_shutdown_race_attempts_cancel_all_once(
     monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
     monkeypatch.setattr(cli, "MarketDataService", ShutdownRaceMarketData)
     monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
-    settings = Settings(
+    settings = MakerSettings(
         API_KEY="key",
         API_SECRET="secret",
         CANCEL_ALL_ON_START=False,
@@ -266,7 +266,7 @@ async def test_taskgroup_failure_without_signal_attempts_cancel_all_and_propagat
     monkeypatch.setattr(cli, "CoincallWsClient", StopAwareWsClient)
     monkeypatch.setattr(cli, "MarketDataService", FailingMarketData)
     monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
-    settings = Settings(
+    settings = MakerSettings(
         API_KEY="key",
         API_SECRET="secret",
         CANCEL_ALL_ON_START=False,
@@ -294,7 +294,7 @@ async def test_shutdown_cancel_all_non_coincall_failure_exits_cleanly(
     monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
     monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
     monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
-    settings = Settings(
+    settings = MakerSettings(
         API_KEY="key",
         API_SECRET="secret",
         CANCEL_ALL_ON_START=False,

@@ -24,7 +24,7 @@ from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.risk.gate import NullExposureProvider, RiskGate
-from coincall_rfq_maker.settings import Settings
+from coincall_rfq_maker.settings import MakerSettings
 from coincall_rfq_maker.ws import CoincallWsClient
 
 logger = logging.getLogger(__name__)
@@ -49,9 +49,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_settings_or_exit() -> Settings:
+def load_settings_or_exit() -> MakerSettings:
     try:
-        return Settings()  # type: ignore[call-arg]
+        return MakerSettings()  # type: ignore[call-arg]
     except ValidationError as exc:
         details = "\n".join(
             f"- {'.'.join(str(part) for part in error['loc']) or 'settings'}: "
@@ -146,7 +146,7 @@ def _all_shutdown_race_failures(exceptions: Sequence[BaseException]) -> bool:
     return all(isinstance(exc, asyncio.QueueShutDown) for exc in exceptions)
 
 
-async def run_async(settings: Settings) -> None:
+async def run_async(settings: MakerSettings) -> None:
     setup_logging(settings.log_level)
     logger.info("Starting rfq-maker (dry_run=%s)", settings.dry_run)
 
@@ -156,7 +156,7 @@ async def run_async(settings: Settings) -> None:
         loop.add_signal_handler(sig, shutdown.set)
 
     events: asyncio.Queue[object] = asyncio.Queue()
-    maker_credentials = settings.maker_credentials()
+    maker_credentials = settings.credentials()
     api_secret = maker_credentials.api_secret.get_secret_value()
 
     async with (
