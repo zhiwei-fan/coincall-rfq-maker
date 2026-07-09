@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any
 
@@ -15,6 +16,7 @@ from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.risk.gate import RiskGate
+from coincall_rfq_maker.testing.fake_exchange import FakeExchange
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 
@@ -712,8 +714,125 @@ async def test_apply_ws_update_transitions_quote_to_filled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_apply_ws_update_same_stage_is_idempotent_and_merges_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+
+    event = QuoteUpdated(
+        quote_id=quote.quote_id,
+        request_id="rfq-1",
+        stage=QuoteStage.OPEN,
+        filled_price=101.0,
+        filled_quantity=2.0,
+        fill_time_ms=123456,
+        block_trade_id="bt-1",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        updated = lifecycle.apply_ws_update(event)
+
+    assert updated is not None
+    assert updated.stage is QuoteStage.OPEN
+    assert updated.filled_price == 101.0
+    assert updated.filled_quantity == 2.0
+    assert updated.fill_time_ms == 123456
+    assert updated.block_trade_id == "bt-1"
+    assert updated.update_time_ms is not None
+    assert "Ignoring illegal quote transition" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_apply_ws_update_same_stage_without_new_fields_is_noop() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+
+    updated = lifecycle.apply_ws_update(
+        QuoteUpdated(quote_id=quote.quote_id, request_id="rfq-1", stage=QuoteStage.OPEN)
+    )
+
+    assert updated is None
+    assert lifecycle.get_by_quote_id(quote.quote_id) is quote
+    assert lifecycle.get_for_rfq("rfq-1") is quote
+
+
+@pytest.mark.asyncio
+async def test_apply_ws_update_same_stage_with_identical_fields_is_noop() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    filled = lifecycle.apply_ws_update(
+        QuoteUpdated(
+            quote_id=quote.quote_id,
+            request_id="rfq-1",
+            stage=QuoteStage.FILLED,
+            filled_price=101.0,
+            filled_quantity=2.0,
+            fill_time_ms=123456,
+            block_trade_id="bt-1",
+        )
+    )
+    assert filled is not None
+
+    duplicate = lifecycle.apply_ws_update(
+        QuoteUpdated(
+            quote_id=quote.quote_id,
+            request_id="rfq-1",
+            stage=QuoteStage.FILLED,
+            filled_price=101.0,
+            filled_quantity=2.0,
+            fill_time_ms=123456,
+            block_trade_id="bt-1",
+        )
+    )
+
+    assert duplicate is None
+    assert lifecycle.get_by_quote_id(quote.quote_id) is filled
+    assert lifecycle.get_for_rfq("rfq-1") is filled
+
+
+@pytest.mark.asyncio
+async def test_apply_ws_update_genuine_illegal_transition_warns_and_is_ignored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    await lifecycle.cancel_for_rfq("rfq-1")
+
+    with caplog.at_level(logging.WARNING):
+        updated = lifecycle.apply_ws_update(
+            QuoteUpdated(quote_id=quote.quote_id, request_id="rfq-1", stage=QuoteStage.OPEN)
+        )
+
+    current = lifecycle.get_by_quote_id(quote.quote_id)
+    assert updated is None
+    assert current is not None
+    assert current.stage is QuoteStage.CANCELLED
+    assert "Ignoring illegal quote transition cancelled -> open" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_apply_ws_update_for_unknown_quote_is_ignored() -> None:
     rest = FakeRestClient()
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
     event = QuoteUpdated(quote_id="ghost", request_id="rfq-x", stage=QuoteStage.OPEN)
     assert lifecycle.apply_ws_update(event) is None
+
+
+@pytest.mark.asyncio
+async def test_fake_exchange_unknown_symbol_raises_api_error() -> None:
+    exchange = FakeExchange(asyncio.Queue())
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await exchange.get_symbol_info("ETHUSD")
+
+    assert exc_info.value.status == 200
+    assert exc_info.value.code == 400001

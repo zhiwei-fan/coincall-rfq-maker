@@ -137,7 +137,7 @@ class FakeExchange:
         underlying = symbol or next(iter(self._underlying_prices))
         price = self._underlying_prices.get(underlying)
         if price is None:
-            raise CoincallRequestError(f"No fake price configured for {underlying}")
+            raise _fake_api_error(f"No fake price configured for {underlying}")
         return SymbolInfoPayload.model_validate(
             {"symbol": underlying, "indexPrice": price, "markPrice": price}
         )

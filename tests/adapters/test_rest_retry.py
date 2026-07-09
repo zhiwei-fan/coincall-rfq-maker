@@ -2,10 +2,14 @@ import logging
 from types import TracebackType
 from typing import Any
 
+import aiohttp
 import pytest
 
 from coincall_rfq_maker.adapters.rest import (
+    _MAX_ATTEMPTS,
+    _RETRY_BACKOFF_SECONDS,
     CoincallAmbiguousError,
+    CoincallApiError,
     CoincallRequestError,
     CoincallRestClient,
 )
@@ -33,6 +37,62 @@ class TimeoutPostSession:
         return TimeoutContext()
 
 
+class TransientGetContext:
+    async def __aenter__(self) -> object:
+        raise aiohttp.ClientConnectionError("temporary disconnect")
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        return False
+
+
+class TransientGetSession:
+    def __init__(self) -> None:
+        self.get_attempts = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> TransientGetContext:
+        self.get_attempts += 1
+        return TransientGetContext()
+
+
+class ResponseContext:
+    def __init__(self, status: int, text: str) -> None:
+        self._response = FakeResponse(status, text)
+
+    async def __aenter__(self) -> "FakeResponse":
+        return self._response
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        return False
+
+
+class FakeResponse:
+    def __init__(self, status: int, text: str) -> None:
+        self.status = status
+        self._text = text
+
+    async def text(self) -> str:
+        return self._text
+
+
+class ApiErrorGetSession:
+    def __init__(self) -> None:
+        self.get_attempts = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        self.get_attempts += 1
+        return ResponseContext(200, '{"code":400001,"msg":"application rejected"}')
+
+
 @pytest.mark.asyncio
 async def test_state_changing_post_timeout_is_not_retried_and_is_ambiguous() -> None:
     session = TimeoutPostSession()
@@ -43,6 +103,43 @@ async def test_state_changing_post_timeout_is_not_retried_and_is_ambiguous() -> 
         await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
 
     assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_get_transient_failure_retries_max_attempts_then_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = TransientGetSession()
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("coincall_rfq_maker.adapters.rest.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
+        await client._request("GET", "/open/option/blocktrade/rfqList/v1")
+
+    assert session.get_attempts == _MAX_ATTEMPTS
+    assert sleeps == [
+        _RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, _MAX_ATTEMPTS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_application_error_response_is_not_retried() -> None:
+    session = ApiErrorGetSession()
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await client._request("GET", "/open/option/blocktrade/rfqList/v1")
+
+    assert session.get_attempts == 1
+    assert exc_info.value.status == 200
+    assert exc_info.value.code == 400001
 
 
 @pytest.mark.asyncio

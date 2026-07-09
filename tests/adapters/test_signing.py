@@ -6,6 +6,7 @@ timestamp=1750000000000, diff=5000) before those files were deleted. If these
 ever need to change, re-derive against a live account — do not hand-edit them.
 """
 
+from coincall_rfq_maker.adapters.schemas import CreateQuoteResult
 from coincall_rfq_maker.adapters.signing import (
     build_rest_headers,
     build_rest_prehash,
@@ -13,6 +14,8 @@ from coincall_rfq_maker.adapters.signing import (
     sign_message,
     sign_rest_request,
 )
+from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 
 API_KEY = "test-key"
 API_SECRET = "test-secret"
@@ -68,6 +71,52 @@ def test_post_prehash_with_nested_list_body() -> None:
     assert (
         sign_message(message, API_SECRET)
         == "2950EEF8E210F5FD45E0E72323589739001DABDFB2C8EC6901583C525DAF15FC"
+    )
+
+
+async def test_create_quote_callsite_payload_prehash_golden() -> None:
+    class CapturingRestClient:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        async def create_quote(
+            self, request_id: str, legs: list[dict[str, str]]
+        ) -> CreateQuoteResult:
+            self.payload = {"requestId": request_id, "legs": legs}
+            return CreateQuoteResult(quote_id="q-1")
+
+    rest = CapturingRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+
+    await lifecycle.reconcile(
+        QuoteIntent(
+            request_id="rfq-1",
+            legs=(
+                QuoteLegIntent(
+                    instrument_name="BTCUSD-21AUG25-120000-C",
+                    price=100.0,
+                ),
+            ),
+        )
+    )
+
+    assert rest.payload is not None
+    message = build_rest_prehash(
+        TS,
+        "POST",
+        "/open/option/blocktrade/quote/create/v1",
+        API_KEY,
+        DIFF,
+        rest.payload,
+    )
+    assert message == (
+        "POST/open/option/blocktrade/quote/create/v1?"
+        'legs=[{"instrumentName":"BTCUSD-21AUG25-120000-C","price":"100.0"}]'
+        "&requestId=rfq-1&uuid=test-key&ts=1750000000000&x-req-ts-diff=5000"
+    )
+    assert (
+        sign_message(message, API_SECRET)
+        == "9F4C2CF5225F568BBA8019D8E4712318C9C04993A8B967041DF1AA3C62C62DDA"
     )
 
 

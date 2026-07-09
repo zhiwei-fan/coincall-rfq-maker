@@ -235,22 +235,36 @@ class QuoteLifecycle:
         if existing is None:
             logger.debug("Quote update for unknown quote %s, ignoring", event.quote_id)
             return None
-        try:
-            updated = existing.with_stage(event.stage)
-        except IllegalQuoteTransition:
-            logger.warning(
-                "Ignoring illegal quote transition %s -> %s for %s",
-                existing.stage,
-                event.stage,
-                event.quote_id,
-            )
-            return None
+        filled_price = coalesce(event.filled_price, existing.filled_price)
+        filled_quantity = coalesce(event.filled_quantity, existing.filled_quantity)
+        fill_time_ms = coalesce(event.fill_time_ms, existing.fill_time_ms)
+        block_trade_id = event.block_trade_id or existing.block_trade_id
+        if event.stage is existing.stage:
+            if (
+                filled_price == existing.filled_price
+                and filled_quantity == existing.filled_quantity
+                and fill_time_ms == existing.fill_time_ms
+                and block_trade_id == existing.block_trade_id
+            ):
+                return None
+            updated = existing
+        else:
+            try:
+                updated = existing.with_stage(event.stage)
+            except IllegalQuoteTransition:
+                logger.warning(
+                    "Ignoring illegal quote transition %s -> %s for %s",
+                    existing.stage,
+                    event.stage,
+                    event.quote_id,
+                )
+                return None
         updated = replace(
             updated,
-            filled_price=coalesce(event.filled_price, updated.filled_price),
-            filled_quantity=coalesce(event.filled_quantity, updated.filled_quantity),
-            fill_time_ms=coalesce(event.fill_time_ms, updated.fill_time_ms),
-            block_trade_id=event.block_trade_id or updated.block_trade_id,
+            filled_price=filled_price,
+            filled_quantity=filled_quantity,
+            fill_time_ms=fill_time_ms,
+            block_trade_id=block_trade_id,
             update_time_ms=current_time_ms(),
         )
         self._store.store(updated)
