@@ -16,6 +16,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "import-linter>=2.13",
     "mypy>=2.2.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
@@ -57,3 +58,42 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+# Architecture boundary: the maker is the product (package root); `core` is the shared
+# Coincall client; `taker` is a subordinate tool. Enforced locally by the pre-push hook
+# (`uv run lint-imports`) — no GitHub CI. See .claude/repo-brief.md.
+[tool.importlinter]
+root_package = "coincall_rfq_maker"
+
+[[tool.importlinter.contracts]]
+name = "core, domain and taker must not import maker-product modules"
+type = "forbidden"
+source_modules = [
+    "coincall_rfq_maker.core",
+    "coincall_rfq_maker.domain",
+    "coincall_rfq_maker.taker",
+]
+forbidden_modules = [
+    "coincall_rfq_maker.cli",
+    "coincall_rfq_maker.orchestration",
+    "coincall_rfq_maker.reconciler",
+    "coincall_rfq_maker.events",
+    "coincall_rfq_maker.observability",
+    "coincall_rfq_maker.ws",
+    "coincall_rfq_maker.settings",
+    "coincall_rfq_maker.marketdata",
+    "coincall_rfq_maker.pricing",
+    "coincall_rfq_maker.quoting",
+    "coincall_rfq_maker.risk",
+    "coincall_rfq_maker.persistence",
+    "coincall_rfq_maker.testing",
+]
+
+[[tool.importlinter.contracts]]
+name = "layered client: taker over core over domain"
+type = "layers"
+layers = [
+    "coincall_rfq_maker.taker",
+    "coincall_rfq_maker.core",
+    "coincall_rfq_maker.domain",
+]
