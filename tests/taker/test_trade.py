@@ -12,7 +12,7 @@ from coincall_rfq_maker.adapters.schemas import (
     RfqCreateResult,
 )
 from coincall_rfq_maker.settings import Settings
-from coincall_rfq_maker.taker import cli
+from coincall_rfq_maker.taker import execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
 
@@ -160,7 +160,7 @@ def _run_trade(
 ) -> list[str]:
     out: list[str] = []
     asyncio.run(
-        cli._cmd_trade(
+        execute._cmd_trade(
             TakerClient(rest),  # type: ignore[arg-type]
             audit,
             _settings(),
@@ -179,21 +179,21 @@ def _run_trade(
 
 
 def test_render_quote_table_numbers_rows_and_shows_legs() -> None:
-    table = cli._render_quote_table((_quote(),), now_ms=2000)
+    table = execute._render_quote_table((_quote(),), now_ms=2000)
     assert "[1] quoteId=QID-1234" in table
     assert INSTRUMENT_NAME in table
     assert "SELL" in table
 
 
 def test_parse_selection_maps_actions_and_indices() -> None:
-    assert cli._parse_selection("", 3) == "cancel"
-    assert cli._parse_selection("c", 3) == "cancel"
-    assert cli._parse_selection("  C ", 3) == "cancel"
-    assert cli._parse_selection("r", 3) == "refresh"
-    assert cli._parse_selection("2", 3) == 1  # 1-based -> 0-based
-    assert cli._parse_selection("0", 3) == "invalid"  # out of range
-    assert cli._parse_selection("4", 3) == "invalid"  # out of range
-    assert cli._parse_selection("x", 3) == "invalid"  # garbage never means cancel
+    assert execute._parse_selection("", 3) == "cancel"
+    assert execute._parse_selection("c", 3) == "cancel"
+    assert execute._parse_selection("  C ", 3) == "cancel"
+    assert execute._parse_selection("r", 3) == "refresh"
+    assert execute._parse_selection("2", 3) == 1  # 1-based -> 0-based
+    assert execute._parse_selection("0", 3) == "invalid"  # out of range
+    assert execute._parse_selection("4", 3) == "invalid"  # out of range
+    assert execute._parse_selection("x", 3) == "invalid"  # garbage never means cancel
 
 
 # -- trade loop: cancel-on-exit invariants ----------------------------------
@@ -366,7 +366,7 @@ def test_create_rfq_audited_before_banner_prints(tmp_path: Path) -> None:
         events.append(f"out:{line}")
 
     asyncio.run(
-        cli._cmd_trade(
+        execute._cmd_trade(
             TakerClient(rest),  # type: ignore[arg-type]
             SpyAudit(tmp_path / "audit.jsonl"),
             _settings(),
@@ -420,7 +420,7 @@ def test_cancel_on_exit_success_audits_attempt_and_success(tmp_path: Path) -> No
     audit = AuditLog(tmp_path / "audit.jsonl")
     out: list[str] = []
 
-    asyncio.run(cli._cancel_on_exit(TakerClient(rest), audit, REQUEST_ID, out=out.append))  # type: ignore[arg-type]
+    asyncio.run(execute._cancel_on_exit(TakerClient(rest), audit, REQUEST_ID, out=out.append))  # type: ignore[arg-type]
 
     assert rest.cancelled == [REQUEST_ID]
     assert [r["action"] for r in _read_audit(tmp_path / "audit.jsonl")] == [
@@ -434,7 +434,7 @@ def test_cancel_on_exit_failure_audits_attempt_and_failure(tmp_path: Path) -> No
     audit = AuditLog(tmp_path / "audit.jsonl")
     out: list[str] = []
 
-    asyncio.run(cli._cancel_on_exit(TakerClient(rest), audit, REQUEST_ID, out=out.append))  # type: ignore[arg-type]
+    asyncio.run(execute._cancel_on_exit(TakerClient(rest), audit, REQUEST_ID, out=out.append))  # type: ignore[arg-type]
 
     assert [r["action"] for r in _read_audit(tmp_path / "audit.jsonl")] == [
         "cancel_attempt",
@@ -455,7 +455,7 @@ def test_pending_task_cancellation_still_cancels_rfq(tmp_path: Path) -> None:
             return "c"
 
         task = asyncio.create_task(
-            cli._cmd_trade(
+            execute._cmd_trade(
                 TakerClient(rest),  # type: ignore[arg-type]
                 audit,
                 _settings(),

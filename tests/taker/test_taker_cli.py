@@ -11,7 +11,7 @@ from coincall_rfq_maker.adapters.schemas import (
     RfqCreateResult,
 )
 from coincall_rfq_maker.settings import Settings
-from coincall_rfq_maker.taker import cli
+from coincall_rfq_maker.taker import cli, execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
 
@@ -142,7 +142,7 @@ def test_create_rfq_preflights_legs_and_prints_request_id(
     client = TakerClient(fake)
 
     asyncio.run(
-        cli._cmd_create_rfq(
+        execute._cmd_create_rfq(
             client,
             AuditLog(tmp_path / "audit.jsonl"),
             ["BTCUSD-9JUL26-56000-C:BUY:0.2"],
@@ -186,7 +186,9 @@ def test_quotes_render_empty(capsys: pytest.CaptureFixture[str]) -> None:
 def test_cancel_rfq_confirms(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fake = FakeRest()
 
-    asyncio.run(cli._cmd_cancel_rfq(TakerClient(fake), AuditLog(tmp_path / "audit.jsonl"), "r1"))
+    asyncio.run(
+        execute._cmd_cancel_rfq(TakerClient(fake), AuditLog(tmp_path / "audit.jsonl"), "r1")
+    )
 
     assert fake.cancelled == ["r1"]
     assert "cancelled RFQ r1" in capsys.readouterr().out

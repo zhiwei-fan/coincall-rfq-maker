@@ -15,7 +15,7 @@ from coincall_rfq_maker.adapters.schemas import (
     QuotePayload,
 )
 from coincall_rfq_maker.settings import Settings
-from coincall_rfq_maker.taker import cli
+from coincall_rfq_maker.taker import execute
 from coincall_rfq_maker.taker.audit import AuditLog
 from coincall_rfq_maker.taker.client import TakerClient
 
@@ -110,7 +110,7 @@ def _run(
     assume_yes: bool = False,
     entry: str | None = None,
     max_notional: float = 5000.0,
-) -> tuple[cli.ExecuteOutcome, list[str]]:
+) -> tuple[execute.ExecuteOutcome, list[str]]:
     out: list[str] = []
     inputs = iter([entry] if entry is not None else [])
 
@@ -118,7 +118,7 @@ def _run(
         return next(inputs)
 
     result = asyncio.run(
-        cli._confirm_and_execute(
+        execute._confirm_and_execute(
             TakerClient(rest),  # type: ignore[arg-type]
             audit,
             request_id=REQUEST_ID,
@@ -141,7 +141,7 @@ def test_refuses_when_quote_not_found(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert any("not found" in line for line in out)
     records = _read_audit(tmp_path / "audit.jsonl")
@@ -156,7 +156,7 @@ def test_refuses_when_request_id_mismatches(tmp_path: Path) -> None:
 
     result, _out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "not_found"
 
@@ -167,7 +167,7 @@ def test_refuses_when_quote_expired(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert any("expired" in line for line in out)
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "expired"
@@ -179,7 +179,7 @@ def test_refuses_terminal_quote_state_without_executing(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert any("non-open quote" in line for line in out)
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "not_open"
@@ -191,7 +191,7 @@ def test_open_quote_state_still_reaches_execute_path(tmp_path: Path) -> None:
 
     result, _out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.EXECUTED
+    assert result is execute.ExecuteOutcome.EXECUTED
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
 
 
@@ -205,7 +205,7 @@ def test_notional_cap_refuses_even_with_assume_yes(tmp_path: Path) -> None:
     # gross premium == abs(0.05 * 0.2) == 0.01, cap 0.001 -> breach, even with --yes.
     result, out = _run(rest, audit, assume_yes=True, max_notional=0.001)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []  # never reached the exchange
     refusal = "\n".join(out)
     assert "0.001" in refusal and "0.0100" in refusal  # names BOTH numbers
@@ -223,7 +223,7 @@ def test_wrong_confirmation_aborts_without_executing(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=False, entry="9999")
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert any("aborted" in line for line in out)
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "unconfirmed"
@@ -235,7 +235,7 @@ def test_correct_last4_executes(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=False, entry=" 1234 ")  # trimmed match
 
-    assert result is cli.ExecuteOutcome.EXECUTED
+    assert result is execute.ExecuteOutcome.EXECUTED
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
     assert any("FILLED" in line and "BT-1" in line for line in out)
     records = _read_audit(tmp_path / "audit.jsonl")
@@ -251,7 +251,7 @@ def test_assume_yes_skips_confirmation_and_executes(tmp_path: Path) -> None:
 
     result, _out = _run(rest, audit, assume_yes=True)  # no input consumed
 
-    assert result is cli.ExecuteOutcome.EXECUTED
+    assert result is execute.ExecuteOutcome.EXECUTED
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
 
 
@@ -264,7 +264,7 @@ def test_ambiguous_outcome_is_not_retried(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.STOP
+    assert result is execute.ExecuteOutcome.STOP
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]  # exactly once, NO retry
     assert any("AMBIGUOUS" in line for line in out)
     records = _read_audit(tmp_path / "audit.jsonl")
@@ -284,7 +284,7 @@ def test_execute_error_stops_cleanly_and_audits(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.STOP
+    assert result is execute.ExecuteOutcome.STOP
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
     assert any("execute failed" in line and "MAY have landed" in line for line in out)
     records = _read_audit(tmp_path / "audit.jsonl")
@@ -302,7 +302,7 @@ def test_malformed_success_still_audits_the_fill(tmp_path: Path) -> None:
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.EXECUTED
+    assert result is execute.ExecuteOutcome.EXECUTED
     assert any("FILLED" in line and "UNKNOWN" in line for line in out)
     records = _read_audit(tmp_path / "audit.jsonl")
     assert [r["action"] for r in records[-2:]] == ["execute_attempt", "execute"]
@@ -317,7 +317,7 @@ def test_execute_attempt_audit_failure_refuses_before_exchange(tmp_path: Path) -
     rest = FakeRest(quotes=(_quote(),), execute_result=_exec_result())
     result, out = _run(rest, FailingAttemptAudit(tmp_path / "audit.jsonl"), assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
     assert any("cannot persist the pre-trade audit breadcrumb" in line for line in out)
 
@@ -330,7 +330,7 @@ def test_post_fill_execute_audit_failure_does_not_undo_fill(tmp_path: Path) -> N
     rest = FakeRest(quotes=(_quote(),), execute_result=_exec_result())
     result, out = _run(rest, FailingFillAudit(tmp_path / "audit.jsonl"), assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.EXECUTED
+    assert result is execute.ExecuteOutcome.EXECUTED
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
     assert any("FILLED" in line for line in out)
 
@@ -344,7 +344,7 @@ def test_malformed_response_ambiguous_error_stops_and_audits(tmp_path: Path) -> 
 
     result, _out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.STOP
+    assert result is execute.ExecuteOutcome.STOP
     assert rest.execute_calls == [(REQUEST_ID, QUOTE_ID)]
     actions = [r["action"] for r in _read_audit(tmp_path / "audit.jsonl")]
     assert actions[-2:] == ["execute_attempt", "execute_ambiguous"]
@@ -360,19 +360,19 @@ def test_gross_premium_multi_leg() -> None:
             {"instrumentName": "B", "side": "BUY", "price": "100", "quantity": "2"},
         ]
     )
-    assert cli._gross_premium(quote) == pytest.approx(0.01 + 200.0)
+    assert execute._gross_premium(quote) == pytest.approx(0.01 + 200.0)
 
 
 def test_gross_premium_refuses_missing_quantity() -> None:
     quote = _quote(legs=[{"instrumentName": "A", "side": "SELL", "price": "0.05"}])
-    with pytest.raises(cli.UnpriceableQuote, match="quantity"):
-        cli._gross_premium(quote)
+    with pytest.raises(execute.UnpriceableQuote, match="quantity"):
+        execute._gross_premium(quote)
 
 
 def test_gross_premium_refuses_empty_quantity() -> None:
     quote = _quote(legs=[{"instrumentName": "A", "side": "SELL", "price": "0.05", "quantity": ""}])
-    with pytest.raises(cli.UnpriceableQuote, match="quantity"):
-        cli._gross_premium(quote)
+    with pytest.raises(execute.UnpriceableQuote, match="quantity"):
+        execute._gross_premium(quote)
 
 
 def test_gross_premium_refuses_unparseable_price() -> None:
@@ -382,8 +382,8 @@ def test_gross_premium_refuses_unparseable_price() -> None:
             {"instrumentName": "B", "side": "BUY", "price": "2", "quantity": "3"},
         ]
     )
-    with pytest.raises(cli.UnpriceableQuote, match="price"):
-        cli._gross_premium(quote)
+    with pytest.raises(execute.UnpriceableQuote, match="price"):
+        execute._gross_premium(quote)
 
 
 @pytest.mark.parametrize(
@@ -399,14 +399,14 @@ def test_gross_premium_refuses_non_finite_numbers(field: str, value: str) -> Non
     leg[field] = value
     quote = _quote(legs=[leg])
 
-    with pytest.raises(cli.UnpriceableQuote, match="non-finite"):
-        cli._gross_premium(quote)
+    with pytest.raises(execute.UnpriceableQuote, match="non-finite"):
+        execute._gross_premium(quote)
 
 
 def test_gross_premium_refuses_no_legs() -> None:
     quote = _quote(legs=[])
-    with pytest.raises(cli.UnpriceableQuote, match="no legs"):
-        cli._gross_premium(quote)
+    with pytest.raises(execute.UnpriceableQuote, match="no legs"):
+        execute._gross_premium(quote)
 
 
 @pytest.mark.parametrize(
@@ -431,7 +431,7 @@ def test_unpriceable_quote_refuses_even_with_yes(
 
     result, out = _run(rest, audit, assume_yes=True)
 
-    assert result is cli.ExecuteOutcome.REFUSED
+    assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []  # never priced -> never executed
     assert any("cannot price quote" in line for line in out)
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "unpriceable"
@@ -492,15 +492,15 @@ def test_cmd_execute_passes_cap_and_yes_through(
 ) -> None:
     seen: dict[str, Any] = {}
 
-    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> cli.ExecuteOutcome:
+    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> execute.ExecuteOutcome:
         seen.update(kwargs)
-        return cli.ExecuteOutcome.EXECUTED
+        return execute.ExecuteOutcome.EXECUTED
 
-    monkeypatch.setattr(cli, "_confirm_and_execute", fake_confirm)
+    monkeypatch.setattr(execute, "_confirm_and_execute", fake_confirm)
     audit = AuditLog(tmp_path / "audit.jsonl")
 
     asyncio.run(
-        cli._cmd_execute(
+        execute._cmd_execute(
             TakerClient(FakeRest()),  # type: ignore[arg-type]
             audit,
             _settings(),
@@ -517,14 +517,14 @@ def test_cmd_execute_passes_cap_and_yes_through(
 
 
 def test_cmd_execute_exits_nonzero_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> cli.ExecuteOutcome:
-        return cli.ExecuteOutcome.STOP
+    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> execute.ExecuteOutcome:
+        return execute.ExecuteOutcome.STOP
 
-    monkeypatch.setattr(cli, "_confirm_and_execute", fake_confirm)
+    monkeypatch.setattr(execute, "_confirm_and_execute", fake_confirm)
 
     with pytest.raises(SystemExit) as exc_info:
         asyncio.run(
-            cli._cmd_execute(
+            execute._cmd_execute(
                 TakerClient(FakeRest()),  # type: ignore[arg-type]
                 AuditLog(tmp_path / "audit.jsonl"),
                 _settings(),
@@ -539,24 +539,24 @@ def test_cmd_execute_exits_nonzero_on_stop(tmp_path: Path, monkeypatch: pytest.M
 @pytest.mark.parametrize(
     ("outcome", "expected_code"),
     [
-        (cli.ExecuteOutcome.REFUSED, 3),
-        (cli.ExecuteOutcome.STOP, 1),
+        (execute.ExecuteOutcome.REFUSED, 3),
+        (execute.ExecuteOutcome.STOP, 1),
     ],
 )
 def test_cmd_execute_exit_codes_for_non_executed_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    outcome: cli.ExecuteOutcome,
+    outcome: execute.ExecuteOutcome,
     expected_code: int,
 ) -> None:
-    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> cli.ExecuteOutcome:
+    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> execute.ExecuteOutcome:
         return outcome
 
-    monkeypatch.setattr(cli, "_confirm_and_execute", fake_confirm)
+    monkeypatch.setattr(execute, "_confirm_and_execute", fake_confirm)
 
     with pytest.raises(SystemExit) as exc_info:
         asyncio.run(
-            cli._cmd_execute(
+            execute._cmd_execute(
                 TakerClient(FakeRest()),  # type: ignore[arg-type]
                 AuditLog(tmp_path / "audit.jsonl"),
                 _settings(),
@@ -571,13 +571,13 @@ def test_cmd_execute_exit_codes_for_non_executed_outcomes(
 def test_cmd_execute_returns_normally_when_executed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> cli.ExecuteOutcome:
-        return cli.ExecuteOutcome.EXECUTED
+    async def fake_confirm(client: Any, audit: Any, **kwargs: Any) -> execute.ExecuteOutcome:
+        return execute.ExecuteOutcome.EXECUTED
 
-    monkeypatch.setattr(cli, "_confirm_and_execute", fake_confirm)
+    monkeypatch.setattr(execute, "_confirm_and_execute", fake_confirm)
 
     asyncio.run(
-        cli._cmd_execute(
+        execute._cmd_execute(
             TakerClient(FakeRest()),  # type: ignore[arg-type]
             AuditLog(tmp_path / "audit.jsonl"),
             _settings(),
