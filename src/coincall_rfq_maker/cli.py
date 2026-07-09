@@ -15,7 +15,7 @@ from collections.abc import Sequence
 
 from pydantic import ValidationError
 
-from coincall_rfq_maker.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.adapters.ws import CoincallWsClient
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
@@ -102,6 +102,11 @@ async def _reconcile_loop(
             await orchestrator.reconcile_with_exchange()
 
 
+def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
+    for exc in exceptions:
+        logger.error("Task failed: %s", exc, exc_info=exc)
+
+
 async def run_async(settings: Settings) -> None:
     setup_logging(settings.log_level)
     logger.info("Starting rfq-maker (dry_run=%s)", settings.dry_run)
@@ -137,7 +142,11 @@ async def run_async(settings: Settings) -> None:
         ws_client = CoincallWsClient(settings.ws_url, settings.api_key, api_secret, events)
 
         if settings.cancel_all_on_start:
-            await quote_lifecycle.cancel_all()
+            try:
+                await quote_lifecycle.cancel_all()
+            except CoincallError as exc:
+                sys.stderr.write(f"Startup error: failed to cancel all quotes: {exc}\n")
+                raise SystemExit(1) from exc
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -156,8 +165,7 @@ async def run_async(settings: Settings) -> None:
                     name="reconciler",
                 )
         except* Exception as eg:
-            for exc in eg.exceptions:
-                logger.error("Task failed: %s", exc, exc_info=exc)
+            _log_task_failures(eg.exceptions)
             raise
 
     logger.info("rfq-maker stopped")

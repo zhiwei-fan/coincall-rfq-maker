@@ -13,7 +13,7 @@ pricing, risk, and the quote lifecycle actor.
 import logging
 import time
 
-from coincall_rfq_maker.adapters.rest import CoincallApiError, CoincallRestClient
+from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
 from coincall_rfq_maker.events import (
@@ -147,7 +147,14 @@ class Orchestrator:
         updated = self.rfq_store.mark_terminal(event.request_id, event.status, now_ms)
         if updated is None:
             return
-        await self._quotes.cancel_for_rfq(event.request_id)
+        try:
+            await self._quotes.cancel_for_rfq(event.request_id)
+        except CoincallError:
+            logger.exception("REST error cancelling quote for RFQ %s", event.request_id)
+            if self._record_ambiguous_quote_failures() == 0:
+                self._risk_gate.record_api_failure()
+        else:
+            self._record_ambiguous_quote_failures()
         for instrument_name in self.rfq_store.orphaned_instruments(event.request_id):
             try:
                 underlying = parse_instrument(instrument_name).underlying
@@ -214,10 +221,12 @@ class Orchestrator:
 
         try:
             quote = await self._quotes.reconcile(intent)
+            self._record_ambiguous_quote_failures()
             self._risk_gate.record_api_success()
-        except CoincallApiError:
+        except CoincallError:
             logger.exception("REST error quoting RFQ %s", request_id)
-            self._risk_gate.record_api_failure()
+            if self._record_ambiguous_quote_failures() == 0:
+                self._risk_gate.record_api_failure()
             return
 
         if rfq.stage is RfqStage.PRICED:
@@ -239,8 +248,9 @@ class Orchestrator:
         """Periodic reconciler: true local RFQ state against the exchange's open RFQ list."""
         try:
             response = await self._rest.get_rfq_list(state="OPEN")
-        except CoincallApiError:
+        except CoincallError:
             logger.exception("Reconciler failed to fetch RFQ list")
+            self._risk_gate.record_api_failure()
             return
         remote_ids = {
             item.get("requestId")
@@ -254,6 +264,12 @@ class Orchestrator:
                     rfq.request_id,
                 )
                 await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, RfqStatus.EXPIRED))
+
+    def _record_ambiguous_quote_failures(self) -> int:
+        count = self._quotes.consume_ambiguous_transport_failures()
+        for _ in range(count):
+            self._risk_gate.record_api_failure()
+        return count
 
 
 def _now_ms() -> int:

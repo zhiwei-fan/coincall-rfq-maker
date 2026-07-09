@@ -27,7 +27,11 @@ _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 0.5
 
 
-class CoincallApiError(Exception):
+class CoincallError(Exception):
+    """Base class for Coincall REST client failures."""
+
+
+class CoincallApiError(CoincallError):
     """Raised when the exchange responds with a non-200 status or non-zero `code`."""
 
     def __init__(self, status: int, code: int | None, message: str) -> None:
@@ -37,8 +41,12 @@ class CoincallApiError(Exception):
         self.message = message
 
 
-class CoincallRequestError(Exception):
+class CoincallRequestError(CoincallError):
     """Raised for client-side misuse (e.g. session not started)."""
+
+
+class CoincallAmbiguousError(CoincallRequestError):
+    """Raised when a state-changing request may have reached the exchange."""
 
 
 class CoincallRestClient:
@@ -71,13 +79,20 @@ class CoincallRestClient:
             await self._session.close()
 
     async def _request(
-        self, method: str, path: str, params: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        idempotent: bool = True,
     ) -> dict[str, Any]:
         if self._session is None:
             raise CoincallRequestError("Session not started; use 'async with CoincallRestClient'")
 
+        max_attempts = _MAX_ATTEMPTS if idempotent else 1
+
         last_error: Exception | None = None
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             timestamp = get_timestamp_ms()
             headers = sign_rest_request(
                 method, path, self._api_key, self._api_secret, timestamp, self._diff, params
@@ -105,15 +120,19 @@ class CoincallRestClient:
                     method,
                     path,
                     attempt,
-                    _MAX_ATTEMPTS,
+                    max_attempts,
                     exc,
                 )
-                if attempt < _MAX_ATTEMPTS:
+                if not idempotent:
+                    raise CoincallAmbiguousError(
+                        f"{method} {path} outcome ambiguous after transport error: {exc}"
+                    ) from exc
+                if attempt < max_attempts:
                     await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
 
         assert last_error is not None
         raise CoincallRequestError(
-            f"{method} {path} failed after {_MAX_ATTEMPTS} attempts: {last_error}"
+            f"{method} {path} failed after {max_attempts} attempts: {last_error}"
         ) from last_error
 
     @staticmethod
@@ -155,17 +174,24 @@ class CoincallRestClient:
     async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> dict[str, Any]:
         """POST /open/option/blocktrade/quote/create/v1"""
         payload = {"requestId": request_id, "legs": legs}
-        return await self._request("POST", "/open/option/blocktrade/quote/create/v1", payload)
+        return await self._request(
+            "POST", "/open/option/blocktrade/quote/create/v1", payload, idempotent=False
+        )
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         """POST /open/option/blocktrade/quote/cancel/v1"""
         return await self._request(
-            "POST", "/open/option/blocktrade/quote/cancel/v1", {"quoteId": quote_id}
+            "POST",
+            "/open/option/blocktrade/quote/cancel/v1",
+            {"quoteId": quote_id},
+            idempotent=False,
         )
 
     async def cancel_all_quotes(self) -> dict[str, Any]:
         """POST /open/option/blocktrade/quote/cancel-all/v1"""
-        return await self._request("POST", "/open/option/blocktrade/quote/cancel-all/v1", None)
+        return await self._request(
+            "POST", "/open/option/blocktrade/quote/cancel-all/v1", None, idempotent=False
+        )
 
     async def get_quote_list(
         self,
