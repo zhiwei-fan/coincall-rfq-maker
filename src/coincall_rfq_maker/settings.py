@@ -23,7 +23,9 @@ class Settings(BaseSettings):
 
     dry_run: bool = Field(default=True, alias="DRY_RUN")
     cancel_all_on_start: bool = Field(default=True, alias="CANCEL_ALL_ON_START")
+    cancel_all_on_stop: bool = Field(default=True, alias="CANCEL_ALL_ON_STOP")
 
+    heartbeat_interval_seconds: float = Field(default=5.0, gt=0, alias="HEARTBEAT_INTERVAL_SECONDS")
     pricing_refresh_seconds: float = Field(default=5.0, alias="PRICING_REFRESH_SECONDS")
     quote_refresh_seconds: float = Field(default=10.0, alias="QUOTE_REFRESH_SECONDS")
     price_move_threshold: float = Field(default=0.001, alias="PRICE_MOVE_THRESHOLD")

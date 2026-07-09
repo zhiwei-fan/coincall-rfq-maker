@@ -131,6 +131,38 @@ class FakeConnection:
         return json.dumps({"dt": 28, "d": {"requestId": "rfq-1", "state": "CANCELLED"}})
 
 
+class BlockingConnection:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        await asyncio.sleep(3600)
+        return ""
+
+
+async def wait_until(predicate: Any, timeout: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            raise AssertionError("condition was not met before timeout")
+        await asyncio.sleep(0.001)
+
+
 @pytest.mark.asyncio
 async def test_queue_shutdown_while_putting_event_exits_read_loop(
     monkeypatch: pytest.MonkeyPatch,
@@ -146,3 +178,87 @@ async def test_queue_shutdown_while_putting_event_exits_read_loop(
     await client._connect_and_read(asyncio.Event())
 
     assert connection.recv_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sent_after_subscribe_and_stops_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = BlockingConnection()
+
+    async def fake_connect(*args: Any, **kwargs: Any) -> BlockingConnection:
+        return connection
+
+    monkeypatch.setattr(ws.websockets, "connect", fake_connect)
+    client = CoincallWsClient(
+        "wss://example.test/ws",
+        "key",
+        "secret",
+        asyncio.Queue(),
+        heartbeat_interval_seconds=0.01,
+    )
+    shutdown = asyncio.Event()
+
+    task = asyncio.create_task(client._connect_and_read(shutdown))
+    await wait_until(lambda: len(connection.sent) >= len(ws.SUBSCRIPTIONS) + 2)
+
+    sent = [json.loads(message) for message in connection.sent]
+    assert sent[: len(ws.SUBSCRIPTIONS)] == [
+        {"action": "subscribe", "dataType": data_type} for data_type in ws.SUBSCRIPTIONS
+    ]
+    heartbeat_frames = sent[len(ws.SUBSCRIPTIONS) :]
+    assert len(heartbeat_frames) >= 2
+    assert all(frame == {"action": "heartbeat"} for frame in heartbeat_frames)
+
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    stopped_at = len(connection.sent)
+    await asyncio.sleep(0.03)
+
+    assert len(connection.sent) == stopped_at
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancellation_cancels_child_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CoincallWsClient(
+        "wss://example.test/ws",
+        "key",
+        "secret",
+        asyncio.Queue(),
+        heartbeat_interval_seconds=0.01,
+    )
+    connection = BlockingConnection()
+    shutdown = asyncio.Event()
+    read_started = asyncio.Event()
+    heartbeat_started = asyncio.Event()
+    child_tasks: list[asyncio.Task[Any]] = []
+
+    async def fake_read_loop(connection: BlockingConnection, shutdown: asyncio.Event) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        child_tasks.append(task)
+        read_started.set()
+        await asyncio.sleep(3600)
+
+    async def fake_heartbeat_loop(connection: BlockingConnection, shutdown: asyncio.Event) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        child_tasks.append(task)
+        heartbeat_started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(client, "_read_loop", fake_read_loop)
+    monkeypatch.setattr(client, "_heartbeat_loop", fake_heartbeat_loop)
+
+    supervisor = asyncio.create_task(client._supervise_connection(connection, shutdown))
+    await asyncio.wait_for(read_started.wait(), timeout=1.0)
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=1.0)
+
+    supervisor.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(supervisor, timeout=1.0)
+
+    assert len(child_tasks) == 2
+    assert all(task.done() for task in child_tasks)

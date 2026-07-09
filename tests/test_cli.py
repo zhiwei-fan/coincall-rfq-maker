@@ -1,6 +1,6 @@
 import asyncio
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 import pytest
 
@@ -50,6 +50,56 @@ class FailingQuoteLifecycle:
         raise CoincallRequestError("cancel-all unavailable")
 
 
+class RecordingQuoteLifecycle:
+    instances: ClassVar[list["RecordingQuoteLifecycle"]] = []
+    fail_on_cancel_all: ClassVar[bool] = False
+    cancel_all_exception: ClassVar[Exception | None] = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.cancel_all_calls = 0
+        type(self).instances.append(self)
+
+    async def cancel_all(self) -> None:
+        self.cancel_all_calls += 1
+        if type(self).cancel_all_exception is not None:
+            raise type(self).cancel_all_exception
+        if type(self).fail_on_cancel_all:
+            raise CoincallRequestError("shutdown cancel-all unavailable")
+
+
+class SignalShutdownWsClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event) -> None:
+        shutdown.set()
+
+
+class StopAwareMarketData:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event, interval_seconds: float) -> None:
+        await shutdown.wait()
+
+
+class ShutdownRaceMarketData:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event, interval_seconds: float) -> None:
+        await shutdown.wait()
+        raise asyncio.QueueShutDown
+
+
+class NoopOrchestrator:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def handle_event(self, event: object) -> None:
+        pass
+
+
 class ShutdownOnPutQueue:
     def __init__(self) -> None:
         self.puts = 0
@@ -75,6 +125,117 @@ async def test_startup_cancel_all_failure_exits_cleanly(
     assert capsys.readouterr().err == (
         "Startup error: failed to cancel all quotes: cancel-all unavailable\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_cancel_all_on_stop_failure_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = True
+    RecordingQuoteLifecycle.cancel_all_exception = None
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = Settings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=True,
+    )
+
+    await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 1
+    assert (
+        "WARNING: failed to cancel all quotes during graceful shutdown" in capsys.readouterr().err
+    )
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_cancel_all_on_stop_false_does_not_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = False
+    RecordingQuoteLifecycle.cancel_all_exception = None
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = Settings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_signal_shutdown_taskgroup_shutdown_race_attempts_cancel_all_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = False
+    RecordingQuoteLifecycle.cancel_all_exception = None
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", ShutdownRaceMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = Settings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=True,
+    )
+
+    await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_all_non_coincall_failure_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = False
+    RecordingQuoteLifecycle.cancel_all_exception = ValueError("malformed cancel-all response")
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = Settings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=True,
+    )
+
+    await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 1
+    stderr = capsys.readouterr().err
+    assert "WARNING: failed to cancel all quotes during graceful shutdown" in stderr
+    assert "quotes may remain live on the exchange: malformed cancel-all response" in stderr
+    RecordingQuoteLifecycle.cancel_all_exception = None
 
 
 @pytest.mark.asyncio

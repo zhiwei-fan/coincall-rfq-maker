@@ -29,6 +29,11 @@ class BlockingFuturesRest:
         return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
 
 
+class ShutdownOnPutQueue:
+    async def put(self, event: object) -> None:
+        raise asyncio.QueueShutDown
+
+
 @pytest.mark.asyncio
 async def test_first_fetch_emits_prices_refreshed() -> None:
     rest = FakeFuturesRest({"BTCUSD": 50_000.0})
@@ -120,6 +125,18 @@ async def test_untrack_during_refresh_does_not_resurrect_price() -> None:
 
     assert service.get_price("BTCUSD") is None
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_prices_refreshed_queue_shutdown_race_does_not_crash_task_group() -> None:
+    rest = FakeFuturesRest({"BTCUSD": 50_000.0})
+    service = MarketDataService(rest, ShutdownOnPutQueue())  # type: ignore[arg-type]
+    service.track("BTCUSD")
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(service.refresh_once(now_ms=1_000))
+
+    assert service.get_price("BTCUSD") == 50_000.0
 
 
 @pytest.mark.asyncio

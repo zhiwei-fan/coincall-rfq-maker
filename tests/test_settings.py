@@ -20,8 +20,10 @@ def test_valid_settings_apply_defaults() -> None:
     settings = Settings(_env_file=None, API_KEY="key", API_SECRET="secret")  # type: ignore[call-arg]
     assert settings.dry_run is True
     assert settings.cancel_all_on_start is True
+    assert settings.cancel_all_on_stop is True
     assert settings.rest_base_url == "https://betaapi.coincall.com"
     assert settings.ws_url == "wss://betaws.seizeyouralpha.com/options"
+    assert settings.heartbeat_interval_seconds == 5.0
     assert settings.pricing_refresh_seconds == 5.0
     assert settings.quote_refresh_seconds == 10.0
     assert settings.price_move_threshold == 0.001
@@ -36,3 +38,8 @@ def test_dry_run_defaults_true_even_when_other_fields_overridden() -> None:
     settings = Settings(_env_file=None, API_KEY="key", API_SECRET="secret", MAX_LEG_QTY=5)  # type: ignore[call-arg]
     assert settings.dry_run is True
     assert settings.max_leg_qty == 5
+
+
+def test_heartbeat_interval_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, API_KEY="key", API_SECRET="secret", HEARTBEAT_INTERVAL_SECONDS=0)  # type: ignore[call-arg]

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 from enum import IntEnum
+from typing import Protocol
 
 import websockets
 
@@ -36,6 +37,8 @@ _CONNECT_TIMEOUT_SECONDS = 30.0
 _RECV_TIMEOUT_SECONDS = 60.0
 _INITIAL_RECONNECT_DELAY_SECONDS = 1.0
 _MAX_RECONNECT_DELAY_SECONDS = 60.0
+_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
+_HEARTBEAT_MESSAGE = json.dumps({"action": "heartbeat"})
 
 _WIRE_QUOTE_STATE_TO_STAGE = {
     "OPEN": QuoteStage.OPEN,
@@ -50,6 +53,12 @@ _TERMINAL_RFQ_STATES = {
     RfqStatus.FILLED,
     RfqStatus.TRADED_AWAY,
 }
+
+
+class _WsConnection(Protocol):
+    async def send(self, message: str) -> None: ...
+
+    async def recv(self) -> str | bytes: ...
 
 
 class DtCode(IntEnum):
@@ -160,11 +169,13 @@ class CoincallWsClient:
         api_key: str,
         api_secret: str,
         event_queue: "asyncio.Queue[object]",
+        heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._ws_url = ws_url
         self._api_key = api_key
         self._api_secret = api_secret
         self._queue = event_queue
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     async def run(self, shutdown: asyncio.Event) -> None:
         """Connect, subscribe, and read until `shutdown` is set, reconnecting with backoff."""
@@ -197,17 +208,48 @@ class CoincallWsClient:
             for data_type in SUBSCRIPTIONS:
                 await connection.send(json.dumps({"action": "subscribe", "dataType": data_type}))
             logger.info("Subscribed to %s", SUBSCRIPTIONS)
-            while not shutdown.is_set():
+            await self._supervise_connection(connection, shutdown)
+
+    async def _supervise_connection(
+        self, connection: _WsConnection, shutdown: asyncio.Event
+    ) -> None:
+        read_task = asyncio.create_task(self._read_loop(connection, shutdown), name="ws-read")
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(connection, shutdown), name="ws-heartbeat"
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {read_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                task.result()
+        finally:
+            for task in (read_task, heartbeat_task):
+                task.cancel()
+            await asyncio.gather(read_task, heartbeat_task, return_exceptions=True)
+
+    async def _read_loop(self, connection: _WsConnection, shutdown: asyncio.Event) -> None:
+        while not shutdown.is_set():
+            try:
+                async with asyncio.timeout(_RECV_TIMEOUT_SECONDS):
+                    raw = await connection.recv()
+            except TimeoutError:
+                continue
+            text = raw.decode() if isinstance(raw, bytes) else raw
+            event = parse_ws_message(text)
+            if event is not None:
                 try:
-                    async with asyncio.timeout(_RECV_TIMEOUT_SECONDS):
-                        raw = await connection.recv()
-                except TimeoutError:
-                    continue
-                text = raw.decode() if isinstance(raw, bytes) else raw
-                event = parse_ws_message(text)
-                if event is not None:
-                    try:
-                        await self._queue.put(event)
-                    except asyncio.QueueShutDown:
-                        logger.debug("WS event queue shut down; exiting read loop")
-                        return
+                    await self._queue.put(event)
+                except asyncio.QueueShutDown:
+                    logger.debug("WS event queue shut down; exiting read loop")
+                    return
+
+    async def _heartbeat_loop(self, connection: _WsConnection, shutdown: asyncio.Event) -> None:
+        while not shutdown.is_set():
+            await connection.send(_HEARTBEAT_MESSAGE)
+            try:
+                async with asyncio.timeout(self._heartbeat_interval_seconds):
+                    await shutdown.wait()
+                return
+            except TimeoutError:
+                pass

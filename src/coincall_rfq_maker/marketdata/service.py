@@ -126,7 +126,12 @@ class MarketDataService:
         if moved:
             for underlying in moved:
                 self._last_emitted_ms[underlying] = now_ms
-            await self._queue.put(PricesRefreshed(underlyings=tuple(moved), timestamp_ms=now_ms))
+            try:
+                await self._queue.put(
+                    PricesRefreshed(underlyings=tuple(moved), timestamp_ms=now_ms)
+                )
+            except asyncio.QueueShutDown:
+                logger.debug("Market-data event queue shut down; stopping refresh emission")
 
     async def run(self, shutdown: asyncio.Event, interval_seconds: float) -> None:
         """Refresh on a fixed interval until `shutdown` is set."""

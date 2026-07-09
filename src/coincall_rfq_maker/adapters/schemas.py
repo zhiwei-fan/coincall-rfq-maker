@@ -111,9 +111,11 @@ class SymbolInfoPayload(BaseModel):
     @property
     def underlying_price(self) -> float | None:
         """Prefer indexPrice, fall back to markPrice — ported from old market_data.py."""
-        if self.index_price is not None:
+        if self.index_price is not None and self.index_price > 0:
             return self.index_price
-        return self.mark_price
+        if self.mark_price is not None and self.mark_price > 0:
+            return self.mark_price
+        return None
 
 
 class WsEnvelope(BaseModel):

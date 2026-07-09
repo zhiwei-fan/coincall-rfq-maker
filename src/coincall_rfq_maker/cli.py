@@ -113,9 +113,28 @@ async def _enqueue_startup_backfill(events: "asyncio.Queue[object]") -> None:
     await events.put(ReconcileTick())
 
 
+async def _cancel_all_on_graceful_stop(quote_lifecycle: QuoteLifecycle) -> None:
+    try:
+        await quote_lifecycle.cancel_all()
+    except Exception as exc:
+        logger.error(
+            "Shutdown cancel-all failed; quotes may remain live on the exchange: %s",
+            exc,
+            exc_info=exc,
+        )
+        sys.stderr.write(
+            "WARNING: failed to cancel all quotes during graceful shutdown; "
+            f"quotes may remain live on the exchange: {exc}\n"
+        )
+
+
 def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
     for exc in exceptions:
         logger.error("Task failed: %s", exc, exc_info=exc)
+
+
+def _all_shutdown_race_failures(exceptions: Sequence[BaseException]) -> bool:
+    return all(isinstance(exc, asyncio.QueueShutDown) for exc in exceptions)
 
 
 async def run_async(settings: Settings) -> None:
@@ -150,7 +169,13 @@ async def run_async(settings: Settings) -> None:
         orchestrator = Orchestrator(
             rest, market_data, pricing_model, risk_gate, quote_lifecycle, persistence
         )
-        ws_client = CoincallWsClient(settings.ws_url, settings.api_key, api_secret, events)
+        ws_client = CoincallWsClient(
+            settings.ws_url,
+            settings.api_key,
+            api_secret,
+            events,
+            heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+        )
 
         if settings.cancel_all_on_start:
             try:
@@ -161,6 +186,7 @@ async def run_async(settings: Settings) -> None:
 
         await _enqueue_startup_backfill(events)
 
+        task_failure_group: ExceptionGroup[Exception] | None = None
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(ws_client.run(shutdown), name="ws-client")
@@ -178,8 +204,17 @@ async def run_async(settings: Settings) -> None:
                     name="reconciler",
                 )
         except* Exception as eg:
-            _log_task_failures(eg.exceptions)
-            raise
+            if shutdown.is_set() and _all_shutdown_race_failures(eg.exceptions):
+                logger.debug("Ignoring shutdown-race task failures: %s", eg.exceptions)
+            else:
+                _log_task_failures(eg.exceptions)
+                task_failure_group = eg
+        finally:
+            if shutdown.is_set() and settings.cancel_all_on_stop:
+                await _cancel_all_on_graceful_stop(quote_lifecycle)
+
+        if task_failure_group is not None:
+            raise task_failure_group
 
     logger.info("rfq-maker stopped")
 
