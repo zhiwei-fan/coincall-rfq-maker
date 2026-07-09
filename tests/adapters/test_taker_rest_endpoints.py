@@ -83,7 +83,7 @@ OPTION_INSTRUMENT_DATA = [
 class RequestRecorder:
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
-        self.calls: list[tuple[str, str, dict[str, Any] | None, bool]] = []
+        self.calls: list[tuple[str, str, dict[str, Any] | None, bool, bool]] = []
 
     async def __call__(
         self,
@@ -92,8 +92,9 @@ class RequestRecorder:
         params: dict[str, Any] | None = None,
         *,
         idempotent: bool = True,
+        form_encoded: bool = False,
     ) -> dict[str, Any]:
-        self.calls.append((method, path, params, idempotent))
+        self.calls.append((method, path, params, idempotent, form_encoded))
         return self.response
 
 
@@ -193,6 +194,7 @@ async def test_create_rfq_posts_expected_path_params_and_parses_response(
             "/open/option/blocktrade/request/create/v1",
             {"legs": legs},
             False,
+            False,
         )
     ]
 
@@ -214,6 +216,7 @@ async def test_execute_quote_posts_expected_path_params_and_parses_response(
             "/open/option/blocktrade/request/accept/v1",
             {"requestId": "198313", "quoteId": "198314"},
             False,
+            True,
         )
     ]
 
@@ -236,6 +239,7 @@ async def test_cancel_rfq_posts_expected_path_params_and_returns_envelope(
             "/open/option/blocktrade/request/cancel/v1",
             {"requestId": "198313"},
             False,
+            True,
         )
     ]
 
@@ -267,6 +271,7 @@ async def test_get_quotes_received_gets_expected_path_and_skips_malformed_items(
             "/open/option/blocktrade/request/getQuotesReceived/v1",
             {"requestId": "r1"},
             True,
+            False,
         )
     ]
     assert "Malformed quote REST item" in caplog.text
@@ -293,7 +298,7 @@ async def test_get_option_instruments_gets_expected_path_and_skips_malformed_ite
         result = await client.get_option_instruments("BTC")
 
     assert [instrument.symbol_name for instrument in result] == ["BTCUSD-9JUL26-56000-C"]
-    assert recorder.calls == [("GET", "/open/option/getInstruments/BTC", None, True)]
+    assert recorder.calls == [("GET", "/open/option/getInstruments/BTC", None, True, False)]
     assert "Malformed option instrument REST item" in caplog.text
 
 

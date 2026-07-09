@@ -11,6 +11,7 @@ import json
 import logging
 from types import TracebackType
 from typing import Any, Literal, Self
+from urllib.parse import urlencode
 
 import aiohttp
 from pydantic import ValidationError
@@ -99,6 +100,7 @@ class CoincallRestClient:
         params: dict[str, Any] | None = None,
         *,
         idempotent: bool = True,
+        form_encoded: bool = False,
     ) -> dict[str, Any]:
         if self._session is None:
             raise CoincallRequestError("Session not started; use 'async with CoincallRestClient'")
@@ -119,6 +121,16 @@ class CoincallRestClient:
                         async with self._session.get(url, headers=headers) as resp:
                             return await self._parse_response(resp)
                     elif method.upper() == "POST":
+                        # Coincall blocktrade cancel/accept endpoints require form-urlencoded
+                        # bodies (JSON -> code 10004 'Parameter illegal'); create endpoints take
+                        # JSON. Signing is identical either way (prehash is from the params dict).
+                        if form_encoded:
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
+                            body = urlencode(
+                                {k: str(v) for k, v in (params or {}).items() if v is not None}
+                            )
+                            async with self._session.post(url, headers=headers, data=body) as resp:
+                                return await self._parse_response(resp)
                         async with self._session.post(
                             url, headers=headers, json=params or {}
                         ) as resp:
@@ -204,6 +216,7 @@ class CoincallRestClient:
             "/open/option/blocktrade/request/cancel/v1",
             {"requestId": request_id},
             idempotent=False,
+            form_encoded=True,
         )
 
     async def execute_quote(self, request_id: str, quote_id: str) -> ExecuteQuoteResult:
@@ -213,6 +226,7 @@ class CoincallRestClient:
             "/open/option/blocktrade/request/accept/v1",
             {"requestId": request_id, "quoteId": quote_id},
             idempotent=False,
+            form_encoded=True,
         )
         try:
             return ExecuteQuoteResult.model_validate(response.get("data") or {})
@@ -265,12 +279,17 @@ class CoincallRestClient:
             "/open/option/blocktrade/quote/cancel/v1",
             {"quoteId": quote_id},
             idempotent=False,
+            form_encoded=True,
         )
 
     async def cancel_all_quotes(self) -> dict[str, Any]:
         """POST /open/option/blocktrade/quote/cancel-all/v1"""
         return await self._request(
-            "POST", "/open/option/blocktrade/quote/cancel-all/v1", None, idempotent=False
+            "POST",
+            "/open/option/blocktrade/quote/cancel-all/v1",
+            None,
+            idempotent=False,
+            form_encoded=True,
         )
 
     async def get_quote_list(
