@@ -123,9 +123,7 @@ async def test_idempotent_get_transient_failure_retries_max_attempts_then_raises
         await client._request("GET", "/open/option/blocktrade/rfqList/v1")
 
     assert session.get_attempts == _MAX_ATTEMPTS
-    assert sleeps == [
-        _RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, _MAX_ATTEMPTS)
-    ]
+    assert sleeps == [_RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, _MAX_ATTEMPTS)]
 
 
 @pytest.mark.asyncio

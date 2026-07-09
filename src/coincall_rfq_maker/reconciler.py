@@ -57,6 +57,10 @@ class Reconciler:
         self._persistence = persistence
 
     async def reconcile_with_exchange(self) -> None:
+        # Treats the OPEN rfqList response as a COMPLETE snapshot: RFQs absent from it
+        # (past the grace window) are expired locally. Owner-confirmed 2026-07-09 that
+        # Coincall's rfqList does not paginate. If it ever gains paging, this single-page
+        # fetch would wrongly expire RFQs on later pages — page through all results first.
         try:
             remote_rfqs = await self._rest.get_rfq_list(state="OPEN")
         except CoincallError:
@@ -118,6 +122,8 @@ class Reconciler:
             await self._on_terminal_rfq(rfq.request_id, RfqStatus.EXPIRED)
 
     async def _reconcile_quote_state(self) -> None:
+        # Same complete-snapshot assumption as reconcile_with_exchange: quoteList OPEN does
+        # not paginate (owner-confirmed 2026-07-09). Revisit if the endpoint gains paging.
         try:
             remote_quotes = await self._rest.get_quote_list(state="OPEN")
         except CoincallError:

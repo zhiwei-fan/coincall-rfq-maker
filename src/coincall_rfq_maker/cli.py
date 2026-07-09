@@ -176,9 +176,7 @@ async def run_async(settings: Settings) -> None:
             stale_market_data_seconds=settings.stale_market_data_seconds,
             exposure_provider=NullExposureProvider(),
         )
-        quote_lifecycle = QuoteLifecycle(
-            rest, dry_run=settings.dry_run, api_reporter=risk_gate
-        )
+        quote_lifecycle = QuoteLifecycle(rest, dry_run=settings.dry_run, api_reporter=risk_gate)
         orchestrator = Orchestrator(
             rest, market_data, pricing_model, risk_gate, quote_lifecycle, persistence
         )

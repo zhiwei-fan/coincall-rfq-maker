@@ -226,9 +226,7 @@ class Orchestrator:
             return False
         return not self._quotes.has_open_or_pending_quote_for_rfq(request_id)
 
-    async def _handle_reconciled_terminal_rfq(
-        self, request_id: str, status: RfqStatus
-    ) -> None:
+    async def _handle_reconciled_terminal_rfq(self, request_id: str, status: RfqStatus) -> None:
         await self._handle_rfq_terminated(RfqTerminated(request_id, status))
 
     def _cleanup_and_evict_terminal_rfq(self, request_id: str) -> None:
