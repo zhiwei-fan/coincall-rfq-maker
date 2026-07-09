@@ -8,8 +8,9 @@ from coincall_rfq_maker.adapters.rest import CoincallApiError
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqLeg, Side
 from coincall_rfq_maker.events import QuoteUpdated
-from coincall_rfq_maker.taker import scenarios
-from coincall_rfq_maker.taker.scenarios import (
+from coincall_rfq_maker.testing import scenarios
+from coincall_rfq_maker.testing.fake_exchange import FakeExchange
+from coincall_rfq_maker.testing.scenarios import (
     SCENARIO_NAMES,
     ScenarioFailure,
     _check,
@@ -17,7 +18,6 @@ from coincall_rfq_maker.taker.scenarios import (
     fake_harness,
     run_scenario,
 )
-from coincall_rfq_maker.testing.fake_exchange import FakeExchange
 
 
 @pytest.mark.asyncio

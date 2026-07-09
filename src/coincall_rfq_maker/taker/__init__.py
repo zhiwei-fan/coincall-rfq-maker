@@ -1,1 +1,1 @@
-"""Taker scenario harness for exercising the maker end to end."""
+"""Real taker CLI package: the safe, non-trade RFQ surface for the taker account."""

@@ -1,4 +1,4 @@
-"""Named taker scenarios that exercise the maker end to end."""
+"""Named maker-vs-taker scenarios (test support) that exercise the maker end to end."""
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence

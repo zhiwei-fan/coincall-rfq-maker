@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     max_leg_qty: float = Field(default=100.0, alias="MAX_LEG_QTY")
     min_time_to_expiry_hours: float = Field(default=1.0, alias="MIN_TIME_TO_EXPIRY_HOURS")
     stale_market_data_seconds: float = Field(default=30.0, alias="STALE_MARKET_DATA_SECONDS")
+    taker_max_notional_usd: float = Field(default=5000.0, alias="TAKER_MAX_NOTIONAL_USD")
 
     bid_vol: float = Field(default=0.20, alias="BID_VOL")
     ask_vol: float = Field(default=2.00, alias="ASK_VOL")
