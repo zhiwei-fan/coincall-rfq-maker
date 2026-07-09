@@ -11,6 +11,7 @@ import coincall_rfq_maker.ws as ws
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
+from coincall_rfq_maker.risk.gate import RiskGate
 from coincall_rfq_maker.ws import CoincallWsClient, parse_ws_message
 
 
@@ -71,10 +72,57 @@ def test_dt_20_quote_update_produces_quote_updated() -> None:
     assert event.block_trade_id == "bt-1"
 
 
+def test_dt_130_quote_push_matches_dt_20_and_is_not_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "quoteId": "q-1",
+        "requestId": "rfq-1",
+        "state": "FILLED",
+        "filledPrice": 22.5,
+        "filledQuantity": 1.0,
+        "blockTradeId": "bt-1",
+    }
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.ws"):
+        dt_20 = parse_ws_message(json.dumps({"dt": 20, "d": payload}))
+        dt_130 = parse_ws_message(json.dumps({"dt": 130, "d": payload}))
+
+    assert dt_130 == dt_20
+    assert isinstance(dt_130, QuoteUpdated)
+    assert "Unknown WS dt code" not in caplog.text
+
+
 def test_malformed_dt_20_quote_update_ignored() -> None:
     raw = json.dumps({"dt": 20, "d": {"requestId": "rfq-1", "state": "FILLED"}})
 
     assert parse_ws_message(raw) is None
+
+
+def test_malformed_dt_130_quote_push_logs_debug_payload_not_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = json.dumps(
+        {
+            "dt": 130,
+            "d": {
+                "requestId": "rfq-1",
+                "state": "FILLED",
+                "apiKey": "secret-key",
+                "note": "x" * 300,
+            },
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert "Malformed quote WS payload" in caplog.text
+    assert "Malformed quote WS raw payload" in caplog.text
+    assert "Unknown WS dt code" not in caplog.text
+    for record in caplog.records:
+        if record.message.startswith("Malformed quote WS raw payload"):
+            assert len(record.message.removeprefix("Malformed quote WS raw payload: ")) <= 200
 
 
 def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
@@ -211,6 +259,30 @@ class BlockingConnection:
         return ""
 
 
+class StopAfterSubscribeConnection:
+    def __init__(self, shutdown: asyncio.Event) -> None:
+        self._shutdown = shutdown
+        self.sent: list[str] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        self._shutdown.set()
+        raise RuntimeError("second connection closed")
+
+
 async def wait_until(predicate: Any, timeout: float = 1.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -303,6 +375,36 @@ async def test_run_redacts_signed_url_from_connection_error_log(
     assert "maker-key" not in caplog.text
     assert values["sign"][0] not in caplog.text
     assert "apiKey=maker-key" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ws_disconnect_reconnect_never_records_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown = asyncio.Event()
+    calls: list[str] = []
+    connect_attempts = 0
+
+    def record_api_failure(self: RiskGate) -> None:
+        calls.append("failure")
+
+    async def fake_connect(*args: Any, **kwargs: Any) -> StopAfterSubscribeConnection:
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts == 1:
+            raise RuntimeError("first connection dropped")
+        return StopAfterSubscribeConnection(shutdown)
+
+    monkeypatch.setattr(RiskGate, "record_api_failure", record_api_failure)
+    monkeypatch.setattr(ws.websockets, "connect", fake_connect)
+    monkeypatch.setattr(ws, "_INITIAL_RECONNECT_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(ws, "_MAX_RECONNECT_DELAY_SECONDS", 0.001)
+    client = CoincallWsClient("wss://example.test/ws", "key", "secret", asyncio.Queue())
+
+    await client.run(shutdown)
+
+    assert connect_attempts == 2
+    assert calls == []
 
 
 @pytest.mark.asyncio

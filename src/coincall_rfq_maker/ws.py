@@ -2,7 +2,8 @@
 
 Signed URL, subscriptions, dt-code routing, and reconnect/backoff are ported
 EXACTLY from the old `websocket_client.py` (channels `rfqMaker`, `rfqQuote`,
-`blockTradeDetail`, `blockTradePublic`; dt 28/20/22/23).
+`blockTradeDetail`, `blockTradePublic`; dt 28/20/22/23), plus the documented
+`rfqQuote` push code 130 routed to the same quote handler as dt 20.
 
 Actor-model boundary: this module only PARSES and ENQUEUES typed events. It
 never touches RFQ/quote/store state directly.
@@ -67,6 +68,7 @@ class DtCode(IntEnum):
 
     RFQ_MAKER = 28
     RFQ_QUOTE = 20
+    RFQ_QUOTE_PUSH = 130
     BLOCK_TRADE_DETAIL = 22
     BLOCK_TRADE_PUBLIC = 23
 
@@ -98,7 +100,7 @@ def parse_ws_message(raw: str) -> WsEvent | None:
     data = envelope.d or {}
     if envelope.dt == DtCode.RFQ_MAKER:
         return _parse_rfq_event(data)
-    if envelope.dt == DtCode.RFQ_QUOTE:
+    if envelope.dt in {DtCode.RFQ_QUOTE, DtCode.RFQ_QUOTE_PUSH}:
         return _parse_quote_event(data)
     if envelope.dt == DtCode.BLOCK_TRADE_DETAIL:
         return _parse_trade_event(data)
@@ -133,6 +135,10 @@ def _parse_quote_event(data: dict[str, object]) -> QuoteUpdated | None:
         payload = QuotePayload.model_validate(data)
     except ValidationError as exc:
         logger.warning("Malformed quote WS payload: %s", exc)
+        logger.debug(
+            "Malformed quote WS raw payload: %.200s",
+            _redact_ws_exception_message(Exception(str(data))),
+        )
         return None
     stage = quote_stage_from_wire(payload.state)
     if stage is None:
