@@ -57,6 +57,19 @@ uv run rfq-maker --dry-run  # explicit dry-run
 uv run rfq-maker --no-dry-run  # actually submit quotes (use with care)
 ```
 
+## Maker vs taker harness
+
+`rfq-maker` is the product: it receives RFQs, prices them, submits maker
+quotes, requotes on price moves, and records fills. `rfq-taker` is a supported
+test harness that drives those paths end to end against an in-process fake
+exchange. Live taker REST endpoints are not wired yet.
+
+```sh
+uv run rfq-taker --scenario all
+uv run rfq-taker --scenario taker_executes
+uv run rfq-taker --live  # exits until Coincall taker endpoints/keys are available
+```
+
 ## Testing
 
 ```sh
