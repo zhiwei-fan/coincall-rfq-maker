@@ -675,7 +675,7 @@ async def test_evict_for_rfq_clears_request_and_all_quote_id_indexes() -> None:
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
-    lifecycle._by_quote_id["stale-alias"] = quote
+    lifecycle._store._by_quote_id["stale-alias"] = quote
 
     lifecycle.evict_for_rfq("rfq-1")
     lifecycle.evict_for_rfq("rfq-1")

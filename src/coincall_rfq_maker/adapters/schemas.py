@@ -5,12 +5,12 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 """
 
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from coincall_rfq_maker.domain.quote import QuoteStage
+from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 
 
@@ -205,6 +205,62 @@ _QUOTE_STATE_TO_STAGE = {
 
 def quote_stage_from_wire(state: str) -> QuoteStage | None:
     return _QUOTE_STATE_TO_STAGE.get(state)
+
+
+def coalesce[T](new: T | None, old: T | None) -> T | None:
+    return new if new is not None else old
+
+
+def find_remote_quote(
+    remote_quotes: QuoteListSnapshot,
+    request_id: str | None = None,
+    quote_id: str | None = None,
+) -> QuotePayload | None:
+    for item in remote_quotes.payloads:
+        if request_id is not None and item.request_id != request_id:
+            continue
+        if quote_id is not None and item.quote_id != quote_id:
+            continue
+        return item
+    return None
+
+
+def find_salvaged_quote_id(remote_quotes: QuoteListSnapshot, request_id: str) -> str | None:
+    for salvaged_request_id, quote_id in remote_quotes.malformed_id_pairs:
+        if salvaged_request_id == request_id:
+            return quote_id
+    return None
+
+
+def quote_from_payload(current: Quote, payload: QuotePayload) -> Quote:
+    stage = quote_stage_from_wire(payload.state)
+    if stage is None:
+        from coincall_rfq_maker.adapters.rest import CoincallRequestError
+
+        raise CoincallRequestError(
+            f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"
+        )
+    base = current if current.stage is stage else with_remote_stage(current, stage)
+    return replace(
+        base,
+        request_id=payload.request_id or current.request_id,
+        quote_id=payload.quote_id,
+        update_time_ms=coalesce(payload.update_time, current.update_time_ms),
+        expiry_time_ms=coalesce(payload.expiry_time, current.expiry_time_ms),
+        filled_price=coalesce(payload.filled_price, current.filled_price),
+        filled_quantity=coalesce(payload.filled_quantity, current.filled_quantity),
+        fill_time_ms=coalesce(payload.fill_time, current.fill_time_ms),
+        block_trade_id=payload.block_trade_id or current.block_trade_id,
+    )
+
+
+def with_remote_stage(current: Quote, stage: QuoteStage) -> Quote:
+    try:
+        return current.with_stage(stage)
+    except IllegalQuoteTransition:
+        if current.stage is QuoteStage.PENDING_CREATE and stage is QuoteStage.FILLED:
+            return current.with_stage(QuoteStage.OPEN).with_stage(QuoteStage.FILLED)
+        raise
 
 
 class BlockTradePayload(BaseModel):
