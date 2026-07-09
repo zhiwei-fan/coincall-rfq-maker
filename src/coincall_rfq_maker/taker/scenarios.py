@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from coincall_rfq_maker.adapters.rest import CoincallRestClient
 from coincall_rfq_maker.domain.quote import QuoteStage
@@ -55,6 +55,11 @@ class TakerOperations(Protocol):
 @runtime_checkable
 class PriceController(Protocol):
     def set_underlying_price(self, underlying: str, price: float) -> None: ...
+
+
+@runtime_checkable
+class QuoteStateReader(Protocol):
+    async def get_quote_list(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 @dataclass(slots=True)
@@ -179,42 +184,52 @@ async def _taker_executes(taker: TakerOperations, context: AssertionContext) -> 
         f"RFQ {request_id} has no executable quote",
     )
     quote_id = _require(quote.quote_id, f"quote for RFQ {request_id} has no quote_id")
+    expected_fill_price = quote.legs[0].price
 
     block_trade_id = await taker.execute_quote(quote_id)
     await _drain_events(context)
 
-    filled = _require(
-        context.quote_lifecycle.get_for_rfq(request_id),
-        f"RFQ {request_id} has no filled quote",
-    )
-    _check(filled.stage is QuoteStage.FILLED, f"quote {quote_id} is {filled.stage}")
+    quote_history = await context.persistence.fetch_quote_history(request_id)
+    last_quote = _last(quote_history, f"RFQ {request_id} has no quote audit history")
     _check(
-        filled.filled_price == quote.legs[0].price,
-        f"quote {quote_id} filled at {filled.filled_price}, expected {quote.legs[0].price}",
+        last_quote["quote_id"] == quote_id,
+        f"last quote history quote is {last_quote['quote_id']}, expected {quote_id}",
     )
-    _check(filled.filled_quantity == 1.0, f"quote {quote_id} filled {filled.filled_quantity}")
     _check(
-        filled.block_trade_id == block_trade_id,
-        f"quote {quote_id} block trade {filled.block_trade_id}, expected {block_trade_id}",
+        last_quote["stage"] == QuoteStage.FILLED.value,
+        f"last quote history stage is {last_quote['stage']}",
     )
 
-    quote_history = await context.persistence.fetch_quote_history(request_id)
     fill_history = await context.persistence.fetch_fills()
+    last_fill = _last(fill_history, "no fill audit history")
     _check(
-        quote_history[-1]["stage"] == QuoteStage.FILLED.value,
-        f"last quote history stage is {quote_history[-1]['stage']}",
+        last_fill["block_trade_id"] == block_trade_id,
+        f"last fill block trade is {last_fill['block_trade_id']}",
     )
     _check(
-        fill_history[-1]["block_trade_id"] == block_trade_id,
-        f"last fill block trade is {fill_history[-1]['block_trade_id']}",
+        last_fill["quote_id"] == quote_id,
+        f"last fill quote is {last_fill['quote_id']}",
     )
     _check(
-        fill_history[-1]["quote_id"] == quote_id,
-        f"last fill quote is {fill_history[-1]['quote_id']}",
+        last_fill["request_id"] == request_id,
+        f"last fill RFQ is {last_fill['request_id']}",
+    )
+
+    exchange_quote = await _require_exchange_quote(taker, quote_id)
+    _check(exchange_quote["state"] == "FILLED", f"exchange quote {quote_id} is {exchange_quote}")
+    _check(
+        exchange_quote["filledPrice"] == expected_fill_price,
+        f"exchange quote {quote_id} filled at {exchange_quote['filledPrice']}, "
+        f"expected {expected_fill_price}",
     )
     _check(
-        fill_history[-1]["request_id"] == request_id,
-        f"last fill RFQ is {fill_history[-1]['request_id']}",
+        exchange_quote["filledQuantity"] == 1.0,
+        f"exchange quote {quote_id} filled {exchange_quote['filledQuantity']}",
+    )
+    _check(
+        exchange_quote["blockTradeId"] == block_trade_id,
+        f"exchange quote {quote_id} block trade {exchange_quote['blockTradeId']}, "
+        f"expected {block_trade_id}",
     )
 
 
@@ -233,11 +248,23 @@ async def _rfq_cancelled(taker: TakerOperations, context: AssertionContext) -> N
         context.orchestrator.rfq_store.get(request_id) is None,
         f"cancelled RFQ {request_id} was not evicted",
     )
-    cancelled = _require(
-        context.quote_lifecycle.get_by_quote_id(quote_id),
-        f"cancelled quote {quote_id} missing from lifecycle",
+
+    quote_history = await context.persistence.fetch_quote_history(request_id)
+    last_quote = _last(quote_history, f"RFQ {request_id} has no quote audit history")
+    _check(
+        last_quote["quote_id"] == quote_id,
+        f"last quote history quote is {last_quote['quote_id']}, expected {quote_id}",
     )
-    _check(cancelled.stage is QuoteStage.CANCELLED, f"quote {quote_id} is {cancelled.stage}")
+    _check(
+        last_quote["stage"] == QuoteStage.CANCELLED.value,
+        f"last quote history stage is {last_quote['stage']}",
+    )
+
+    exchange_quote = await _require_exchange_quote(taker, quote_id)
+    _check(
+        exchange_quote["state"] == "CANCELLED",
+        f"exchange quote {quote_id} is {exchange_quote}",
+    )
 
 
 async def _create_and_quote(taker: TakerOperations, context: AssertionContext) -> str:
@@ -290,3 +317,21 @@ def _require[T](value: T | None, message: str) -> T:
     if value is None:
         raise ScenarioFailure(message)
     return value
+
+
+def _last[T](values: Sequence[T], message: str) -> T:
+    if not values:
+        raise ScenarioFailure(message)
+    return values[-1]
+
+
+async def _require_exchange_quote(taker: TakerOperations, quote_id: str) -> dict[str, Any]:
+    if not isinstance(taker, QuoteStateReader):
+        raise ScenarioFailure("terminal quote assertions require quote-state reader support")
+    response = await taker.get_quote_list(quote_id=quote_id)
+    data = response.get("data")
+    if not isinstance(data, list):
+        raise ScenarioFailure(f"quote lookup for {quote_id} returned malformed data")
+    matches = [item for item in data if isinstance(item, dict) and item.get("quoteId") == quote_id]
+    _check(len(matches) == 1, f"quote lookup for {quote_id} returned {len(matches)} matches")
+    return matches[0]

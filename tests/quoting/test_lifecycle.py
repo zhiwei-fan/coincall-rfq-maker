@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 import pytest
@@ -262,7 +263,7 @@ async def test_reconcile_pending_cancel_rechecks_exchange_before_create_when_sti
 
 
 @pytest.mark.asyncio
-async def test_reconcile_pending_cancel_mirrors_filled_then_creates_fresh_quote() -> None:
+async def test_reconcile_pending_cancel_mirrors_filled_without_creating_fresh_quote() -> None:
     rest = FakeRestClient()
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent(price=100.0))
@@ -287,15 +288,56 @@ async def test_reconcile_pending_cancel_mirrors_filled_then_creates_fresh_quote(
         ],
     }
 
-    fresh = await lifecycle.reconcile(make_intent(price=105.0))
+    current = await lifecycle.reconcile(make_intent(price=105.0))
 
-    old_quote = lifecycle.get_by_quote_id(quote.quote_id)
-    assert old_quote is not None
-    assert old_quote.stage is QuoteStage.FILLED
-    assert old_quote.filled_price == 101.0
-    assert fresh.stage is QuoteStage.OPEN
-    assert fresh.quote_id == "q-2"
+    assert current.stage is QuoteStage.FILLED
+    assert current.quote_id == quote.quote_id
+    assert current.filled_price == 101.0
+    assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_filled_existing_quote_does_not_create_replacement() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent(price=100.0))
+    assert quote.quote_id is not None
+    updated = lifecycle.apply_ws_update(
+        QuoteUpdated(
+            quote_id=quote.quote_id,
+            request_id="rfq-1",
+            stage=QuoteStage.FILLED,
+            filled_price=101.0,
+        )
+    )
+    assert updated is not None
+
+    current = await lifecycle.reconcile(make_intent(price=105.0))
+
+    assert current.stage is QuoteStage.FILLED
+    assert current.quote_id == quote.quote_id
+    assert current.filled_price == 101.0
+    assert len(rest.create_calls) == 1
+    assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_expired_existing_quote_still_creates_replacement() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent(price=100.0))
+    assert quote.quote_id is not None
+    updated = lifecycle.apply_ws_update(
+        QuoteUpdated(quote_id=quote.quote_id, request_id="rfq-1", stage=QuoteStage.EXPIRED)
+    )
+    assert updated is not None
+
+    current = await lifecycle.reconcile(make_intent(price=105.0))
+
+    assert current.stage is QuoteStage.OPEN
+    assert current.quote_id == "q-2"
     assert len(rest.create_calls) == 2
+    assert rest.cancel_calls == []
 
 
 @pytest.mark.asyncio
@@ -319,6 +361,167 @@ async def test_reconcile_pending_create_reverifies_and_adopts_without_second_cre
     assert quote.stage is QuoteStage.OPEN
     assert quote.quote_id == "exchange-q-1"
     assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_withdraw_pending_create_verifies_open_quote_then_cancels() -> None:
+    rest = FakeRestClient()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+
+    rest.create_error = None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": "exchange-q-1", "state": "OPEN"}],
+    }
+
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert withdrawn is not None
+    assert withdrawn.stage is QuoteStage.CANCELLED
+    assert current is not None
+    assert current.stage is QuoteStage.CANCELLED
+    assert current.quote_id == "exchange-q-1"
+    assert rest.cancel_calls == ["exchange-q-1"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_pending_cancel_cancels_again_when_remote_still_open() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    rest.cancel_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    with pytest.raises(CoincallAmbiguousError):
+        await lifecycle.cancel_for_rfq("rfq-1")
+
+    rest.cancel_error = None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": quote.quote_id, "state": "OPEN"}],
+    }
+
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert withdrawn is not None
+    assert withdrawn.stage is QuoteStage.CANCELLED
+    assert current is not None
+    assert current.stage is QuoteStage.CANCELLED
+    assert rest.cancel_calls == [quote.quote_id, quote.quote_id]
+
+
+@pytest.mark.asyncio
+async def test_settle_filled_pending_create_resolves_remote_quote_by_request_id() -> None:
+    rest = FakeRestClient()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": "exchange-q-1",
+                "state": "FILLED",
+                "filledPrice": 101.0,
+            }
+        ],
+    }
+
+    settled = await lifecycle.settle_filled_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert settled is not None
+    assert settled.stage is QuoteStage.FILLED
+    assert settled.quote_id == "exchange-q-1"
+    assert settled.filled_price == 101.0
+    assert current is settled
+    assert rest.quote_list_calls[-1] == {"request_id": "rfq-1"}
+
+
+@pytest.mark.asyncio
+async def test_settle_filled_remote_open_quote_is_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": quote.quote_id, "state": "OPEN"}],
+    }
+
+    with caplog.at_level(logging.WARNING):
+        settled = await lifecycle.settle_filled_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert settled is not None
+    assert settled.stage is QuoteStage.CANCELLED
+    assert current is not None
+    assert current.stage is QuoteStage.CANCELLED
+    assert rest.quote_list_calls == [{"quote_id": quote.quote_id}]
+    assert rest.cancel_calls == [quote.quote_id]
+    assert "terminated FILLED but quote" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_settle_filled_dry_run_withdraws_locally_without_rest_calls() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=True)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.stage is QuoteStage.PENDING_CREATE
+
+    settled = await lifecycle.settle_filled_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert settled is not None
+    assert settled.stage is QuoteStage.CANCELLED
+    assert current is not None
+    assert current.stage is QuoteStage.CANCELLED
+    assert rest.create_calls == []
+    assert rest.quote_list_calls == []
+    assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adopt_open_exchange_quote_refuses_different_quote_id_displacement() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+
+    adopted = lifecycle.adopt_open_exchange_quote("rfq-1", "exchange-q-other")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert adopted is None
+    assert current is not None
+    assert current.quote_id == quote.quote_id
+    assert lifecycle.get_by_quote_id("exchange-q-other") is None
+
+
+@pytest.mark.asyncio
+async def test_evict_for_rfq_clears_request_and_all_quote_id_indexes() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    lifecycle._by_quote_id["stale-alias"] = quote
+
+    lifecycle.evict_for_rfq("rfq-1")
+    lifecycle.evict_for_rfq("rfq-1")
+
+    assert lifecycle.get_for_rfq("rfq-1") is None
+    assert lifecycle.get_by_quote_id(quote.quote_id) is None
+    assert lifecycle.get_by_quote_id("stale-alias") is None
 
 
 @pytest.mark.asyncio

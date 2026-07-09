@@ -62,9 +62,21 @@ class QuoteLifecycle:
         self._ambiguous_transport_failures = 0
         return count
 
+    def evict_for_rfq(self, request_id: str) -> None:
+        self._by_request.pop(request_id, None)
+        stale_quote_ids = [
+            quote_id
+            for quote_id, quote in self._by_quote_id.items()
+            if quote.request_id == request_id
+        ]
+        for quote_id in stale_quote_ids:
+            del self._by_quote_id[quote_id]
+
     async def reconcile(self, intent: QuoteIntent) -> Quote:
         """Idempotently ensure our live quote for `intent.request_id` matches `intent`."""
         existing = self._by_request.get(intent.request_id)
+        if existing is not None and existing.stage is QuoteStage.FILLED:
+            return existing
         if existing is not None and existing.stage is QuoteStage.PENDING_CANCEL:
             resolved = await self._resolve_ambiguous_cancel(
                 existing,
@@ -72,6 +84,8 @@ class QuoteLifecycle:
                     f"Pending cancel for RFQ {intent.request_id} remains ambiguous"
                 ),
             )
+            if resolved.stage is QuoteStage.FILLED:
+                return resolved
             if not resolved.is_terminal:
                 return resolved
             return await self._create(intent)
@@ -97,6 +111,74 @@ class QuoteLifecycle:
         if existing is not None and existing.is_open:
             await self._cancel(existing)
 
+    async def withdraw_for_rfq(self, request_id: str) -> Quote | None:
+        """Fail-closed withdrawal for every non-terminal local quote stage."""
+        existing = self._by_request.get(request_id)
+        if existing is None or existing.is_terminal:
+            return existing
+        if existing.stage is QuoteStage.OPEN:
+            return await self._cancel(existing)
+        if existing.stage is QuoteStage.PENDING_CREATE:
+            opened = None if self._dry_run else await self._verify_pending_create(existing)
+            if opened is not None:
+                return await self._cancel(opened)
+            cancelled = existing.with_stage(QuoteStage.CANCELLED)
+            self._store(cancelled)
+            return cancelled
+        if existing.stage is QuoteStage.PENDING_CANCEL:
+            if existing.quote_id is None:
+                cancelled = existing.with_stage(QuoteStage.CANCELLED)
+                self._store(cancelled)
+                return cancelled
+            try:
+                resolved = await self._resolve_ambiguous_cancel(
+                    existing,
+                    CoincallAmbiguousError(
+                        f"Pending cancel for RFQ {request_id} remains ambiguous"
+                    ),
+                )
+            except CoincallAmbiguousError:
+                current = self._by_request.get(request_id)
+                if current is not None and current.is_open:
+                    return await self._cancel(current)
+                raise
+            if resolved.is_open:
+                return await self._cancel(resolved)
+            return resolved
+        return existing
+
+    async def settle_filled_rfq(self, request_id: str) -> Quote | None:
+        """Mirror exchange quote state for an RFQ reported FILLED by the exchange."""
+        existing = self._by_request.get(request_id)
+        if existing is None:
+            return None
+        if existing.is_terminal:
+            return existing
+        if self._dry_run:
+            logger.info(
+                "[DRY RUN] would settle filled RFQ %s by withdrawing local quote",
+                request_id,
+            )
+            cancelled = existing.with_stage(QuoteStage.CANCELLED)
+            self._store(cancelled)
+            return cancelled
+
+        resolved: Quote | None
+        if existing.quote_id is not None:
+            resolved = await self.resolve_remote_quote(existing)
+        elif existing.stage is QuoteStage.PENDING_CREATE:
+            resolved = await self._resolve_remote_quote_by_request(existing)
+        else:
+            resolved = None
+        if resolved is not None and resolved.stage is QuoteStage.OPEN:
+            logger.warning(
+                "RFQ %s terminated FILLED but quote %s remains OPEN on exchange; cancelling it",
+                request_id,
+                resolved.quote_id,
+            )
+            return await self._cancel(resolved)
+        return resolved
+
     async def cancel_all(self) -> None:
         if self._dry_run:
             logger.info("[DRY RUN] would cancel all quotes")
@@ -115,6 +197,14 @@ class QuoteLifecycle:
         existing = self._by_request.get(request_id)
         if existing is None or existing.stage not in {QuoteStage.PENDING_CREATE, QuoteStage.OPEN}:
             return None
+        if existing.quote_id is not None and existing.quote_id != quote_id:
+            logger.warning(
+                "Refusing to adopt exchange quote %s for RFQ %s; local quote %s remains open",
+                quote_id,
+                request_id,
+                existing.quote_id,
+            )
+            return None
         return self._adopt_open_quote(existing, quote_id)
 
     async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
@@ -125,14 +215,7 @@ class QuoteLifecycle:
         remote = _find_remote_quote(response, quote_id=quote.quote_id)
         if remote is None:
             return None
-        resolved = _quote_from_remote(quote, remote)
-        self._store(resolved)
-        logger.info(
-            "Reconciled quote %s to exchange state %s",
-            quote.quote_id,
-            resolved.stage,
-        )
-        return resolved
+        return self._mirror_remote_quote(quote, remote)
 
     def apply_ws_update(self, event: QuoteUpdated) -> Quote | None:
         """Mirror an exchange-reported quote state change into the local store."""
@@ -254,6 +337,13 @@ class QuoteLifecycle:
             return None
         return self._adopt_open_quote(pending, quote_id)
 
+    async def _resolve_remote_quote_by_request(self, quote: Quote) -> Quote | None:
+        response = await self._rest.get_quote_list(request_id=quote.request_id)
+        remote = _find_remote_quote(response, request_id=quote.request_id)
+        if remote is None:
+            return None
+        return self._mirror_remote_quote(quote, remote)
+
     async def _resolve_ambiguous_cancel(
         self, pending_cancel: Quote, exc: CoincallAmbiguousError
     ) -> Quote:
@@ -279,6 +369,16 @@ class QuoteLifecycle:
         self._by_request[quote.request_id] = quote
         if quote.quote_id:
             self._by_quote_id[quote.quote_id] = quote
+
+    def _mirror_remote_quote(self, quote: Quote, remote: dict[str, Any]) -> Quote:
+        resolved = _quote_from_remote(quote, remote)
+        self._store(resolved)
+        logger.info(
+            "Reconciled quote %s to exchange state %s",
+            resolved.quote_id,
+            resolved.stage,
+        )
+        return resolved
 
     def _adopt_open_quote(self, quote: Quote, quote_id: str) -> Quote:
         opened = quote if quote.stage is QuoteStage.OPEN else quote.with_stage(QuoteStage.OPEN)
@@ -336,7 +436,7 @@ def _quote_from_remote(current: Quote, remote: dict[str, Any]) -> Quote:
         raise CoincallRequestError(
             f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"
         )
-    base = current if current.stage is stage else current.with_stage(stage)
+    base = current if current.stage is stage else _with_remote_stage(current, stage)
     return replace(
         base,
         request_id=payload.request_id or current.request_id,
@@ -348,3 +448,12 @@ def _quote_from_remote(current: Quote, remote: dict[str, Any]) -> Quote:
         fill_time_ms=_coalesce(payload.fill_time, current.fill_time_ms),
         block_trade_id=payload.block_trade_id or current.block_trade_id,
     )
+
+
+def _with_remote_stage(current: Quote, stage: QuoteStage) -> Quote:
+    try:
+        return current.with_stage(stage)
+    except IllegalQuoteTransition:
+        if current.stage is QuoteStage.PENDING_CREATE and stage is QuoteStage.FILLED:
+            return current.with_stage(QuoteStage.OPEN).with_stage(QuoteStage.FILLED)
+        raise

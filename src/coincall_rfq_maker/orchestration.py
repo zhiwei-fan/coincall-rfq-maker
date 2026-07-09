@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.adapters.schemas import RfqPayload, rfq_from_payload
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
+from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
 from coincall_rfq_maker.events import (
     PricesRefreshed,
@@ -187,20 +188,32 @@ class Orchestrator:
         if updated is None:
             logger.debug("RFQ termination for unknown or evicted RFQ %s ignored", event.request_id)
             return
-        settled = await self._settle_terminal_quote(event.request_id)
+        settled = await self._settle_terminal_quote(event.request_id, event.status)
         if self._persistence is not None:
             await self._persistence.record_rfq(updated, now_ms)
         if not settled:
             return
         self._cleanup_and_evict_terminal_rfq(event.request_id)
 
-    async def _settle_terminal_quote(self, request_id: str) -> bool:
+    async def _settle_terminal_quote(self, request_id: str, status: RfqStatus) -> bool:
         try:
-            await self._quotes.cancel_for_rfq(request_id)
+            if status is RfqStatus.FILLED:
+                quote = await self._quotes.settle_filled_rfq(request_id)
+                if quote is not None and quote.is_terminal and self._persistence is not None:
+                    await self._persistence.record_quote(quote, None, _now_ms())
+            else:
+                await self._quotes.withdraw_for_rfq(request_id)
         except CoincallError:
             logger.exception("REST error cancelling quote for RFQ %s", request_id)
             if self._record_ambiguous_quote_failures() == 0:
                 self._risk_gate.record_api_failure()
+            return False
+        except ValidationError as exc:
+            logger.warning(
+                "Malformed remote quote payload while settling RFQ %s: %s",
+                request_id,
+                exc,
+            )
             return False
         else:
             self._record_ambiguous_quote_failures()
@@ -214,6 +227,7 @@ class Orchestrator:
                 continue
             if not self.rfq_store.active_for_underlying(underlying):
                 self._market_data.untrack(underlying)
+        self._quotes.evict_for_rfq(request_id)
         self.rfq_store.evict(request_id)
 
     async def _handle_quote_updated(self, event: QuoteUpdated) -> None:
@@ -279,6 +293,7 @@ class Orchestrator:
         decision = self._risk_gate.evaluate(rfq, intent, ages, now_ms)
         if not decision.approved:
             logger.warning("Not quoting RFQ %s: %s", request_id, decision.reason)
+            await self._withdraw_rejected_quote(request_id, decision.reason)
             return
 
         try:
@@ -305,6 +320,29 @@ class Orchestrator:
                 if underlying_price is not None:
                     snapshot[maybe_instrument.underlying] = underlying_price
             await self._persistence.record_quote(quote, snapshot, now_ms)
+
+    async def _withdraw_rejected_quote(self, request_id: str, reason: str | None) -> None:
+        before = self._quotes.get_for_rfq(request_id)
+        try:
+            withdrawn = await self._quotes.withdraw_for_rfq(request_id)
+        except CoincallError:
+            logger.exception("REST error cancelling rejected quote for RFQ %s", request_id)
+            if self._record_ambiguous_quote_failures() == 0:
+                self._risk_gate.record_api_failure()
+        else:
+            if (
+                before is not None
+                and not before.is_terminal
+                and withdrawn is not None
+                and withdrawn.stage is QuoteStage.CANCELLED
+                and withdrawn.stage is not before.stage
+            ):
+                logger.warning(
+                    "Withdrew quote for RFQ %s after risk rejection: %s",
+                    request_id,
+                    reason or "unknown reason",
+                )
+            self._record_ambiguous_quote_failures()
 
     async def reconcile_with_exchange(self) -> None:
         """Periodic reconciler: true local RFQ/quote state against exchange open lists."""
