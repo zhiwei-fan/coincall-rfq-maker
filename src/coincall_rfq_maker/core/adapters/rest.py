@@ -3,12 +3,13 @@
 Endpoints, params, and payload shapes are ported EXACTLY from the old
 `api_client.py` (`RfqAPI` / `FuturesAPI`). Adds `asyncio.timeout` around every
 call and a small retry for transient network errors (never for application
-errors reported via the `code` field).
+errors reported via persistent `code` values).
 """
 
 import asyncio
 import json
 import logging
+from enum import Enum, auto
 from types import TracebackType
 from typing import Any, Literal, Self
 from urllib.parse import urlencode
@@ -61,12 +62,38 @@ class CoincallRequestError(CoincallError):
     """Raised for client-side misuse (e.g. session not started)."""
 
 
+class CoincallConnectivityError(CoincallRequestError):
+    """Raised when idempotent transport retries are exhausted."""
+
+
 class CoincallMalformedResponseError(CoincallRequestError):
     """Raised when an HTTP-200 response body is not the expected JSON object."""
 
 
 class CoincallAmbiguousError(CoincallRequestError):
     """Raised when a state-changing request may have reached the exchange."""
+
+
+class ApiFailureKind(Enum):
+    """Failure classes used by retry and kill-switch accounting."""
+
+    TRANSIENT = auto()
+    PERSISTENT = auto()
+    AMBIGUOUS = auto()
+
+
+def classify_api_failure(exc: CoincallError) -> ApiFailureKind:
+    """Classify Coincall REST failures for retry/accounting boundaries."""
+    if isinstance(exc, CoincallAmbiguousError):
+        return ApiFailureKind.AMBIGUOUS
+    if isinstance(exc, (CoincallConnectivityError, CoincallMalformedResponseError)):
+        return ApiFailureKind.TRANSIENT
+    if isinstance(exc, CoincallApiError):
+        if exc.code == 10000:
+            return ApiFailureKind.TRANSIENT
+        if exc.status == 429 or 500 <= exc.status <= 599:
+            return ApiFailureKind.TRANSIENT
+    return ApiFailureKind.PERSISTENT
 
 
 class CoincallRestClient:
@@ -142,7 +169,22 @@ class CoincallRestClient:
                             return await self._parse_response(resp)
                     else:
                         raise CoincallRequestError(f"Unsupported method {method!r}")
-            except CoincallApiError:
+            except CoincallApiError as exc:
+                if (
+                    classify_api_failure(exc) is ApiFailureKind.TRANSIENT
+                    and idempotent
+                    and attempt < max_attempts
+                ):
+                    logger.warning(
+                        "Request %s %s failed (attempt %d/%d): %s",
+                        method,
+                        path,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
                 raise
             except (TimeoutError, aiohttp.ClientError, CoincallMalformedResponseError) as exc:
                 last_error = exc
@@ -162,7 +204,7 @@ class CoincallRestClient:
                     await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
 
         assert last_error is not None
-        raise CoincallRequestError(
+        raise CoincallConnectivityError(
             f"{method} {path} failed after {max_attempts} attempts: {last_error}"
         ) from last_error
 

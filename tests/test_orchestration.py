@@ -5,11 +5,13 @@ import pytest
 
 from coincall_rfq_maker import reconciler
 from coincall_rfq_maker.core.adapters.rest import (
+    ApiFailureKind,
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
     _parse_quote_list,
     _parse_rfq_list,
+    classify_api_failure,
 )
 from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
@@ -34,8 +36,10 @@ class FakeRest:
         self._open_request_ids = open_request_ids
         self.rfq_list_items: list[dict[str, Any]] | None = None
         self.get_rfq_error: Exception | None = None
+        self.get_quote_error: Exception | None = None
         self.create_calls: list[tuple[str, list[dict[str, str]]]] = []
         self.cancel_calls: list[str] = []
+        self.cancel_all_calls = 0
         self.create_error: Exception | None = None
         self.cancel_error: Exception | None = None
         self.quote_list_response: dict[str, Any] = {"code": 0, "data": []}
@@ -61,7 +65,7 @@ class FakeRest:
             raise self.create_error
         quote_id = f"q-{self._next_quote_id}"
         self._next_quote_id += 1
-        return CreateQuoteResult(quote_id=quote_id)
+        return CreateQuoteResult.model_validate({"quoteId": quote_id})
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
         self.cancel_calls.append(quote_id)
@@ -69,8 +73,14 @@ class FakeRest:
             raise self.cancel_error
         return {"code": 0, "data": {}}
 
+    async def cancel_all_quotes(self) -> dict[str, Any]:
+        self.cancel_all_calls += 1
+        return {"code": 0, "data": {}}
+
     async def get_quote_list(self, **kwargs: Any) -> QuoteListSnapshot:
         self.quote_list_calls.append(kwargs)
+        if self.get_quote_error is not None:
+            raise self.get_quote_error
         if self.quote_list_responses is not None:
             return _quote_payloads(self.quote_list_responses.pop(0))
         return _quote_payloads(self.quote_list_response)
@@ -124,7 +134,11 @@ class FakeQuoteLifecycle:
     async def reconcile(self, intent: object) -> object:
         self.reconcile_calls += 1
         if self.reconcile_error is not None:
-            if self._api_reporter is not None:
+            if (
+                self._api_reporter is not None
+                and isinstance(self.reconcile_error, (CoincallRequestError, CoincallApiError))
+                and classify_api_failure(self.reconcile_error) is ApiFailureKind.PERSISTENT
+            ):
                 self._api_reporter.record_api_failure()
             raise self.reconcile_error
         return object()
@@ -232,7 +246,7 @@ async def test_reconciler_marks_locally_active_rfq_terminal_when_exchange_disagr
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=None,  # type: ignore[arg-type]
-        risk_gate=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
@@ -327,7 +341,7 @@ async def test_reconciler_converges_when_exchange_matches_local_state() -> None:
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=None,  # type: ignore[arg-type]
-        risk_gate=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
@@ -348,7 +362,7 @@ async def test_reconciler_backfills_unknown_open_rfq_and_dedupes_next_pass() -> 
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -365,7 +379,7 @@ async def test_reconciler_backfills_unknown_open_rfq_and_dedupes_next_pass() -> 
     assert len(rest.create_calls) == 1
     assert quote is not None
     assert quote.stage is QuoteStage.OPEN
-    assert risk_gate.calls == ["success", "success", "success"]
+    assert risk_gate.calls == ["success"] * 7
 
 
 @pytest.mark.asyncio
@@ -451,7 +465,7 @@ async def test_reconciler_resolves_local_open_quote_absent_from_exchange_open_li
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -496,7 +510,7 @@ async def test_reconciler_treats_salvaged_malformed_quote_ids_as_remote_open() -
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -584,7 +598,9 @@ async def test_reconciler_skips_malformed_resolved_quote_and_continues() -> None
 
 
 @pytest.mark.asyncio
-async def test_cancel_failure_reverts_quote_open_skips_replacement_and_records_failure() -> None:
+async def test_persistent_cancel_failure_reverts_open_skips_replacement_and_records_failure() -> (
+    None
+):
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     pricing_model = FakePricingModel(ask=100.0)
@@ -599,7 +615,7 @@ async def test_cancel_failure_reverts_quote_open_skips_replacement_and_records_f
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=pricing_model,  # type: ignore[arg-type]
+        pricing_model=pricing_model,
         risk_gate=risk_gate,
         quote_lifecycle=quotes,
     )
@@ -609,7 +625,7 @@ async def test_cancel_failure_reverts_quote_open_skips_replacement_and_records_f
     assert first is not None
 
     pricing_model.ask = 105.0
-    rest.cancel_error = CoincallApiError(500, None, "cancel failed")
+    rest.cancel_error = CoincallApiError(200, 10004, "Parameter illegal")
     await orchestrator.reprice_all_active()
 
     current = quotes.get_for_rfq("rfq-1")
@@ -630,7 +646,7 @@ async def test_risk_reject_cancels_existing_open_quote() -> None:
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -661,7 +677,7 @@ async def test_risk_reject_with_pending_create_cancels_quote_that_later_opened()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -700,7 +716,7 @@ async def test_risk_reject_with_pending_cancel_resolves_and_cancels_if_still_ope
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -742,7 +758,7 @@ async def test_risk_reject_does_not_log_withdrawal_for_already_terminal_quote(
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -764,7 +780,7 @@ async def test_risk_reject_does_not_log_withdrawal_for_already_terminal_quote(
 
 
 @pytest.mark.asyncio
-async def test_create_failures_feed_kill_switch_and_then_block_quoting() -> None:
+async def test_persistent_create_failures_feed_kill_switch_and_then_block_quoting() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     risk_gate = RiskGate(
@@ -775,11 +791,11 @@ async def test_create_failures_feed_kill_switch_and_then_block_quoting() -> None
         kill_switch_threshold=2,
     )
     quotes = FakeQuoteLifecycle(api_reporter=risk_gate)
-    quotes.reconcile_error = CoincallApiError(503, None, "unavailable")
+    quotes.reconcile_error = CoincallApiError(200, 10004, "Parameter illegal")
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
@@ -791,6 +807,98 @@ async def test_create_failures_feed_kill_switch_and_then_block_quoting() -> None
 
     assert risk_gate.kill_switch_tripped
     assert quotes.reconcile_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_transient_quote_failure_sets_global_cooldown_and_skips_reprice_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now_ms = 1_000
+
+    monkeypatch.setattr(
+        "coincall_rfq_maker.orchestration.get_timestamp_ms",
+        lambda: now_ms,
+    )
+    rest = FakeRest()
+    market_data = FakeMarketData(price=50_000.0)
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=2,
+    )
+    quotes = FakeQuoteLifecycle(api_reporter=risk_gate)
+    quotes.reconcile_error = CoincallApiError(200, 10000, "Try again later")
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=risk_gate,
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+    for _ in range(12):
+        await orchestrator.reprice_all_active()
+
+    assert not risk_gate.kill_switch_tripped
+    assert quotes.reconcile_calls == 1
+
+    now_ms = 2_100
+    quotes.reconcile_error = None
+    await orchestrator.reprice_all_active()
+
+    assert quotes.reconcile_calls == 2
+    assert orchestrator._outage_gate.cooldown_until_ms == 0
+
+    await orchestrator.reprice_all_active()
+
+    assert quotes.reconcile_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_quote_failure_sets_global_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coincall_rfq_maker.orchestration.get_timestamp_ms", lambda: 1_000)
+    rest = FakeRest()
+    market_data = FakeMarketData(price=50_000.0)
+    quotes = FakeQuoteLifecycle()
+    quotes.reconcile_error = CoincallAmbiguousError("unknown outcome")
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+    await orchestrator.reprice_all_active()
+
+    assert quotes.reconcile_calls == 1
+    assert orchestrator._outage_gate.cooldown_until_ms > 1_000
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_all_bypasses_active_outage_cooldown() -> None:
+    rest = FakeRest()
+    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=50_000.0),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+    )
+    orchestrator._outage_gate.record_transient(1_000)
+
+    await quotes.cancel_all()
+
+    assert rest.cancel_all_calls == 1
 
 
 @pytest.mark.asyncio
@@ -807,7 +915,7 @@ async def test_resolved_ambiguous_create_records_success_only() -> None:
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=risk_gate,  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -848,6 +956,61 @@ async def test_reconciler_records_request_error_without_raising() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconciler_successful_fetches_record_api_success() -> None:
+    rest = FakeRest(open_request_ids=["rfq-1"])
+    risk_gate = RecordingRiskGate()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=risk_gate,  # type: ignore[arg-type]
+        quote_lifecycle=FakeQuoteLifecycle(),  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert risk_gate.calls == ["success", "success"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_transient_rfq_error_does_not_record_failure() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.get_rfq_error = CoincallApiError(200, 10000, "Try again later")
+    risk_gate = RecordingRiskGate()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=risk_gate,  # type: ignore[arg-type]
+        quote_lifecycle=FakeQuoteLifecycle(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert risk_gate.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconciler_persistent_quote_error_records_failure() -> None:
+    rest = FakeRest(open_request_ids=["rfq-1"])
+    rest.get_quote_error = CoincallApiError(200, 10004, "Parameter illegal")
+    risk_gate = RecordingRiskGate()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=risk_gate,  # type: ignore[arg-type]
+        quote_lifecycle=FakeQuoteLifecycle(),  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert risk_gate.calls == ["success", "failure"]
+
+
+@pytest.mark.asyncio
 async def test_reprice_tick_dispatch_reprices_active_rfqs() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
@@ -855,7 +1018,7 @@ async def test_reprice_tick_dispatch_reprices_active_rfqs() -> None:
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,  # type: ignore[arg-type]
     )
@@ -893,7 +1056,7 @@ async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evi
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
@@ -915,6 +1078,7 @@ async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evi
     assert rest.cancel_calls == [quote.quote_id]
 
     rest.cancel_error = None
+    orchestrator._outage_gate.record_transient(1_000)
     await orchestrator.handle_event(ReconcileTick())
 
     assert orchestrator.rfq_store.get("rfq-1") is None
@@ -931,7 +1095,7 @@ async def test_rfq_terminated_filled_resolves_remote_filled_quote_without_cancel
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
         persistence=persistence,  # type: ignore[arg-type]
@@ -976,7 +1140,7 @@ async def test_rfq_terminated_filled_cancels_remote_open_quote_and_evicts() -> N
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
         persistence=persistence,  # type: ignore[arg-type]
@@ -1009,7 +1173,7 @@ async def test_rfq_terminated_filled_with_pending_cancel_records_fill_and_evicts
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
         persistence=persistence,  # type: ignore[arg-type]
@@ -1060,7 +1224,7 @@ async def test_rfq_terminated_filled_malformed_remote_quote_retains_for_retry() 
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
         persistence=persistence,  # type: ignore[arg-type]

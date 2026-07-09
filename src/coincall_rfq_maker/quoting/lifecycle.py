@@ -295,7 +295,6 @@ class QuoteLifecycle:
         try:
             result = await self._rest.create_quote(intent.request_id, payload_legs)
         except CoincallAmbiguousError as exc:
-            self._api_boundary.note_ambiguous_failure()
             logger.warning(
                 "Create quote for RFQ %s is ambiguous; verifying open quotes",
                 intent.request_id,
@@ -320,7 +319,6 @@ class QuoteLifecycle:
             try:
                 await self._rest.cancel_quote(quote.quote_id)
             except CoincallAmbiguousError as exc:
-                self._api_boundary.note_ambiguous_failure()
                 logger.warning(
                     "Cancel quote %s is ambiguous; verifying open quotes",
                     quote.quote_id,

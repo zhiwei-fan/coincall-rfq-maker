@@ -2,15 +2,13 @@
 
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Protocol
 
-from coincall_rfq_maker.core.adapters.rest import CoincallError
-
-
-@dataclass
-class _ApiOperationAccounting:
-    ambiguous_failures: int = 0
+from coincall_rfq_maker.core.adapters.rest import (
+    ApiFailureKind,
+    CoincallError,
+    classify_api_failure,
+)
 
 
 class ApiOutcomeReporter(Protocol):
@@ -30,21 +28,19 @@ class _NullApiOutcomeReporter:
 class ApiOutcomeBoundary:
     def __init__(self, reporter: ApiOutcomeReporter | None = None) -> None:
         self._reporter = reporter if reporter is not None else _NullApiOutcomeReporter()
-        self._api_operation: ContextVar[_ApiOperationAccounting | None] = ContextVar(
+        self._api_operation: ContextVar[bool | None] = ContextVar(
             "quote_lifecycle_api_operation", default=None
         )
 
     async def run[T](self, operation: Callable[[], Awaitable[T]]) -> T:
-        accounting = self._api_operation.get()
-        if accounting is not None:
+        if self._api_operation.get():
             return await operation()
 
-        accounting = _ApiOperationAccounting()
-        token = self._api_operation.set(accounting)
+        token = self._api_operation.set(True)
         try:
             result = await operation()
-        except CoincallError:
-            for _ in range(accounting.ambiguous_failures or 1):
+        except CoincallError as exc:
+            if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
                 self._reporter.record_api_failure()
             raise
         else:
@@ -52,8 +48,3 @@ class ApiOutcomeBoundary:
             return result
         finally:
             self._api_operation.reset(token)
-
-    def note_ambiguous_failure(self) -> None:
-        accounting = self._api_operation.get()
-        if accounting is not None:
-            accounting.ambiguous_failures += 1

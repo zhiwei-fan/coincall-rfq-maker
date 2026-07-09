@@ -3,7 +3,12 @@
 import logging
 from typing import Protocol
 
-from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.core.adapters.rest import (
+    ApiFailureKind,
+    CoincallError,
+    CoincallRestClient,
+    classify_api_failure,
+)
 from coincall_rfq_maker.core.adapters.schemas import rfq_from_payload
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote
@@ -63,10 +68,12 @@ class Reconciler:
         # fetch would wrongly expire RFQs on later pages — page through all results first.
         try:
             remote_rfqs = await self._rest.get_rfq_list(state="OPEN")
-        except CoincallError:
+        except CoincallError as exc:
             logger.exception("Reconciler failed to fetch RFQ list")
-            self._risk_gate.record_api_failure()
+            if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
+                self._risk_gate.record_api_failure()
             return
+        self._risk_gate.record_api_success()
 
         remote_ids = set(remote_rfqs.malformed_request_ids)
         for request_id in remote_rfqs.malformed_request_ids:
@@ -126,10 +133,12 @@ class Reconciler:
         # not paginate (owner-confirmed 2026-07-09). Revisit if the endpoint gains paging.
         try:
             remote_quotes = await self._rest.get_quote_list(state="OPEN")
-        except CoincallError:
+        except CoincallError as exc:
             logger.exception("Reconciler failed to fetch quote list")
-            self._risk_gate.record_api_failure()
+            if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
+                self._risk_gate.record_api_failure()
             return
+        self._risk_gate.record_api_success()
 
         remote_open_quote_ids = {quote_id for _, quote_id in remote_quotes.malformed_id_pairs}
         for request_id, quote_id in remote_quotes.malformed_id_pairs:

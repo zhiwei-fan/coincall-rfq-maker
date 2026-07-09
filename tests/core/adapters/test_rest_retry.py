@@ -8,12 +8,16 @@ import pytest
 from coincall_rfq_maker.core.adapters.rest import (
     _MAX_ATTEMPTS,
     _RETRY_BACKOFF_SECONDS,
+    ApiFailureKind,
     CoincallAmbiguousError,
     CoincallApiError,
+    CoincallConnectivityError,
+    CoincallMalformedResponseError,
     CoincallRequestError,
     CoincallRestClient,
     _parse_quote_list,
     _wire_id,
+    classify_api_failure,
 )
 
 
@@ -87,12 +91,25 @@ class FakeResponse:
 
 
 class ApiErrorGetSession:
-    def __init__(self) -> None:
+    def __init__(self, code: int = 400001, msg: str = "application rejected") -> None:
         self.get_attempts = 0
+        self._code = code
+        self._msg = msg
 
     def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
         self.get_attempts += 1
-        return ResponseContext(200, '{"code":400001,"msg":"application rejected"}')
+        return ResponseContext(200, f'{{"code":{self._code},"msg":"{self._msg}"}}')
+
+
+class SequencedGetSession:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self.get_attempts = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        response = self._responses[self.get_attempts]
+        self.get_attempts += 1
+        return ResponseContext(200, response)
 
 
 class StaticPostSession:
@@ -113,6 +130,36 @@ class StaticGetSession:
     def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
         self.get_attempts += 1
         return ResponseContext(200, self._text)
+
+
+def test_api_failure_classifier_contract() -> None:
+    assert classify_api_failure(CoincallApiError(200, 10000, "Try again later")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallApiError(503, None, "unavailable")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallApiError(429, None, "rate limited")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallMalformedResponseError("bad json")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallConnectivityError("network down")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallAmbiguousError("unknown outcome")) is (
+        ApiFailureKind.AMBIGUOUS
+    )
+    assert classify_api_failure(CoincallApiError(200, 10004, "Parameter illegal")) is (
+        ApiFailureKind.PERSISTENT
+    )
+    assert classify_api_failure(CoincallApiError(200, 499999, "unknown")) is (
+        ApiFailureKind.PERSISTENT
+    )
+    assert classify_api_failure(CoincallRequestError("Session not started")) is (
+        ApiFailureKind.PERSISTENT
+    )
 
 
 @pytest.mark.asyncio
@@ -146,6 +193,46 @@ async def test_idempotent_get_transient_failure_retries_max_attempts_then_raises
 
     assert session.get_attempts == _MAX_ATTEMPTS
     assert sleeps == [_RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, _MAX_ATTEMPTS)]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_get_code_10000_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SequencedGetSession(
+        [
+            '{"code":10000,"msg":"Try again later"}',
+            '{"code":10000,"msg":"Try again later"}',
+            '{"code":0,"data":{"rfqList":[]}}',
+        ]
+    )
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.asyncio.sleep", fake_sleep)
+
+    response = await client._request("GET", "/open/option/blocktrade/rfqList/v1")
+
+    assert response == {"code": 0, "data": {"rfqList": []}}
+    assert session.get_attempts == 3
+    assert sleeps == [_RETRY_BACKOFF_SECONDS, _RETRY_BACKOFF_SECONDS * 2]
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_post_code_10000_is_not_retried() -> None:
+    session = StaticPostSession('{"code":10000,"msg":"Try again later"}')
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
+
+    assert exc_info.value.code == 10000
+    assert session.post_attempts == 1
 
 
 @pytest.mark.asyncio

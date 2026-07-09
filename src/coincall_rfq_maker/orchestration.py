@@ -15,8 +15,14 @@ because it makes interleaving races structurally impossible.
 """
 
 import logging
+from dataclasses import dataclass
 
-from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.core.adapters.rest import (
+    ApiFailureKind,
+    CoincallError,
+    CoincallRestClient,
+    classify_api_failure,
+)
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.quote import QuoteStage
@@ -49,6 +55,27 @@ DispatchEvent = (
     | RepriceTick
     | ReconcileTick
 )
+
+
+@dataclass(slots=True)
+class TransientOutageGate:
+    cooldown_until_ms: int = 0
+    consecutive_failures: int = 0
+    jitter_counter: int = 0
+
+    def in_cooldown(self, now_ms: int) -> bool:
+        return now_ms < self.cooldown_until_ms
+
+    def record_transient(self, now_ms: int) -> None:
+        base_delay_ms = min(60_000, 1_000 * (2**self.consecutive_failures))
+        jitter_ms = (self.jitter_counter % 5) * 50
+        self.cooldown_until_ms = now_ms + base_delay_ms + jitter_ms
+        self.consecutive_failures += 1
+        self.jitter_counter += 1
+
+    def record_success(self) -> None:
+        self.cooldown_until_ms = 0
+        self.consecutive_failures = 0
 
 
 class RfqStore:
@@ -155,6 +182,7 @@ class Orchestrator:
         self._risk_gate = risk_gate
         self._quotes = quote_lifecycle
         self._persistence = persistence
+        self._outage_gate = TransientOutageGate()
         self.rfq_store = RfqStore()
         self._reconciler = Reconciler(
             rest_client=rest_client,
@@ -306,11 +334,29 @@ class Orchestrator:
             await self._withdraw_rejected_quote(request_id, decision.reason)
             return
 
+        if self._outage_gate.in_cooldown(now_ms):
+            logger.info(
+                "Quoting paused during transient Coincall outage cooldown for RFQ %s until %d",
+                request_id,
+                self._outage_gate.cooldown_until_ms,
+            )
+            return
+
         try:
             quote = await self._quotes.reconcile(intent)
-        except CoincallError:
+        except CoincallError as exc:
+            kind = classify_api_failure(exc)
+            if kind in {ApiFailureKind.TRANSIENT, ApiFailureKind.AMBIGUOUS}:
+                self._outage_gate.record_transient(now_ms)
+                logger.warning(
+                    "Quoting paused after %s Coincall failure for RFQ %s until %d",
+                    kind.name.lower(),
+                    request_id,
+                    self._outage_gate.cooldown_until_ms,
+                )
             logger.exception("REST error quoting RFQ %s", request_id)
             return
+        self._outage_gate.record_success()
 
         if rfq.stage is RfqStage.PRICED:
             rfq = rfq.with_stage(RfqStage.QUOTED)
