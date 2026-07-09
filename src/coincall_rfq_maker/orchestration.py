@@ -15,10 +15,9 @@ because it makes interleaving races structurally impossible.
 """
 
 import logging
-import time
 
 from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
-from coincall_rfq_maker.adapters.schemas import rfq_from_payload
+from coincall_rfq_maker.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
@@ -36,11 +35,10 @@ from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import PricingModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import build_quote_intent
+from coincall_rfq_maker.reconciler import Reconciler
 from coincall_rfq_maker.risk.gate import RiskGate
 
 logger = logging.getLogger(__name__)
-
-RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS = 120.0
 
 DispatchEvent = (
     RfqReceived
@@ -68,7 +66,7 @@ class RfqStore:
     def upsert(self, rfq: Rfq, received_at_ms: int | None = None) -> None:
         if rfq.request_id not in self._rfqs:
             self._received_at_ms[rfq.request_id] = (
-                received_at_ms if received_at_ms is not None else _now_ms()
+                received_at_ms if received_at_ms is not None else get_timestamp_ms()
             )
         self._rfqs[rfq.request_id] = rfq
         for name in rfq.instrument_names():
@@ -152,13 +150,21 @@ class Orchestrator:
         quote_lifecycle: QuoteLifecycle,
         persistence: PersistenceStore | None = None,
     ) -> None:
-        self._rest = rest_client
         self._market_data = market_data
         self._pricing_model = pricing_model
         self._risk_gate = risk_gate
         self._quotes = quote_lifecycle
         self._persistence = persistence
         self.rfq_store = RfqStore()
+        self._reconciler = Reconciler(
+            rest_client=rest_client,
+            rfq_store=self.rfq_store,
+            quote_lifecycle=quote_lifecycle,
+            risk_gate=risk_gate,
+            on_rfq_backfill=self._handle_rfq_received,
+            on_terminal_rfq=self._handle_reconciled_terminal_rfq,
+            persistence=persistence,
+        )
 
     async def handle_event(self, event: object) -> None:
         match event:
@@ -177,8 +183,11 @@ class Orchestrator:
             case ReconcileTick():
                 await self.reconcile_with_exchange()
 
+    async def reconcile_with_exchange(self) -> None:
+        await self._reconciler.reconcile_with_exchange()
+
     async def _handle_rfq_received(self, rfq: Rfq) -> None:
-        now_ms = _now_ms()
+        now_ms = get_timestamp_ms()
         self.rfq_store.upsert(rfq, received_at_ms=now_ms)
         for name in rfq.instrument_names():
             try:
@@ -192,7 +201,7 @@ class Orchestrator:
         await self._reprice_and_quote(rfq.request_id)
 
     async def _handle_rfq_terminated(self, event: RfqTerminated) -> None:
-        now_ms = _now_ms()
+        now_ms = get_timestamp_ms()
         updated = self.rfq_store.mark_terminal(event.request_id, event.status, now_ms)
         if updated is None:
             logger.debug("RFQ termination for unknown or evicted RFQ %s ignored", event.request_id)
@@ -209,17 +218,18 @@ class Orchestrator:
             if status is RfqStatus.FILLED:
                 quote = await self._quotes.settle_filled_rfq(request_id)
                 if quote is not None and quote.is_terminal and self._persistence is not None:
-                    await self._persistence.record_quote(quote, None, _now_ms())
+                    await self._persistence.record_quote(quote, None, get_timestamp_ms())
             else:
                 await self._quotes.withdraw_for_rfq(request_id)
         except CoincallError:
             logger.exception("REST error cancelling quote for RFQ %s", request_id)
-            if self._record_ambiguous_quote_failures() == 0:
-                self._risk_gate.record_api_failure()
             return False
-        else:
-            self._record_ambiguous_quote_failures()
         return not self._quotes.has_open_or_pending_quote_for_rfq(request_id)
+
+    async def _handle_reconciled_terminal_rfq(
+        self, request_id: str, status: RfqStatus
+    ) -> None:
+        await self._handle_rfq_terminated(RfqTerminated(request_id, status))
 
     def _cleanup_and_evict_terminal_rfq(self, request_id: str) -> None:
         for instrument_name in self.rfq_store.orphaned_instruments(request_id):
@@ -246,12 +256,12 @@ class Orchestrator:
             return
         updated = self._quotes.apply_ws_update(event)
         if updated is not None and self._persistence is not None:
-            await self._persistence.record_quote(updated, None, _now_ms())
+            await self._persistence.record_quote(updated, None, get_timestamp_ms())
 
     async def _handle_trade(self, event: TradeExecuted) -> None:
         logger.info("Trade executed: block_trade=%s quote=%s", event.block_trade_id, event.quote_id)
         if self._persistence is not None:
-            await self._persistence.record_fill(event, _now_ms())
+            await self._persistence.record_fill(event, get_timestamp_ms())
 
     async def _handle_prices_refreshed(self, event: PricesRefreshed) -> None:
         for underlying in event.underlyings:
@@ -291,7 +301,7 @@ class Orchestrator:
             rfq = rfq.with_stage(RfqStage.PRICED)
             self.rfq_store.upsert(rfq)
 
-        now_ms = _now_ms()
+        now_ms = get_timestamp_ms()
         decision = self._risk_gate.evaluate(rfq, intent, ages, now_ms)
         if not decision.approved:
             logger.warning("Not quoting RFQ %s: %s", request_id, decision.reason)
@@ -300,12 +310,8 @@ class Orchestrator:
 
         try:
             quote = await self._quotes.reconcile(intent)
-            self._record_ambiguous_quote_failures()
-            self._risk_gate.record_api_success()
         except CoincallError:
             logger.exception("REST error quoting RFQ %s", request_id)
-            if self._record_ambiguous_quote_failures() == 0:
-                self._risk_gate.record_api_failure()
             return
 
         if rfq.stage is RfqStage.PRICED:
@@ -329,8 +335,6 @@ class Orchestrator:
             withdrawn = await self._quotes.withdraw_for_rfq(request_id)
         except CoincallError:
             logger.exception("REST error cancelling rejected quote for RFQ %s", request_id)
-            if self._record_ambiguous_quote_failures() == 0:
-                self._risk_gate.record_api_failure()
         else:
             if (
                 before is not None
@@ -344,128 +348,6 @@ class Orchestrator:
                     request_id,
                     reason or "unknown reason",
                 )
-            self._record_ambiguous_quote_failures()
-
-    async def reconcile_with_exchange(self) -> None:
-        """Periodic reconciler: true local RFQ/quote state against exchange open lists."""
-        try:
-            remote_rfqs = await self._rest.get_rfq_list(state="OPEN")
-        except CoincallError:
-            logger.exception("Reconciler failed to fetch RFQ list")
-            self._risk_gate.record_api_failure()
-            return
-
-        remote_ids = set(remote_rfqs.malformed_request_ids)
-        for request_id in remote_rfqs.malformed_request_ids:
-            logger.warning(
-                "Reconciler: RFQ %s present in exchange OPEN snapshot but payload was malformed",
-                request_id,
-            )
-        seen_remote_ids = set()
-        for payload in remote_rfqs.payloads:
-            if payload.request_id in seen_remote_ids:
-                continue
-            seen_remote_ids.add(payload.request_id)
-            remote_ids.add(payload.request_id)
-            if self.rfq_store.get(payload.request_id) is not None:
-                continue
-            rfq = rfq_from_payload(payload)
-            if rfq.status is not RfqStatus.ACTIVE:
-                continue
-            logger.info("Reconciler: backfilling open RFQ %s from exchange", rfq.request_id)
-            await self._handle_rfq_received(rfq)
-
-        now_ms = _now_ms()
-        for rfq in self.rfq_store.active():
-            if rfq.request_id not in remote_ids:
-                received_at_ms = self.rfq_store.received_at_ms(rfq.request_id)
-                age_seconds = (
-                    None if received_at_ms is None else (now_ms - received_at_ms) / 1000
-                )
-                if age_seconds is not None and age_seconds < RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS:
-                    logger.debug(
-                        "Reconciler: RFQ %s absent from exchange OPEN snapshot for %.1fs; "
-                        "within %.1fs grace",
-                        rfq.request_id,
-                        age_seconds,
-                        RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS,
-                    )
-                    continue
-                logger.info(
-                    "Reconciler: RFQ %s no longer open on exchange, marking terminal",
-                    rfq.request_id,
-                )
-                await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, RfqStatus.EXPIRED))
-        for rfq in self.rfq_store.terminal():
-            if self._quotes.has_open_or_pending_quote_for_rfq(rfq.request_id):
-                logger.info(
-                    "Reconciler: retrying terminal cleanup for RFQ %s",
-                    rfq.request_id,
-                )
-                await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, rfq.status))
-
-        await self._reconcile_quote_state()
-
-    async def _reconcile_quote_state(self) -> None:
-        try:
-            remote_quotes = await self._rest.get_quote_list(state="OPEN")
-        except CoincallError:
-            logger.exception("Reconciler failed to fetch quote list")
-            self._risk_gate.record_api_failure()
-            return
-
-        remote_open_quote_ids = {quote_id for _, quote_id in remote_quotes.malformed_id_pairs}
-        for request_id, quote_id in remote_quotes.malformed_id_pairs:
-            logger.warning(
-                "Reconciler: quote %s for RFQ %s present in exchange OPEN snapshot "
-                "but payload was malformed",
-                quote_id,
-                request_id,
-            )
-            self._quotes.adopt_open_exchange_quote(request_id, quote_id)
-
-        for item in remote_quotes.payloads:
-            quote_id = item.quote_id
-            remote_open_quote_ids.add(quote_id)
-            local = self._quotes.get_by_quote_id(quote_id)
-            if local is None or local.is_terminal:
-                item_request_id = item.request_id
-                adopted = (
-                    None
-                    if item_request_id is None
-                    else self._quotes.adopt_open_exchange_quote(item_request_id, quote_id)
-                )
-                if adopted is None:
-                    await self._cancel_orphan_exchange_quote(quote_id)
-
-        for quote in self._quotes.open_quotes():
-            if quote.quote_id is None or quote.quote_id in remote_open_quote_ids:
-                continue
-            try:
-                resolved = await self._quotes.resolve_remote_quote(quote)
-            except CoincallError:
-                logger.exception("Reconciler failed to resolve quote %s", quote.quote_id)
-                self._risk_gate.record_api_failure()
-                continue
-            if resolved is not None and resolved.is_terminal and self._persistence is not None:
-                await self._persistence.record_quote(resolved, None, _now_ms())
-
-    async def _cancel_orphan_exchange_quote(self, quote_id: str) -> None:
-        try:
-            await self._quotes.cancel_exchange_quote(quote_id)
-        except CoincallError:
-            logger.exception("Reconciler failed to cancel orphan exchange quote %s", quote_id)
-            self._risk_gate.record_api_failure()
-
-    def _record_ambiguous_quote_failures(self) -> int:
-        count = self._quotes.consume_ambiguous_transport_failures()
-        for _ in range(count):
-            self._risk_gate.record_api_failure()
-        return count
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 def _safe_parse(name: str) -> Instrument | None:

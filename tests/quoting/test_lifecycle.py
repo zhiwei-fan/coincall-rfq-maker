@@ -14,6 +14,7 @@ from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
+from coincall_rfq_maker.risk.gate import RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 
@@ -52,6 +53,17 @@ class FakeRestClient:
     async def get_quote_list(self, **kwargs: Any) -> QuoteListSnapshot:
         self.quote_list_calls.append(kwargs)
         return _quote_payloads(self.quote_list_response)
+
+
+class RecordingApiReporter:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def record_api_failure(self) -> None:
+        self.calls.append("failure")
+
+    def record_api_success(self) -> None:
+        self.calls.append("success")
 
 
 def _quote_payloads(response: dict[str, Any]) -> QuoteListSnapshot:
@@ -411,6 +423,105 @@ async def test_reconcile_pending_create_reverifies_and_adopts_without_second_cre
     assert quote.stage is QuoteStage.OPEN
     assert quote.quote_id == "exchange-q-1"
     assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_cancel_terminal_verification_resets_api_failure_streak() -> None:
+    rest = FakeRestClient()
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=2,
+    )
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent(price=100.0))
+    assert quote.quote_id is not None
+
+    rest.cancel_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    with pytest.raises(CoincallAmbiguousError):
+        await lifecycle.cancel_for_rfq("rfq-1")
+    assert not risk_gate.kill_switch_tripped
+
+    rest.cancel_error = None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": quote.quote_id, "state": "FILLED"}],
+    }
+    current = await lifecycle.reconcile(make_intent(price=105.0))
+    assert current.stage is QuoteStage.FILLED
+
+    rest.cancel_error = CoincallApiError(500, None, "cancel failed")
+    with pytest.raises(CoincallApiError):
+        await lifecycle.cancel_exchange_quote("q-next")
+    assert not risk_gate.kill_switch_tripped
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_create_adoption_resets_api_failure_streak() -> None:
+    rest = FakeRestClient()
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=2,
+    )
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+    assert not risk_gate.kill_switch_tripped
+
+    rest.create_error = None
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": "exchange-q-1", "state": "OPEN"}],
+    }
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "exchange-q-1"
+
+    rest.cancel_error = CoincallApiError(500, None, "cancel failed")
+    with pytest.raises(CoincallApiError):
+        await lifecycle.cancel_exchange_quote("q-next")
+    assert not risk_gate.kill_switch_tripped
+
+
+@pytest.mark.asyncio
+async def test_settle_filled_unknown_remote_quote_state_records_one_failure() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    quote = await lifecycle.reconcile(make_intent())
+    assert quote.quote_id is not None
+    reporter.calls.clear()
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": quote.quote_id, "state": "ALIEN"}],
+    }
+
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.settle_filled_rfq("rfq-1")
+
+    assert reporter.calls == ["failure"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_create_failure_is_not_double_counted() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+
+    assert reporter.calls == ["failure"]
 
 
 @pytest.mark.asyncio

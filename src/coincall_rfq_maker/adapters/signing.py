@@ -9,14 +9,15 @@ vectors from a live account — any drift breaks authentication silently.
 import hashlib
 import hmac
 import json
-import time
 from typing import Any
 from urllib.parse import quote
+
+from coincall_rfq_maker.clock import get_timestamp_ms as _get_timestamp_ms
 
 
 def get_timestamp_ms() -> int:
     """Current UNIX timestamp in milliseconds."""
-    return int(time.time() * 1000)
+    return _get_timestamp_ms()
 
 
 def build_rest_prehash(

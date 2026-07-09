@@ -94,7 +94,7 @@ async def fake_harness(db_path: str) -> AsyncIterator[FakeHarness]:
             stale_market_data_seconds=30.0,
             exposure_provider=NullExposureProvider(),
         )
-        quote_lifecycle = QuoteLifecycle(rest, dry_run=False)
+        quote_lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)
         orchestrator = Orchestrator(
             rest,
             market_data,

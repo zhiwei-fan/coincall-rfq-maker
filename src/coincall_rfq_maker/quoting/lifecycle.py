@@ -6,7 +6,10 @@ exchange — intents are computed and logged only.
 """
 
 import logging
-from dataclasses import replace
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from typing import Protocol
 
 from coincall_rfq_maker.adapters.rest import (
     CoincallAmbiguousError,
@@ -19,7 +22,7 @@ from coincall_rfq_maker.adapters.schemas import (
     QuotePayload,
     quote_stage_from_wire,
 )
-from coincall_rfq_maker.adapters.signing import get_timestamp_ms
+from coincall_rfq_maker.clock import current_time_ms
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.strategy import QuoteIntent
@@ -29,15 +32,44 @@ logger = logging.getLogger(__name__)
 _PRICE_TOLERANCE = 1e-9
 
 
+@dataclass
+class _ApiOperationAccounting:
+    ambiguous_failures: int = 0
+
+
+class ApiOutcomeReporter(Protocol):
+    def record_api_failure(self) -> None: ...
+
+    def record_api_success(self) -> None: ...
+
+
+class _NullApiOutcomeReporter:
+    def record_api_failure(self) -> None:
+        pass
+
+    def record_api_success(self) -> None:
+        pass
+
+
 class QuoteLifecycle:
     """In-memory quote store plus create/cancel/replace against the exchange."""
 
-    def __init__(self, rest_client: CoincallRestClient, dry_run: bool = True) -> None:
+    def __init__(
+        self,
+        rest_client: CoincallRestClient,
+        dry_run: bool = True,
+        api_reporter: ApiOutcomeReporter | None = None,
+    ) -> None:
         self._rest = rest_client
         self._dry_run = dry_run
         self._by_request: dict[str, Quote] = {}
         self._by_quote_id: dict[str, Quote] = {}
-        self._ambiguous_transport_failures = 0
+        self._api_reporter = (
+            api_reporter if api_reporter is not None else _NullApiOutcomeReporter()
+        )
+        self._api_operation: ContextVar[_ApiOperationAccounting | None] = ContextVar(
+            "quote_lifecycle_api_operation", default=None
+        )
 
     def get_for_rfq(self, request_id: str) -> Quote | None:
         return self._by_request.get(request_id)
@@ -54,11 +86,6 @@ class QuoteLifecycle:
             return False
         return not (self._dry_run and quote.stage is QuoteStage.PENDING_CREATE)
 
-    def consume_ambiguous_transport_failures(self) -> int:
-        count = self._ambiguous_transport_failures
-        self._ambiguous_transport_failures = 0
-        return count
-
     def evict_for_rfq(self, request_id: str) -> None:
         self._by_request.pop(request_id, None)
         stale_quote_ids = [
@@ -69,18 +96,44 @@ class QuoteLifecycle:
         for quote_id in stale_quote_ids:
             del self._by_quote_id[quote_id]
 
+    async def _run_api_operation[T](self, operation: Callable[[], Awaitable[T]]) -> T:
+        accounting = self._api_operation.get()
+        if accounting is not None:
+            return await operation()
+
+        accounting = _ApiOperationAccounting()
+        token = self._api_operation.set(accounting)
+        try:
+            result = await operation()
+        except CoincallError:
+            for _ in range(accounting.ambiguous_failures or 1):
+                self._api_reporter.record_api_failure()
+            raise
+        else:
+            self._api_reporter.record_api_success()
+            return result
+        finally:
+            self._api_operation.reset(token)
+
+    def _record_ambiguous_failure(self) -> None:
+        accounting = self._api_operation.get()
+        if accounting is not None:
+            accounting.ambiguous_failures += 1
+
     async def reconcile(self, intent: QuoteIntent) -> Quote:
+        return await self._run_api_operation(lambda: self._reconcile(intent))
+
+    async def _reconcile(self, intent: QuoteIntent) -> Quote:
         """Idempotently ensure our live quote for `intent.request_id` matches `intent`."""
         existing = self._by_request.get(intent.request_id)
         if existing is not None and existing.stage is QuoteStage.FILLED:
             return existing
         if existing is not None and existing.stage is QuoteStage.PENDING_CANCEL:
-            resolved = await self._resolve_ambiguous_cancel(
-                existing,
-                CoincallAmbiguousError(
+            resolved = await self._resolve_pending_cancel(existing)
+            if resolved is None:
+                raise CoincallAmbiguousError(
                     f"Pending cancel for RFQ {intent.request_id} remains ambiguous"
-                ),
-            )
+                )
             if resolved.stage is QuoteStage.FILLED:
                 return resolved
             if not resolved.is_terminal:
@@ -104,11 +157,17 @@ class QuoteLifecycle:
         return await self._create(intent)
 
     async def cancel_for_rfq(self, request_id: str) -> None:
+        await self._run_api_operation(lambda: self._cancel_for_rfq(request_id))
+
+    async def _cancel_for_rfq(self, request_id: str) -> None:
         existing = self._by_request.get(request_id)
         if existing is not None and existing.is_open:
             await self._cancel(existing)
 
     async def withdraw_for_rfq(self, request_id: str) -> Quote | None:
+        return await self._run_api_operation(lambda: self._withdraw_for_rfq(request_id))
+
+    async def _withdraw_for_rfq(self, request_id: str) -> Quote | None:
         """Fail-closed withdrawal for every non-terminal local quote stage."""
         existing = self._by_request.get(request_id)
         if existing is None or existing.is_terminal:
@@ -128,23 +187,28 @@ class QuoteLifecycle:
                 self._store(cancelled)
                 return cancelled
             try:
-                resolved = await self._resolve_ambiguous_cancel(
-                    existing,
-                    CoincallAmbiguousError(
-                        f"Pending cancel for RFQ {request_id} remains ambiguous"
-                    ),
-                )
+                resolved = await self._resolve_pending_cancel(existing)
             except CoincallAmbiguousError:
                 current = self._by_request.get(request_id)
                 if current is not None and current.is_open:
                     return await self._cancel(current)
                 raise
+            if resolved is None:
+                current = self._by_request.get(request_id)
+                if current is not None and current.is_open:
+                    return await self._cancel(current)
+                raise CoincallAmbiguousError(
+                    f"Pending cancel for RFQ {request_id} remains ambiguous"
+                )
             if resolved.is_open:
                 return await self._cancel(resolved)
             return resolved
         return existing
 
     async def settle_filled_rfq(self, request_id: str) -> Quote | None:
+        return await self._run_api_operation(lambda: self._settle_filled_rfq(request_id))
+
+    async def _settle_filled_rfq(self, request_id: str) -> Quote | None:
         """Mirror exchange quote state for an RFQ reported FILLED by the exchange."""
         existing = self._by_request.get(request_id)
         if existing is None:
@@ -177,12 +241,18 @@ class QuoteLifecycle:
         return resolved
 
     async def cancel_all(self) -> None:
+        await self._run_api_operation(self._cancel_all)
+
+    async def _cancel_all(self) -> None:
         if self._dry_run:
             logger.info("[DRY RUN] would cancel all quotes")
             return
         await self._rest.cancel_all_quotes()
 
     async def cancel_exchange_quote(self, quote_id: str) -> None:
+        await self._run_api_operation(lambda: self._cancel_exchange_quote(quote_id))
+
+    async def _cancel_exchange_quote(self, quote_id: str) -> None:
         """Cancel an exchange-open quote that should not be represented locally."""
         if self._dry_run:
             logger.info("[DRY RUN] would cancel orphan exchange quote %s", quote_id)
@@ -207,6 +277,9 @@ class QuoteLifecycle:
         return self._adopt_open_quote(existing, quote_id)
 
     async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
+        return await self._run_api_operation(lambda: self._resolve_remote_quote(quote))
+
+    async def _resolve_remote_quote(self, quote: Quote) -> Quote | None:
         """Fetch one quote by id and mirror the exchange state into the local store."""
         if quote.quote_id is None:
             return None
@@ -238,13 +311,13 @@ class QuoteLifecycle:
             filled_quantity=_coalesce(event.filled_quantity, updated.filled_quantity),
             fill_time_ms=_coalesce(event.fill_time_ms, updated.fill_time_ms),
             block_trade_id=event.block_trade_id or updated.block_trade_id,
-            update_time_ms=get_timestamp_ms(),
+            update_time_ms=current_time_ms(),
         )
         self._store(updated)
         return updated
 
     async def _create(self, intent: QuoteIntent) -> Quote:
-        now = get_timestamp_ms()
+        now = current_time_ms()
         pending = Quote(
             request_id=intent.request_id,
             stage=QuoteStage.PENDING_CREATE,
@@ -268,7 +341,7 @@ class QuoteLifecycle:
         try:
             result = await self._rest.create_quote(intent.request_id, payload_legs)
         except CoincallAmbiguousError as exc:
-            self._ambiguous_transport_failures += 1
+            self._record_ambiguous_failure()
             logger.warning(
                 "Create quote for RFQ %s is ambiguous; verifying open quotes",
                 intent.request_id,
@@ -293,7 +366,7 @@ class QuoteLifecycle:
             try:
                 await self._rest.cancel_quote(quote.quote_id)
             except CoincallAmbiguousError as exc:
-                self._ambiguous_transport_failures += 1
+                self._record_ambiguous_failure()
                 logger.warning(
                     "Cancel quote %s is ambiguous; verifying open quotes",
                     quote.quote_id,
@@ -343,17 +416,23 @@ class QuoteLifecycle:
     async def _resolve_ambiguous_cancel(
         self, pending_cancel: Quote, exc: CoincallAmbiguousError
     ) -> Quote:
-        if pending_cancel.quote_id is None:
+        resolved = await self._resolve_pending_cancel(pending_cancel)
+        if resolved is None:
             raise exc
+        return resolved
+
+    async def _resolve_pending_cancel(self, pending_cancel: Quote) -> Quote | None:
+        if pending_cancel.quote_id is None:
+            return None
         remote_quotes = await self._rest.get_quote_list(quote_id=pending_cancel.quote_id)
         remote = _find_remote_quote(remote_quotes, quote_id=pending_cancel.quote_id)
         if remote is None:
-            raise exc
+            return None
 
         resolved = _quote_from_remote(pending_cancel, remote)
         self._store(resolved)
         if resolved.stage is QuoteStage.OPEN:
-            raise exc
+            return None
         logger.info(
             "Verified quote %s resolved to exchange state %s",
             pending_cancel.quote_id,

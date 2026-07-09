@@ -91,20 +91,20 @@ async def _shutdown_queue_on_signal(
 async def _quote_refresh_loop(
     events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
-    while not shutdown.is_set():
-        try:
-            async with asyncio.timeout(interval_seconds):
-                await shutdown.wait()
-            return
-        except TimeoutError:
-            try:
-                await events.put(RepriceTick())
-            except asyncio.QueueShutDown:
-                return
+    await _tick_loop(events, shutdown, interval_seconds, RepriceTick())
 
 
 async def _reconcile_loop(
     events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
+) -> None:
+    await _tick_loop(events, shutdown, interval_seconds, ReconcileTick())
+
+
+async def _tick_loop(
+    events: "asyncio.Queue[object]",
+    shutdown: asyncio.Event,
+    interval_seconds: float,
+    event: object,
 ) -> None:
     while not shutdown.is_set():
         try:
@@ -113,7 +113,7 @@ async def _reconcile_loop(
             return
         except TimeoutError:
             try:
-                await events.put(ReconcileTick())
+                await events.put(event)
             except asyncio.QueueShutDown:
                 return
 
@@ -176,7 +176,9 @@ async def run_async(settings: Settings) -> None:
             stale_market_data_seconds=settings.stale_market_data_seconds,
             exposure_provider=NullExposureProvider(),
         )
-        quote_lifecycle = QuoteLifecycle(rest, dry_run=settings.dry_run)
+        quote_lifecycle = QuoteLifecycle(
+            rest, dry_run=settings.dry_run, api_reporter=risk_gate
+        )
         orchestrator = Orchestrator(
             rest, market_data, pricing_model, risk_gate, quote_lifecycle, persistence
         )

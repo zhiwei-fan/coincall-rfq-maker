@@ -26,9 +26,9 @@ from coincall_rfq_maker.adapters.schemas import (
 )
 from coincall_rfq_maker.adapters.signing import (
     encode_query_params,
-    get_timestamp_ms,
     sign_rest_request,
 )
+from coincall_rfq_maker.clock import get_timestamp_ms
 
 logger = logging.getLogger(__name__)
 
