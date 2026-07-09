@@ -1,9 +1,14 @@
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
-from coincall_rfq_maker.risk.gate import RiskGate
+from coincall_rfq_maker.risk.gate import ExposureSnapshot, NullExposureProvider, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 NOW_MS = 1_000_000
+
+
+class UnusableExposureProvider:
+    def current_exposure(self) -> ExposureSnapshot:
+        return ExposureSnapshot(exposures_by_underlying={}, usable=False, reason="stale snapshot")
 
 
 def make_gate(**overrides: float | int) -> RiskGate:
@@ -38,6 +43,36 @@ def test_approves_within_all_limits() -> None:
     decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
     assert decision.approved
     assert decision.reason is None
+
+
+def test_null_exposure_provider_preserves_approval_path() -> None:
+    gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=1.0,
+        stale_market_data_seconds=30.0,
+        exposure_provider=NullExposureProvider(),
+    )
+
+    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert decision.approved
+    assert decision.reason is None
+
+
+def test_unusable_exposure_provider_fails_closed_with_distinct_reason() -> None:
+    gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=1.0,
+        stale_market_data_seconds=30.0,
+        exposure_provider=UnusableExposureProvider(),
+    )
+
+    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert not decision.approved
+    assert decision.reason == "exposure data unavailable: stale snapshot"
 
 
 def test_rejects_leg_qty_over_max() -> None:
@@ -95,3 +130,23 @@ def test_fail_closed_on_missing_leg_price() -> None:
     empty_intent = QuoteIntent(request_id="rfq-1", legs=())
     decision = gate.evaluate(make_rfq(), empty_intent, {INSTRUMENT: 1.0}, NOW_MS)
     assert not decision.approved
+
+
+class FalseyUnusableExposureProvider(UnusableExposureProvider):
+    """A provider that is falsey (e.g. caches positions, currently empty)."""
+
+    def __len__(self) -> int:
+        return 0
+
+
+def test_falsey_exposure_provider_is_not_replaced_by_null_provider() -> None:
+    gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=1.0,
+        stale_market_data_seconds=30.0,
+        exposure_provider=FalseyUnusableExposureProvider(),
+    )
+    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    assert not decision.approved
+    assert decision.reason is not None and "exposure" in decision.reason

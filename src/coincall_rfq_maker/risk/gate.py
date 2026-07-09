@@ -9,6 +9,7 @@ repeated consecutive API failures and rejects everything until reset.
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Protocol
 
 from coincall_rfq_maker.domain.rfq import Rfq
 from coincall_rfq_maker.quoting.strategy import QuoteIntent
@@ -24,6 +25,33 @@ class RiskDecision:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class UnderlyingExposure:
+    net_position_quantity: float = 0.0
+    premium_notional: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureSnapshot:
+    exposures_by_underlying: Mapping[str, UnderlyingExposure]
+    usable: bool = True
+    reason: str | None = None
+
+
+class ExposureProvider(Protocol):
+    def current_exposure(self) -> ExposureSnapshot: ...
+
+
+class NullExposureProvider:
+    def current_exposure(self) -> ExposureSnapshot:
+        return ExposureSnapshot(exposures_by_underlying={})
+
+
+@dataclass(frozen=True, slots=True)
+class _RiskEvaluationContext:
+    exposure: ExposureSnapshot
+
+
 class RiskGate:
     def __init__(
         self,
@@ -32,12 +60,16 @@ class RiskGate:
         min_time_to_expiry_hours: float,
         stale_market_data_seconds: float,
         kill_switch_threshold: int = DEFAULT_KILL_SWITCH_THRESHOLD,
+        exposure_provider: ExposureProvider | None = None,
     ) -> None:
         self._max_notional = max_quote_notional_usd
         self._max_leg_qty = max_leg_qty
         self._min_tte_hours = min_time_to_expiry_hours
         self._stale_seconds = stale_market_data_seconds
         self._kill_switch_threshold = kill_switch_threshold
+        self._exposure_provider = (
+            exposure_provider if exposure_provider is not None else NullExposureProvider()
+        )
         self._consecutive_failures = 0
         self._kill_switch_tripped = False
 
@@ -82,6 +114,11 @@ class RiskGate:
     ) -> RiskDecision:
         if self._kill_switch_tripped:
             return self._reject("kill switch tripped")
+
+        context = _RiskEvaluationContext(exposure=self._exposure_provider.current_exposure())
+        if not context.exposure.usable:
+            reason = context.exposure.reason or "unusable or stale exposure data"
+            return self._reject(f"exposure data unavailable: {reason}")
 
         time_to_expiry_hours = (rfq.expiry_time_ms - now_ms) / 1000 / 3600
         if time_to_expiry_hours < self._min_tte_hours:

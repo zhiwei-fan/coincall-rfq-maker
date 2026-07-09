@@ -24,7 +24,7 @@ from coincall_rfq_maker.orchestration import Orchestrator
 from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
-from coincall_rfq_maker.risk.gate import RiskGate
+from coincall_rfq_maker.risk.gate import NullExposureProvider, RiskGate
 from coincall_rfq_maker.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -147,10 +147,11 @@ async def run_async(settings: Settings) -> None:
         loop.add_signal_handler(sig, shutdown.set)
 
     events: asyncio.Queue[object] = asyncio.Queue()
-    api_secret = settings.api_secret.get_secret_value()
+    maker_credentials = settings.maker_credentials()
+    api_secret = maker_credentials.api_secret.get_secret_value()
 
     async with (
-        CoincallRestClient(settings.api_key, api_secret, settings.rest_base_url) as rest,
+        CoincallRestClient(maker_credentials.api_key, api_secret, settings.rest_base_url) as rest,
         PersistenceStore(settings.db_path) as persistence,
     ):
         market_data = MarketDataService(rest, events, settings.price_move_threshold)
@@ -164,6 +165,7 @@ async def run_async(settings: Settings) -> None:
             max_leg_qty=settings.max_leg_qty,
             min_time_to_expiry_hours=settings.min_time_to_expiry_hours,
             stale_market_data_seconds=settings.stale_market_data_seconds,
+            exposure_provider=NullExposureProvider(),
         )
         quote_lifecycle = QuoteLifecycle(rest, dry_run=settings.dry_run)
         orchestrator = Orchestrator(
@@ -171,7 +173,7 @@ async def run_async(settings: Settings) -> None:
         )
         ws_client = CoincallWsClient(
             settings.ws_url,
-            settings.api_key,
+            maker_credentials.api_key,
             api_secret,
             events,
             heartbeat_interval_seconds=settings.heartbeat_interval_seconds,

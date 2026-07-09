@@ -4,8 +4,16 @@ Fails fast (raises at construction time) when API_KEY or API_SECRET are
 missing, since the process cannot talk to Coincall without them.
 """
 
-from pydantic import Field, SecretStr, field_validator
+from dataclasses import dataclass
+
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+@dataclass(frozen=True, slots=True)
+class Credentials:
+    api_key: str
+    api_secret: SecretStr
 
 
 class Settings(BaseSettings):
@@ -17,6 +25,8 @@ class Settings(BaseSettings):
 
     api_key: str = Field(alias="API_KEY")
     api_secret: SecretStr = Field(alias="API_SECRET")
+    taker_api_key: str | None = Field(default=None, alias="TAKER_API_KEY")
+    taker_api_secret: SecretStr | None = Field(default=None, alias="TAKER_API_SECRET")
 
     rest_base_url: str = Field(default="https://betaapi.coincall.com", alias="REST_BASE_URL")
     ws_url: str = Field(default="wss://betaws.seizeyouralpha.com/options", alias="WS_URL")
@@ -55,3 +65,33 @@ class Settings(BaseSettings):
         if not value.get_secret_value().strip():
             raise ValueError("API_SECRET must not be blank")
         return value
+
+    @field_validator("taker_api_key")
+    @classmethod
+    def _blank_taker_api_key_is_absent(cls, value: str | None) -> str | None:
+        # An empty placeholder (TAKER_API_KEY="") must behave like an unset
+        # var so maker-only configs copied from .env.example keep starting.
+        if value is not None and not value.strip():
+            return None
+        return value
+
+    @field_validator("taker_api_secret")
+    @classmethod
+    def _blank_taker_api_secret_is_absent(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _taker_credentials_both_or_neither(self) -> "Settings":
+        if (self.taker_api_key is None) != (self.taker_api_secret is None):
+            raise ValueError("TAKER_API_KEY and TAKER_API_SECRET must be set together or omitted")
+        return self
+
+    def maker_credentials(self) -> Credentials:
+        return Credentials(api_key=self.api_key, api_secret=self.api_secret)
+
+    def taker_credentials(self) -> Credentials | None:
+        if self.taker_api_key is None or self.taker_api_secret is None:
+            return None
+        return Credentials(api_key=self.taker_api_key, api_secret=self.taker_api_secret)
