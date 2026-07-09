@@ -194,6 +194,59 @@ class CreateQuoteResult(BaseModel):
     quote_id: str = Field(alias="quoteId")
 
 
+class RfqCreateResult(BaseModel):
+    """Typed result for create-RFQ responses."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    request_id: str = Field(alias="requestId")
+    state: str = "ACTIVE"
+    create_time: int | None = Field(default=None, alias="createTime")
+    expiry_time: int | None = Field(default=None, alias="expiryTime")
+
+
+class ExecutedLegPayload(BaseModel):
+    """Executed block-trade leg payload returned after accepting a quote."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    instrument_name: str = Field(alias="instrumentName")
+    side: Side | None = None
+    price: str | None = None
+    quantity: str | None = None
+    fee: str | None = None
+    trade_id: str | None = Field(default=None, alias="tradeId")
+    order_id: str | None = Field(default=None, alias="orderId")
+    iv: str | None = None
+
+
+class ExecuteQuoteResult(BaseModel):
+    """Typed result for accepted quote responses."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    block_trade_id: str = Field(alias="blockTradeId")
+    request_id: str | None = Field(default=None, alias="requestId")
+    quote_id: str | None = Field(default=None, alias="quoteId")
+    role: str | None = None
+    legs: list[ExecutedLegPayload] = Field(default_factory=list)
+
+
+class OptionInstrument(BaseModel):
+    """Coincall option instrument metadata."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    symbol_name: str = Field(alias="symbolName")
+    base_currency: str = Field(alias="baseCurrency")
+    strike: float
+    expiration_timestamp: int = Field(alias="expirationTimestamp")
+    is_active: bool = Field(alias="isActive")
+    min_qty: float = Field(alias="minQty")
+    tick_size: float = Field(alias="tickSize")
+    start_timestamp: int | None = Field(default=None, alias="startTimestamp")
+
+
 # WIRE_QUOTE_STATE: the canonical exchange quote-state to domain-stage map.
 _QUOTE_STATE_TO_STAGE = {
     "OPEN": QuoteStage.OPEN,

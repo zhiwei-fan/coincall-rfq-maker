@@ -17,8 +17,11 @@ from pydantic import ValidationError
 
 from coincall_rfq_maker.adapters.schemas import (
     CreateQuoteResult,
+    ExecuteQuoteResult,
+    OptionInstrument,
     QuoteListSnapshot,
     QuotePayload,
+    RfqCreateResult,
     RfqListSnapshot,
     RfqPayload,
     SymbolInfoPayload,
@@ -181,6 +184,49 @@ class CoincallRestClient:
         response = await self._request("GET", "/open/option/blocktrade/rfqList/v1", params)
         return _parse_rfq_list(response)
 
+    async def create_rfq(self, legs: list[dict[str, str]]) -> RfqCreateResult:
+        """POST /open/option/blocktrade/request/create/v1"""
+        response = await self._request(
+            "POST",
+            "/open/option/blocktrade/request/create/v1",
+            {"legs": legs},
+            idempotent=False,
+        )
+        try:
+            return RfqCreateResult.model_validate(response.get("data") or {})
+        except ValidationError as exc:
+            raise CoincallRequestError("Malformed create-RFQ response") from exc
+
+    async def cancel_rfq(self, request_id: str) -> dict[str, Any]:
+        """POST /open/option/blocktrade/request/cancel/v1"""
+        return await self._request(
+            "POST",
+            "/open/option/blocktrade/request/cancel/v1",
+            {"requestId": request_id},
+            idempotent=False,
+        )
+
+    async def execute_quote(self, request_id: str, quote_id: str) -> ExecuteQuoteResult:
+        """Accept a quote and execute the resulting block trade."""
+        response = await self._request(
+            "POST",
+            "/open/option/blocktrade/request/accept/v1",
+            {"requestId": request_id, "quoteId": quote_id},
+            idempotent=False,
+        )
+        try:
+            return ExecuteQuoteResult.model_validate(response.get("data") or {})
+        except ValidationError as exc:
+            raise CoincallRequestError("Malformed execute-quote response") from exc
+
+    async def get_quotes_received(self, request_id: str | None = None) -> tuple[QuotePayload, ...]:
+        """GET /open/option/blocktrade/request/getQuotesReceived/v1"""
+        params = {"requestId": request_id} if request_id is not None else None
+        response = await self._request(
+            "GET", "/open/option/blocktrade/request/getQuotesReceived/v1", params
+        )
+        return _parse_quotes_received(response)
+
     # -- Quote endpoints --------------------------------------------------
 
     async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
@@ -272,6 +318,11 @@ class CoincallRestClient:
         except ValidationError as exc:
             raise CoincallRequestError(f"Malformed symbol info response for {symbol}") from exc
 
+    async def get_option_instruments(self, base_currency: str) -> tuple[OptionInstrument, ...]:
+        """GET /open/option/getInstruments/{base_currency}"""
+        response = await self._request("GET", f"/open/option/getInstruments/{base_currency}", None)
+        return _parse_option_instruments(response)
+
 
 def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
     data = response.get("data") or {}
@@ -305,6 +356,32 @@ def _parse_quote_list(response: dict[str, Any]) -> QuoteListSnapshot:
         return QuoteListSnapshot()
     payloads, malformed_id_pairs = _validated_quote_items(raw_items)
     return QuoteListSnapshot(tuple(payloads), frozenset(malformed_id_pairs))
+
+
+def _parse_quotes_received(response: dict[str, Any]) -> tuple[QuotePayload, ...]:
+    raw_items = response.get("data") or []
+    if not isinstance(raw_items, list):
+        logger.warning("Malformed quotes-received REST response data: expected list")
+        return ()
+    payloads, _malformed_id_pairs = _validated_quote_items(raw_items)
+    return tuple(payloads)
+
+
+def _parse_option_instruments(response: dict[str, Any]) -> tuple[OptionInstrument, ...]:
+    raw_items = response.get("data") or []
+    if not isinstance(raw_items, list):
+        logger.warning("Malformed option instruments REST response data: expected list")
+        return ()
+    items: list[OptionInstrument] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            logger.warning("Malformed option instrument REST item: expected object")
+            continue
+        try:
+            items.append(OptionInstrument.model_validate(item))
+        except ValidationError as exc:
+            logger.warning("Malformed option instrument REST item: %s", exc)
+    return tuple(items)
 
 
 def _validated_rfq_items(raw_items: list[Any]) -> tuple[list[RfqPayload], set[str]]:
