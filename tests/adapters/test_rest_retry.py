@@ -3,7 +3,11 @@ from typing import Any
 
 import pytest
 
-from coincall_rfq_maker.adapters.rest import CoincallAmbiguousError, CoincallRestClient
+from coincall_rfq_maker.adapters.rest import (
+    CoincallAmbiguousError,
+    CoincallRequestError,
+    CoincallRestClient,
+)
 
 
 class TimeoutContext:
@@ -38,3 +42,11 @@ async def test_state_changing_post_timeout_is_not_retried_and_is_ambiguous() -> 
         await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
 
     assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_get_quote_list_rejects_time_window_over_three_days() -> None:
+    client = CoincallRestClient("key", "secret")
+
+    with pytest.raises(CoincallRequestError, match="cannot exceed 3 days"):
+        await client.get_quote_list(start_time=0, end_time=3 * 24 * 60 * 60 * 1000 + 1)

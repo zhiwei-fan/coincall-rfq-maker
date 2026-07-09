@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 0.5
+_MAX_QUOTE_LIST_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
 
 
 class CoincallError(Exception):
@@ -216,6 +217,12 @@ class CoincallRestClient:
             params["startTime"] = start_time
         if end_time:
             params["endTime"] = end_time
+        if (
+            start_time is not None
+            and end_time is not None
+            and end_time - start_time > _MAX_QUOTE_LIST_WINDOW_MS
+        ):
+            raise CoincallRequestError("Quote list time range cannot exceed 3 days")
         return await self._request("GET", "/open/option/blocktrade/list-quote/v1", params)
 
     # -- Futures market data --------------------------------------------------

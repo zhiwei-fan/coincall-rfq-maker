@@ -109,6 +109,10 @@ async def _reconcile_loop(
                 return
 
 
+async def _enqueue_startup_backfill(events: "asyncio.Queue[object]") -> None:
+    await events.put(ReconcileTick())
+
+
 def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
     for exc in exceptions:
         logger.error("Task failed: %s", exc, exc_info=exc)
@@ -154,6 +158,8 @@ async def run_async(settings: Settings) -> None:
             except CoincallError as exc:
                 sys.stderr.write(f"Startup error: failed to cancel all quotes: {exc}\n")
                 raise SystemExit(1) from exc
+
+        await _enqueue_startup_backfill(events)
 
         try:
             async with asyncio.TaskGroup() as tg:

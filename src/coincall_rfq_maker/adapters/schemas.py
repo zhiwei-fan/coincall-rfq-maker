@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from coincall_rfq_maker.domain.rfq import Side
+from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 
 
 class ApiEnvelope(BaseModel):
@@ -42,6 +42,24 @@ class RfqPayload(BaseModel):
     taker_name: str | None = Field(default=None, alias="takerName")
     counterparty: str | None = Field(default=None, alias="counterparty")
     update_time: int | None = Field(default=None, alias="updateTime")
+
+
+def rfq_from_payload(payload: RfqPayload) -> Rfq:
+    """Convert a validated REST/WS RFQ payload into the domain model."""
+    status = RfqStatus(payload.state)
+    return Rfq(
+        request_id=payload.request_id,
+        status=status,
+        legs=tuple(
+            RfqLeg(instrument_name=leg.instrument_name, side=leg.side, quantity=leg.quantity)
+            for leg in payload.legs
+        ),
+        create_time_ms=payload.create_time or 0,
+        expiry_time_ms=payload.expiry_time or 0,
+        taker_name=payload.taker_name,
+        counterparty=payload.counterparty,
+        last_update_time_ms=payload.update_time,
+    )
 
 
 class QuoteLegPayload(BaseModel):

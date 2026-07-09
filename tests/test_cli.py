@@ -125,3 +125,13 @@ async def test_reconcile_loop_exits_cleanly_when_queue_shutdown_races_put() -> N
     )
 
     assert queue.puts == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_tick_is_enqueued_before_timer_events() -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+
+    await cli._enqueue_startup_backfill(queue)
+    await queue.put(RepriceTick())
+
+    assert isinstance(await queue.get(), ReconcileTick)

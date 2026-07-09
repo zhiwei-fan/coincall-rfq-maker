@@ -16,8 +16,12 @@ because it makes interleaving races structurally impossible.
 
 import logging
 import time
+from typing import Any
+
+from pydantic import ValidationError
 
 from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.adapters.schemas import RfqPayload, rfq_from_payload
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
 from coincall_rfq_maker.events import (
@@ -32,7 +36,7 @@ from coincall_rfq_maker.events import (
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import PricingModel
-from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle, quote_items
 from coincall_rfq_maker.quoting.strategy import build_quote_intent
 from coincall_rfq_maker.risk.gate import RiskGate
 
@@ -303,18 +307,34 @@ class Orchestrator:
             await self._persistence.record_quote(quote, snapshot, now_ms)
 
     async def reconcile_with_exchange(self) -> None:
-        """Periodic reconciler: true local RFQ state against the exchange's open RFQ list."""
+        """Periodic reconciler: true local RFQ/quote state against exchange open lists."""
         try:
             response = await self._rest.get_rfq_list(state="OPEN")
         except CoincallError:
             logger.exception("Reconciler failed to fetch RFQ list")
             self._risk_gate.record_api_failure()
             return
-        remote_ids = {
-            item.get("requestId")
-            for item in (response.get("data") or {}).get("rfqList", [])
-            if item.get("requestId")
-        }
+
+        remote_ids = set()
+        seen_remote_ids = set()
+        for item in _rfq_items(response):
+            request_id = _string_field(item, "requestId")
+            if request_id is None or request_id in seen_remote_ids:
+                continue
+            seen_remote_ids.add(request_id)
+            remote_ids.add(request_id)
+            if self.rfq_store.get(request_id) is not None:
+                continue
+            try:
+                rfq = rfq_from_payload(RfqPayload.model_validate(item))
+            except ValueError as exc:
+                logger.warning("Reconciler ignored malformed RFQ payload: %s", exc)
+                continue
+            if rfq.status is not RfqStatus.ACTIVE:
+                continue
+            logger.info("Reconciler: backfilling open RFQ %s from exchange", rfq.request_id)
+            await self._handle_rfq_received(rfq)
+
         for rfq in self.rfq_store.active():
             if rfq.request_id not in remote_ids:
                 logger.info(
@@ -329,6 +349,59 @@ class Orchestrator:
                     rfq.request_id,
                 )
                 await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, rfq.status))
+
+        await self._reconcile_quote_state()
+
+    async def _reconcile_quote_state(self) -> None:
+        try:
+            response = await self._rest.get_quote_list(state="OPEN")
+        except CoincallError:
+            logger.exception("Reconciler failed to fetch quote list")
+            self._risk_gate.record_api_failure()
+            return
+
+        remote_open_quote_ids = set()
+        for item in quote_items(response):
+            quote_id = _string_field(item, "quoteId")
+            if quote_id is None:
+                continue
+            remote_open_quote_ids.add(quote_id)
+            local = self._quotes.get_by_quote_id(quote_id)
+            if local is None or local.is_terminal:
+                request_id = _string_field(item, "requestId")
+                adopted = (
+                    None
+                    if request_id is None
+                    else self._quotes.adopt_open_exchange_quote(request_id, quote_id)
+                )
+                if adopted is None:
+                    await self._cancel_orphan_exchange_quote(quote_id)
+
+        for quote in self._quotes.open_quotes():
+            if quote.quote_id is None or quote.quote_id in remote_open_quote_ids:
+                continue
+            try:
+                resolved = await self._quotes.resolve_remote_quote(quote)
+            except CoincallError:
+                logger.exception("Reconciler failed to resolve quote %s", quote.quote_id)
+                self._risk_gate.record_api_failure()
+                continue
+            except ValidationError as exc:
+                logger.warning(
+                    "Reconciler ignored malformed quote payload for %s: %s",
+                    quote.quote_id,
+                    exc,
+                )
+                continue
+            if resolved is not None and resolved.is_terminal and self._persistence is not None:
+                await self._persistence.record_quote(resolved, None, _now_ms())
+
+    async def _cancel_orphan_exchange_quote(self, quote_id: str) -> None:
+        try:
+            await self._quotes.cancel_exchange_quote(quote_id)
+        except CoincallError:
+            logger.exception("Reconciler failed to cancel orphan exchange quote %s", quote_id)
+            self._risk_gate.record_api_failure()
 
     def _record_ambiguous_quote_failures(self) -> int:
         count = self._quotes.consume_ambiguous_transport_failures()
@@ -346,3 +419,18 @@ def _safe_parse(name: str) -> Instrument | None:
         return parse_instrument(name)
     except InstrumentParseError:
         return None
+
+
+def _rfq_items(response: dict[str, Any]) -> list[dict[str, Any]]:
+    data = response.get("data") or {}
+    if not isinstance(data, dict):
+        return []
+    raw_items = data.get("rfqList", [])
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _string_field(item: dict[str, Any], field: str) -> str | None:
+    value = item.get(field)
+    return value if isinstance(value, str) and value else None

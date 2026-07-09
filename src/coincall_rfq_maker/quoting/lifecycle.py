@@ -48,6 +48,9 @@ class QuoteLifecycle:
     def get_by_quote_id(self, quote_id: str) -> Quote | None:
         return self._by_quote_id.get(quote_id)
 
+    def open_quotes(self) -> list[Quote]:
+        return [quote for quote in self._by_request.values() if quote.is_open]
+
     def has_open_or_pending_quote_for_rfq(self, request_id: str) -> bool:
         quote = self._by_request.get(request_id)
         if quote is None or quote.is_terminal:
@@ -99,6 +102,37 @@ class QuoteLifecycle:
             logger.info("[DRY RUN] would cancel all quotes")
             return
         await self._rest.cancel_all_quotes()
+
+    async def cancel_exchange_quote(self, quote_id: str) -> None:
+        """Cancel an exchange-open quote that should not be represented locally."""
+        if self._dry_run:
+            logger.info("[DRY RUN] would cancel orphan exchange quote %s", quote_id)
+            return
+        await self._rest.cancel_quote(quote_id)
+
+    def adopt_open_exchange_quote(self, request_id: str, quote_id: str) -> Quote | None:
+        """Adopt an exchange-open quote that matches a known local RFQ quote."""
+        existing = self._by_request.get(request_id)
+        if existing is None or existing.stage not in {QuoteStage.PENDING_CREATE, QuoteStage.OPEN}:
+            return None
+        return self._adopt_open_quote(existing, quote_id)
+
+    async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
+        """Fetch one quote by id and mirror the exchange state into the local store."""
+        if quote.quote_id is None:
+            return None
+        response = await self._rest.get_quote_list(quote_id=quote.quote_id)
+        remote = _find_remote_quote(response, quote_id=quote.quote_id)
+        if remote is None:
+            return None
+        resolved = _quote_from_remote(quote, remote)
+        self._store(resolved)
+        logger.info(
+            "Reconciled quote %s to exchange state %s",
+            quote.quote_id,
+            resolved.stage,
+        )
+        return resolved
 
     def apply_ws_update(self, event: QuoteUpdated) -> Quote | None:
         """Mirror an exchange-reported quote state change into the local store."""
@@ -218,10 +252,7 @@ class QuoteLifecycle:
         quote_id = _remote_quote_id(remote)
         if quote_id is None:
             return None
-        opened = replace(pending.with_stage(QuoteStage.OPEN), quote_id=quote_id)
-        self._store(opened)
-        logger.info("Adopted exchange quote %s for RFQ %s", quote_id, pending.request_id)
-        return opened
+        return self._adopt_open_quote(pending, quote_id)
 
     async def _resolve_ambiguous_cancel(
         self, pending_cancel: Quote, exc: CoincallAmbiguousError
@@ -249,6 +280,13 @@ class QuoteLifecycle:
         if quote.quote_id:
             self._by_quote_id[quote.quote_id] = quote
 
+    def _adopt_open_quote(self, quote: Quote, quote_id: str) -> Quote:
+        opened = quote if quote.stage is QuoteStage.OPEN else quote.with_stage(QuoteStage.OPEN)
+        opened = replace(opened, quote_id=quote_id)
+        self._store(opened)
+        logger.info("Adopted exchange quote %s for RFQ %s", quote_id, quote.request_id)
+        return opened
+
 
 def _coalesce[T](new: T | None, old: T | None) -> T | None:
     return new if new is not None else old
@@ -268,7 +306,7 @@ def _matches(existing: Quote, intent: QuoteIntent) -> bool:
 def _find_remote_quote(
     response: dict[str, Any], request_id: str | None = None, quote_id: str | None = None
 ) -> dict[str, Any] | None:
-    for item in _quote_items(response):
+    for item in quote_items(response):
         if request_id is not None and item.get("requestId") != request_id:
             continue
         if quote_id is not None and item.get("quoteId") != quote_id:
@@ -277,7 +315,7 @@ def _find_remote_quote(
     return None
 
 
-def _quote_items(response: dict[str, Any]) -> list[dict[str, Any]]:
+def quote_items(response: dict[str, Any]) -> list[dict[str, Any]]:
     raw_items = response.get("data") or []
     if not isinstance(raw_items, list):
         return []
@@ -298,8 +336,9 @@ def _quote_from_remote(current: Quote, remote: dict[str, Any]) -> Quote:
         raise CoincallRequestError(
             f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"
         )
+    base = current if current.stage is stage else current.with_stage(stage)
     return replace(
-        current.with_stage(stage),
+        base,
         request_id=payload.request_id or current.request_id,
         quote_id=payload.quote_id,
         update_time_ms=_coalesce(payload.update_time, current.update_time_ms),
