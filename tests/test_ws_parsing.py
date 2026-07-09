@@ -100,6 +100,32 @@ def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
     assert event.fill_time_ms == 123456
 
 
+def test_dt_22_block_trade_detail_parses_integer_ids() -> None:
+    raw = json.dumps(
+        {
+            "dt": 22,
+            "d": {
+                "blockTradeId": 2075207494989787138,
+                "quoteId": 2075207494989787139,
+                "requestId": 2075207481654804480,
+                "filledPrice": 8467.04,
+                "filledQuantity": 0.01,
+                "fillTime": 1783602996739,
+            },
+        }
+    )
+
+    event = parse_ws_message(raw)
+
+    assert isinstance(event, TradeExecuted)
+    assert event.block_trade_id == "2075207494989787138"
+    assert event.quote_id == "2075207494989787139"
+    assert event.request_id == "2075207481654804480"
+    assert event.filled_price == 8467.04
+    assert event.filled_quantity == 0.01
+    assert event.fill_time_ms == 1783602996739
+
+
 def test_malformed_dt_22_block_trade_detail_ignored() -> None:
     raw = json.dumps({"dt": 22, "d": {"quoteId": "q-1", "requestId": "rfq-1"}})
 

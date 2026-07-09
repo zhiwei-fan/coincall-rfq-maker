@@ -6,12 +6,24 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, overload
+from typing import Annotated, Any, overload
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
+
+
+def _coerce_wire_id(value: object) -> object:
+    if value == "":
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return value
+
+
+WireId = Annotated[str, BeforeValidator(_coerce_wire_id)]
+OptionalWireId = Annotated[str | None, BeforeValidator(_coerce_wire_id)]
 
 
 class ApiEnvelope(BaseModel):
@@ -37,7 +49,7 @@ class RfqPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    request_id: str = Field(alias="requestId")
+    request_id: WireId = Field(alias="requestId")
     state: str
     legs: list[RfqLegPayload] = Field(default_factory=list)
     create_time: int | None = Field(default=None, alias="createTime")
@@ -45,13 +57,6 @@ class RfqPayload(BaseModel):
     taker_name: str | None = Field(default=None, alias="takerName")
     counterparty: str | None = Field(default=None, alias="counterparty")
     update_time: int | None = Field(default=None, alias="updateTime")
-
-    @field_validator("request_id", mode="before")
-    @classmethod
-    def _empty_request_id_is_absent(cls, value: object) -> object:
-        if value == "":
-            return None
-        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,8 +131,8 @@ class QuotePayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    quote_id: str = Field(alias="quoteId")
-    request_id: str | None = Field(default=None, alias="requestId")
+    quote_id: WireId = Field(alias="quoteId")
+    request_id: OptionalWireId = Field(default=None, alias="requestId")
     state: str = "OPEN"
     legs: list[QuoteLegPayload] = Field(default_factory=list)
     create_time: int | None = Field(default=None, alias="createTime")
@@ -136,21 +141,7 @@ class QuotePayload(BaseModel):
     filled_price: float | None = Field(default=None, alias="filledPrice")
     filled_quantity: float | None = Field(default=None, alias="filledQuantity")
     fill_time: int | None = Field(default=None, alias="fillTime")
-    block_trade_id: str | None = Field(default=None, alias="blockTradeId")
-
-    @field_validator("quote_id", mode="before")
-    @classmethod
-    def _empty_quote_id_is_absent(cls, value: object) -> object:
-        if value == "":
-            return None
-        return value
-
-    @field_validator("request_id", mode="before")
-    @classmethod
-    def _empty_request_id_is_absent(cls, value: object) -> object:
-        if value == "":
-            return None
-        return value
+    block_trade_id: OptionalWireId = Field(default=None, alias="blockTradeId")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +182,7 @@ class CreateQuoteResult(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    quote_id: str = Field(alias="quoteId")
+    quote_id: WireId = Field(alias="quoteId")
 
 
 class RfqCreateResult(BaseModel):
@@ -199,7 +190,7 @@ class RfqCreateResult(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    request_id: str = Field(alias="requestId")
+    request_id: WireId = Field(alias="requestId")
     state: str = "ACTIVE"
     create_time: int | None = Field(default=None, alias="createTime")
     expiry_time: int | None = Field(default=None, alias="expiryTime")
@@ -215,8 +206,8 @@ class ExecutedLegPayload(BaseModel):
     price: str | None = None
     quantity: str | None = None
     fee: str | None = None
-    trade_id: str | None = Field(default=None, alias="tradeId")
-    order_id: str | None = Field(default=None, alias="orderId")
+    trade_id: OptionalWireId = Field(default=None, alias="tradeId")
+    order_id: OptionalWireId = Field(default=None, alias="orderId")
     iv: str | None = None
 
 
@@ -225,9 +216,9 @@ class ExecuteQuoteResult(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    block_trade_id: str = Field(alias="blockTradeId")
-    request_id: str | None = Field(default=None, alias="requestId")
-    quote_id: str | None = Field(default=None, alias="quoteId")
+    block_trade_id: WireId = Field(alias="blockTradeId")
+    request_id: OptionalWireId = Field(default=None, alias="requestId")
+    quote_id: OptionalWireId = Field(default=None, alias="quoteId")
     role: str | None = None
     legs: list[ExecutedLegPayload] = Field(default_factory=list)
 
@@ -321,9 +312,9 @@ class BlockTradePayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    block_trade_id: str = Field(alias="blockTradeId")
-    quote_id: str | None = Field(default=None, alias="quoteId")
-    request_id: str | None = Field(default=None, alias="requestId")
+    block_trade_id: WireId = Field(alias="blockTradeId")
+    quote_id: OptionalWireId = Field(default=None, alias="quoteId")
+    request_id: OptionalWireId = Field(default=None, alias="requestId")
     filled_price: float | None = Field(default=None, alias="filledPrice")
     filled_quantity: float | None = Field(default=None, alias="filledQuantity")
     fill_time: int | None = Field(default=None, alias="fillTime")

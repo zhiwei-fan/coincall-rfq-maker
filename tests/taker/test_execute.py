@@ -624,3 +624,43 @@ def test_rest_execute_quote_salvages_present_id_when_legs_malformed(
     result = asyncio.run(client.execute_quote(REQUEST_ID, QUOTE_ID))
 
     assert result.block_trade_id == "BT-9"
+
+
+def test_rest_execute_quote_salvage_keeps_valid_legs_when_top_level_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CoincallRestClient("key", "secret")
+
+    async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": {
+                "requestId": 2075207481654804480,
+                "quoteId": 2075207494989787138,
+                "legs": [
+                    {
+                        "instrumentName": "BTCUSD-10JUL26-62000-C",
+                        "side": "SELL",
+                        "price": "8467",
+                        "quantity": "0.01",
+                        "tradeId": 2075207494989787139,
+                    },
+                    {
+                        "instrumentName": "BTCUSD-10JUL26-62000-C",
+                        "side": "SELL",
+                        "price": 8467,
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    result = asyncio.run(client.execute_quote(REQUEST_ID, QUOTE_ID))
+
+    assert result.block_trade_id == "UNKNOWN"
+    assert result.request_id == REQUEST_ID
+    assert result.quote_id == QUOTE_ID
+    assert len(result.legs) == 1
+    assert result.legs[0].trade_id == "2075207494989787139"
+    assert result.legs[0].price == "8467"

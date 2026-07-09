@@ -12,6 +12,8 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallApiError,
     CoincallRequestError,
     CoincallRestClient,
+    _parse_quote_list,
+    _wire_id,
 )
 
 
@@ -268,7 +270,7 @@ async def test_get_quote_list_returns_valid_payloads_and_skips_malformed_items(
 
 
 @pytest.mark.asyncio
-async def test_create_quote_missing_quote_id_raises_request_error(
+async def test_create_quote_missing_quote_id_is_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = CoincallRestClient("key", "secret")
@@ -278,5 +280,33 @@ async def test_create_quote_missing_quote_id_raises_request_error(
 
     monkeypatch.setattr(client, "_request", fake_request)
 
-    with pytest.raises(CoincallRequestError, match="missing quoteId"):
+    with pytest.raises(CoincallAmbiguousError, match="missing quoteId"):
         await client.create_quote("rfq-1", [])
+
+
+def test_wire_id_salvages_integer_ids_but_not_bool_or_empty() -> None:
+    assert _wire_id(123) == "123"
+    assert _wire_id(True) is None
+    assert _wire_id("") is None
+    assert _wire_id("abc") == "abc"
+
+
+def test_quote_list_salvages_integer_ids_from_malformed_items() -> None:
+    snapshot = _parse_quote_list(
+        {
+            "code": 0,
+            "data": [
+                {
+                    "requestId": 2075207481654804480,
+                    "quoteId": 2075207494989787138,
+                    "state": "OPEN",
+                    "filledPrice": "not-a-number",
+                }
+            ],
+        }
+    )
+
+    assert snapshot == []
+    assert snapshot.malformed_id_pairs == frozenset(
+        {("2075207481654804480", "2075207494989787138")}
+    )

@@ -1,9 +1,15 @@
 import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
 from coincall_rfq_maker.core.adapters.schemas import (
+    CreateQuoteResult,
+    ExecuteQuoteResult,
+    OptionalWireId,
+    QuoteLegPayload,
     QuoteListSnapshot,
     QuotePayload,
+    RfqPayload,
     SymbolInfoPayload,
     find_remote_quote,
     find_salvaged_quote_id,
@@ -11,6 +17,30 @@ from coincall_rfq_maker.core.adapters.schemas import (
     with_remote_stage,
 )
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteStage
+
+INSTRUMENT = "BTCUSD-10JUL26-62000-C"
+
+GOLDEN_CREATE_QUOTE_DATA = {
+    "quoteId": 2075207494989787138,
+    "requestId": 2075207481654804480,
+    "description": "BTC Call 10 Jul 26 62000",
+    "strategyName": "Call",
+    "strategyQuantity": "0.01000000",
+    "strategyPrice": "8467.04000000",
+    "quoteSide": "SELL",
+    "legs": [
+        {
+            "instrumentName": INSTRUMENT,
+            "side": "SELL",
+            "price": "8467",
+            "quantity": "0.01",
+            "ratio": "1.000000000000000000",
+        }
+    ],
+    "createTime": 1783602996739,
+    "expiryTime": 1783603296739,
+    "updateTime": 1783602996739,
+}
 
 
 def make_quote(stage: QuoteStage = QuoteStage.OPEN) -> Quote:
@@ -119,3 +149,89 @@ def test_find_salvaged_quote_id_matches_request_id() -> None:
 
     assert find_salvaged_quote_id(snapshot, request_id="rfq-1") == "q-1"
     assert find_salvaged_quote_id(snapshot, request_id="rfq-missing") is None
+
+
+def test_create_quote_result_coerces_golden_integer_quote_id() -> None:
+    result = CreateQuoteResult.model_validate(GOLDEN_CREATE_QUOTE_DATA)
+
+    assert result.quote_id == "2075207494989787138"
+
+
+@pytest.mark.parametrize(
+    "block_trade_id,request_id,quote_id",
+    [
+        (2075207494989787138, 2075207481654804480, 2075207494989787138),
+        ("2075207494989787138", "2075207481654804480", "2075207494989787138"),
+    ],
+)
+def test_execute_quote_result_parses_integer_and_string_id_dialects(
+    block_trade_id: int | str,
+    request_id: int | str,
+    quote_id: int | str,
+) -> None:
+    result = ExecuteQuoteResult.model_validate(
+        {
+            "blockTradeId": block_trade_id,
+            "requestId": request_id,
+            "quoteId": quote_id,
+            "legs": [
+                {
+                    "instrumentName": INSTRUMENT,
+                    "side": "SELL",
+                    "price": "8467",
+                    "quantity": "0.01",
+                    "tradeId": 2075207494989787139,
+                    "orderId": 2075207494989787140,
+                }
+            ],
+        }
+    )
+
+    assert result.block_trade_id == "2075207494989787138"
+    assert result.request_id == "2075207481654804480"
+    assert result.quote_id == "2075207494989787138"
+    assert len(result.legs) == 1
+    assert result.legs[0].trade_id == "2075207494989787139"
+    assert result.legs[0].order_id == "2075207494989787140"
+    assert result.legs[0].price == "8467"
+    assert result.legs[0].quantity == "0.01"
+
+
+def test_quote_payload_parses_integer_ws_quote_ids() -> None:
+    payload = QuotePayload.model_validate(
+        {
+            "quoteId": 2075207494989787138,
+            "requestId": 2075207481654804480,
+            "blockTradeId": 2075207494989787141,
+            "state": "OPEN",
+        }
+    )
+
+    assert payload.quote_id == "2075207494989787138"
+    assert payload.request_id == "2075207481654804480"
+    assert payload.block_trade_id == "2075207494989787141"
+
+
+def test_required_empty_wire_ids_still_fail_and_optional_empty_ids_are_absent() -> None:
+    with pytest.raises(ValidationError):
+        RfqPayload.model_validate({"requestId": "", "state": "ACTIVE"})
+    with pytest.raises(ValidationError):
+        QuotePayload.model_validate({"quoteId": ""})
+
+    payload = QuotePayload.model_validate({"quoteId": "q-1", "requestId": "", "blockTradeId": ""})
+    assert payload.request_id is None
+    assert payload.block_trade_id is None
+
+
+def test_amount_strings_are_pinned_and_numeric_required_amount_rejected() -> None:
+    payload = QuotePayload.model_validate(
+        {"quoteId": "q-1", "legs": [{"instrumentName": INSTRUMENT, "price": "8467.04000000"}]}
+    )
+
+    assert payload.legs[0].price == "8467.04000000"
+    with pytest.raises(ValidationError):
+        QuoteLegPayload.model_validate({"instrumentName": INSTRUMENT, "price": 8467.04})
+
+
+def test_optional_wire_id_empty_string_is_absent() -> None:
+    assert TypeAdapter(OptionalWireId).validate_python("") is None

@@ -8,6 +8,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
+    CoincallRestClient,
     _parse_quote_list,
 )
 from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
@@ -226,6 +227,84 @@ async def test_ambiguous_create_not_listed_is_treated_as_failure() -> None:
     current = lifecycle.get_for_rfq("rfq-1")
     assert current is not None
     assert current.stage is QuoteStage.PENDING_CREATE
+
+
+@pytest.mark.asyncio
+async def test_malformed_successful_create_response_adopts_open_quote_and_resets_failure_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = CoincallRestClient("key", "secret")
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=5,
+    )
+    for _ in range(4):
+        risk_gate.record_api_failure()
+
+    async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        path = _args[1]
+        if path == "/open/option/blocktrade/quote/create/v1":
+            return {"code": 0, "data": {"quoteId": {"not": "parseable"}}}
+        if path == "/open/option/blocktrade/list-quote/v1":
+            return {
+                "code": 0,
+                "data": [
+                    {
+                        "requestId": "rfq-1",
+                        "quoteId": 2075207494989787138,
+                        "state": "OPEN",
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(rest, "_request", fake_request)
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)
+
+    quote = await lifecycle.reconcile(make_intent())
+
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "2075207494989787138"
+    assert not risk_gate.kill_switch_tripped
+    risk_gate.record_api_failure()
+    assert not risk_gate.kill_switch_tripped
+
+
+@pytest.mark.asyncio
+async def test_malformed_successful_create_response_not_listed_counts_and_trips_after_five(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = CoincallRestClient("key", "secret")
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=5,
+    )
+
+    async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        path = _args[1]
+        if path == "/open/option/blocktrade/quote/create/v1":
+            return {"code": 0, "data": {"quoteId": {"not": "parseable"}}}
+        if path == "/open/option/blocktrade/list-quote/v1":
+            return {"code": 0, "data": []}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(rest, "_request", fake_request)
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)
+
+    for _ in range(4):
+        with pytest.raises(CoincallRequestError):
+            await lifecycle.reconcile(make_intent())
+    assert not risk_gate.kill_switch_tripped
+
+    with pytest.raises(CoincallRequestError):
+        await lifecycle.reconcile(make_intent())
+    assert risk_gate.kill_switch_tripped
 
 
 @pytest.mark.asyncio

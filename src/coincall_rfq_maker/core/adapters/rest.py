@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
+    ExecutedLegPayload,
     ExecuteQuoteResult,
     OptionInstrument,
     QuoteListSnapshot,
@@ -252,8 +253,8 @@ class CoincallRestClient:
         try:
             return ExecuteQuoteResult.model_validate(raw)
         except ValidationError as exc:
-            raw_block_trade_id = raw.get("blockTradeId")
-            block_trade_id = str(raw_block_trade_id) if raw_block_trade_id else "UNKNOWN"
+            block_trade_id = _wire_id(raw.get("blockTradeId")) or "UNKNOWN"
+            legs = _salvage_executed_legs(raw.get("legs"))
             logger.error(
                 "Accept for quote %s (RFQ %s) SUCCEEDED (code==0) but its response failed "
                 "validation; recording a best-effort fill (blockTradeId=%s) rather than "
@@ -267,7 +268,7 @@ class CoincallRestClient:
                 block_trade_id=block_trade_id,
                 request_id=request_id,
                 quote_id=quote_id,
-                legs=[],
+                legs=legs,
             )
 
     async def get_quotes_received(self, request_id: str | None = None) -> tuple[QuotePayload, ...]:
@@ -295,7 +296,7 @@ class CoincallRestClient:
                 request_id,
                 response,
             )
-            raise CoincallRequestError(
+            raise CoincallAmbiguousError(
                 f"Create-quote response missing quoteId for RFQ {request_id}"
             ) from exc
         if not result.quote_id:
@@ -304,7 +305,7 @@ class CoincallRestClient:
                 request_id,
                 response,
             )
-            raise CoincallRequestError(
+            raise CoincallAmbiguousError(
                 f"Create-quote response missing quoteId for RFQ {request_id}"
             )
         return result
@@ -475,7 +476,24 @@ def _validated_quote_items(raw_items: list[Any]) -> tuple[list[QuotePayload], se
     return items, malformed_id_pairs
 
 
+def _salvage_executed_legs(raw_legs: object) -> list[ExecutedLegPayload]:
+    if not isinstance(raw_legs, list):
+        return []
+    legs: list[ExecutedLegPayload] = []
+    for raw_leg in raw_legs:
+        if not isinstance(raw_leg, dict):
+            logger.warning("Malformed executed leg in successful accept response: expected object")
+            continue
+        try:
+            legs.append(ExecutedLegPayload.model_validate(raw_leg))
+        except ValidationError as exc:
+            logger.warning("Malformed executed leg in successful accept response: %s", exc)
+    return legs
+
+
 def _wire_id(value: object) -> str | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
     if isinstance(value, str) and value:
         return value
     return None
