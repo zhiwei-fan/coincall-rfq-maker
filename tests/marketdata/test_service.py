@@ -16,6 +16,19 @@ class FakeFuturesRest:
         return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
 
 
+class BlockingFuturesRest:
+    def __init__(self, prices: dict[str, float]) -> None:
+        self._prices = prices
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_symbol_info(self, symbol: str | None = None) -> dict[str, Any]:
+        assert symbol is not None
+        self.started.set()
+        await self.release.wait()
+        return {"code": 0, "data": {"symbol": symbol, "indexPrice": self._prices[symbol]}}
+
+
 @pytest.mark.asyncio
 async def test_first_fetch_emits_prices_refreshed() -> None:
     rest = FakeFuturesRest({"BTCUSD": 50_000.0})
@@ -88,7 +101,25 @@ async def test_untrack_clears_cached_price() -> None:
     service.track("BTCUSD")
     await service.refresh_once(now_ms=1_000)
     service.untrack("BTCUSD")
+    await service.refresh_once(now_ms=2_000)
     assert service.get_price("BTCUSD") is None
+
+
+@pytest.mark.asyncio
+async def test_untrack_during_refresh_does_not_resurrect_price() -> None:
+    rest = BlockingFuturesRest({"BTCUSD": 50_000.0})
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    service = MarketDataService(rest, queue)  # type: ignore[arg-type]
+    service.track("BTCUSD")
+
+    refresh = asyncio.create_task(service.refresh_once(now_ms=1_000))
+    await asyncio.wait_for(rest.started.wait(), timeout=1.0)
+    service.untrack("BTCUSD")
+    rest.release.set()
+    await asyncio.wait_for(refresh, timeout=1.0)
+
+    assert service.get_price("BTCUSD") is None
+    assert queue.empty()
 
 
 @pytest.mark.asyncio

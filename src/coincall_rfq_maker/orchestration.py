@@ -8,6 +8,10 @@ pure `domain/rfq.py` state machine would give it I/O side effects; cramming
 it into `cli.py` would blow past a readable file size. It lives here
 instead, as the single-writer owner of RFQ state and the glue between
 pricing, risk, and the quote lifecycle actor.
+
+Event handling is deliberately serial: a slow REST call delays other queued
+events for its duration. That is the accepted tradeoff at this quoting cadence
+because it makes interleaving races structurally impossible.
 """
 
 import logging
@@ -19,6 +23,8 @@ from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
 from coincall_rfq_maker.events import (
     PricesRefreshed,
     QuoteUpdated,
+    ReconcileTick,
+    RepriceTick,
     RfqReceived,
     RfqTerminated,
     TradeExecuted,
@@ -32,7 +38,15 @@ from coincall_rfq_maker.risk.gate import RiskGate
 
 logger = logging.getLogger(__name__)
 
-DispatchEvent = RfqReceived | RfqTerminated | QuoteUpdated | TradeExecuted | PricesRefreshed
+DispatchEvent = (
+    RfqReceived
+    | RfqTerminated
+    | QuoteUpdated
+    | TradeExecuted
+    | PricesRefreshed
+    | RepriceTick
+    | ReconcileTick
+)
 
 
 class RfqStore:
@@ -56,6 +70,9 @@ class RfqStore:
 
     def active(self) -> list[Rfq]:
         return [rfq for rfq in self._rfqs.values() if not rfq.is_terminal_status]
+
+    def terminal(self) -> list[Rfq]:
+        return [rfq for rfq in self._rfqs.values() if rfq.is_terminal_status]
 
     def active_for_underlying(self, underlying: str) -> list[Rfq]:
         matches = []
@@ -95,6 +112,20 @@ class RfqStore:
                 orphaned.add(name)
         return orphaned
 
+    def evict(self, request_id: str) -> None:
+        rfq = self._rfqs.pop(request_id, None)
+        if rfq is None:
+            return
+        for name in rfq.instrument_names():
+            holders = self._instrument_holders.get(name)
+            if holders is None:
+                continue
+            holders.discard(request_id)
+            if holders:
+                self._instrument_holders[name] = holders
+            else:
+                del self._instrument_holders[name]
+
 
 class Orchestrator:
     """Owns the RFQ store and drives price -> risk -> quote for active RFQs."""
@@ -128,6 +159,10 @@ class Orchestrator:
                 await self._handle_trade(event)
             case PricesRefreshed():
                 await self._handle_prices_refreshed(event)
+            case RepriceTick():
+                await self.reprice_all_active()
+            case ReconcileTick():
+                await self.reconcile_with_exchange()
 
     async def _handle_rfq_received(self, rfq: Rfq) -> None:
         self.rfq_store.upsert(rfq)
@@ -146,26 +181,49 @@ class Orchestrator:
         now_ms = _now_ms()
         updated = self.rfq_store.mark_terminal(event.request_id, event.status, now_ms)
         if updated is None:
+            logger.debug("RFQ termination for unknown or evicted RFQ %s ignored", event.request_id)
             return
+        settled = await self._settle_terminal_quote(event.request_id)
+        if self._persistence is not None:
+            await self._persistence.record_rfq(updated, now_ms)
+        if not settled:
+            return
+        self._cleanup_and_evict_terminal_rfq(event.request_id)
+
+    async def _settle_terminal_quote(self, request_id: str) -> bool:
         try:
-            await self._quotes.cancel_for_rfq(event.request_id)
+            await self._quotes.cancel_for_rfq(request_id)
         except CoincallError:
-            logger.exception("REST error cancelling quote for RFQ %s", event.request_id)
+            logger.exception("REST error cancelling quote for RFQ %s", request_id)
             if self._record_ambiguous_quote_failures() == 0:
                 self._risk_gate.record_api_failure()
+            return False
         else:
             self._record_ambiguous_quote_failures()
-        for instrument_name in self.rfq_store.orphaned_instruments(event.request_id):
+        return not self._quotes.has_open_or_pending_quote_for_rfq(request_id)
+
+    def _cleanup_and_evict_terminal_rfq(self, request_id: str) -> None:
+        for instrument_name in self.rfq_store.orphaned_instruments(request_id):
             try:
                 underlying = parse_instrument(instrument_name).underlying
             except InstrumentParseError:
                 continue
             if not self.rfq_store.active_for_underlying(underlying):
                 self._market_data.untrack(underlying)
-        if self._persistence is not None:
-            await self._persistence.record_rfq(updated, now_ms)
+        self.rfq_store.evict(request_id)
 
     async def _handle_quote_updated(self, event: QuoteUpdated) -> None:
+        if (
+            event.request_id
+            and self.rfq_store.get(event.request_id) is None
+            and self._quotes.get_by_quote_id(event.quote_id) is None
+        ):
+            logger.debug(
+                "Quote update for unknown quote on evicted RFQ %s ignored (quote=%s)",
+                event.request_id,
+                event.quote_id,
+            )
+            return
         updated = self._quotes.apply_ws_update(event)
         if updated is not None and self._persistence is not None:
             await self._persistence.record_quote(updated, None, _now_ms())
@@ -264,6 +322,13 @@ class Orchestrator:
                     rfq.request_id,
                 )
                 await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, RfqStatus.EXPIRED))
+        for rfq in self.rfq_store.terminal():
+            if self._quotes.has_open_or_pending_quote_for_rfq(rfq.request_id):
+                logger.info(
+                    "Reconciler: retrying terminal cleanup for RFQ %s",
+                    rfq.request_id,
+                )
+                await self._handle_rfq_terminated(RfqTerminated(rfq.request_id, rfq.status))
 
     def _record_ambiguous_quote_failures(self) -> int:
         count = self._quotes.consume_ambiguous_transport_failures()

@@ -7,11 +7,13 @@ from coincall_rfq_maker.adapters.rest import (
     CoincallApiError,
     CoincallRequestError,
 )
-from coincall_rfq_maker.domain.quote import QuoteStage
+from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
+from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
 from coincall_rfq_maker.orchestration import Orchestrator
 from coincall_rfq_maker.pricing.engine import LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.risk.gate import RiskDecision, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
@@ -89,8 +91,30 @@ class FakeQuoteLifecycle:
             raise self.reconcile_error
         return object()
 
+    def get_by_quote_id(self, quote_id: str) -> None:
+        return None
+
+    def apply_ws_update(self, event: QuoteUpdated) -> None:
+        return None
+
+    def has_open_or_pending_quote_for_rfq(self, request_id: str) -> bool:
+        return False
+
     def consume_ambiguous_transport_failures(self) -> int:
         return 0
+
+
+class RecordingPersistence:
+    def __init__(self) -> None:
+        self.quotes: list[Quote] = []
+
+    async def record_rfq(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    async def record_quote(
+        self, quote: Quote, market_snapshot: dict[str, float] | None, now_ms: int
+    ) -> None:
+        self.quotes.append(quote)
 
 
 class FakePricingModel:
@@ -125,6 +149,13 @@ def make_rfq(request_id: str) -> Rfq:
     )
 
 
+def make_intent(request_id: str = "rfq-1", price: float = 100.0) -> QuoteIntent:
+    return QuoteIntent(
+        request_id=request_id,
+        legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=price),),
+    )
+
+
 @pytest.mark.asyncio
 async def test_reconciler_marks_locally_active_rfq_terminal_when_exchange_disagrees() -> None:
     rest = FakeRest(open_request_ids=["rfq-1"])  # exchange only knows about rfq-1
@@ -143,10 +174,7 @@ async def test_reconciler_marks_locally_active_rfq_terminal_when_exchange_disagr
     await orchestrator.reconcile_with_exchange()
 
     assert orchestrator.rfq_store.get("rfq-1").is_terminal_status is False  # type: ignore[union-attr]
-    rfq_2 = orchestrator.rfq_store.get("rfq-2")
-    assert rfq_2 is not None
-    assert rfq_2.is_terminal_status
-    assert rfq_2.status is RfqStatus.EXPIRED
+    assert orchestrator.rfq_store.get("rfq-2") is None
     assert quotes.cancelled_for == ["rfq-2"]
 
 
@@ -290,3 +318,141 @@ async def test_reconciler_records_request_error_without_raising() -> None:
     await orchestrator.reconcile_with_exchange()
 
     assert risk_gate.kill_switch_tripped
+
+
+@pytest.mark.asyncio
+async def test_reprice_tick_dispatch_reprices_active_rfqs() -> None:
+    rest = FakeRest()
+    market_data = FakeMarketData(price=50_000.0)
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.handle_event(RepriceTick())
+
+    assert quotes.reconcile_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tick_dispatch_reconciles_exchange_state() -> None:
+    rest = FakeRest(open_request_ids=[])
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.handle_event(ReconcileTick())
+
+    assert orchestrator.rfq_store.get("rfq-1") is None
+    assert quotes.cancelled_for == ["rfq-1"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evicted() -> None:
+    rest = FakeRest(open_request_ids=[])
+    market_data = FakeMarketData(price=50_000.0)
+    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    await orchestrator.reprice_all_active()
+    quote = quotes.get_for_rfq("rfq-1")
+    assert quote is not None
+    assert quote.quote_id is not None
+
+    rest.cancel_error = CoincallApiError(500, None, "cancel failed")
+    await orchestrator.handle_event(RfqTerminated("rfq-1", RfqStatus.CANCELLED))
+
+    retained = orchestrator.rfq_store.get("rfq-1")
+    current = quotes.get_for_rfq("rfq-1")
+    assert retained is not None
+    assert retained.is_terminal_status
+    assert current is not None
+    assert current.stage is QuoteStage.OPEN
+    assert rest.cancel_calls == [quote.quote_id]
+
+    rest.cancel_error = None
+    await orchestrator.handle_event(ReconcileTick())
+
+    assert orchestrator.rfq_store.get("rfq-1") is None
+    assert quotes.get_for_rfq("rfq-1").stage is QuoteStage.CANCELLED  # type: ignore[union-attr]
+    assert rest.cancel_calls == [quote.quote_id, quote.quote_id]
+
+
+@pytest.mark.asyncio
+async def test_quote_update_for_evicted_rfq_updates_known_quote_and_is_persisted() -> None:
+    rest = FakeRest()
+    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    persistence = RecordingPersistence()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+        persistence=persistence,  # type: ignore[arg-type]
+    )
+    quote = await quotes.reconcile(make_intent())
+    assert quote.quote_id is not None
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    orchestrator.rfq_store.evict("rfq-1")
+
+    await orchestrator.handle_event(
+        QuoteUpdated(
+            quote_id=quote.quote_id,
+            request_id="rfq-1",
+            stage=QuoteStage.FILLED,
+            filled_price=101.0,
+            filled_quantity=1.0,
+            fill_time_ms=123456,
+            block_trade_id="bt-1",
+        )
+    )
+
+    updated = quotes.get_by_quote_id(quote.quote_id)
+    assert updated is not None
+    assert updated.stage is QuoteStage.FILLED
+    assert updated.filled_price == 101.0
+    assert updated.filled_quantity == 1.0
+    assert updated.fill_time_ms == 123456
+    assert updated.block_trade_id == "bt-1"
+    assert persistence.quotes == [updated]
+
+
+@pytest.mark.asyncio
+async def test_terminal_rfq_is_evicted_and_late_events_are_ignored() -> None:
+    rest = FakeRest()
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.handle_event(RfqTerminated("rfq-1", RfqStatus.CANCELLED))
+    await orchestrator.handle_event(
+        QuoteUpdated(quote_id="q-late", request_id="rfq-1", stage=QuoteStage.CANCELLED)
+    )
+    await orchestrator.handle_event(RfqTerminated("rfq-1", RfqStatus.CANCELLED))
+
+    assert orchestrator.rfq_store.get("rfq-1") is None
+    assert quotes.cancelled_for == ["rfq-1"]

@@ -48,6 +48,12 @@ class QuoteLifecycle:
     def get_by_quote_id(self, quote_id: str) -> Quote | None:
         return self._by_quote_id.get(quote_id)
 
+    def has_open_or_pending_quote_for_rfq(self, request_id: str) -> bool:
+        quote = self._by_request.get(request_id)
+        if quote is None or quote.is_terminal:
+            return False
+        return not (self._dry_run and quote.stage is QuoteStage.PENDING_CREATE)
+
     def consume_ambiguous_transport_failures(self) -> int:
         count = self._ambiguous_transport_failures
         self._ambiguous_transport_failures = 0

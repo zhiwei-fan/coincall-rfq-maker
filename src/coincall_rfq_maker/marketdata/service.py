@@ -1,10 +1,12 @@
 """Underlying price cache actor.
 
-Single-writer owner of the price cache: `refresh_once` is the only place
-prices are mutated. Emits `PricesRefreshed` when a tracked underlying moves
-past `price_move_threshold` or `force_refresh_seconds` has elapsed since the
-last emission for it — behavior salvaged from the old `main.py` design notes
-("Refresh all pricing on every 0.1% move, or 2 minutes elapsed").
+Single-writer owner of the tracked-underlying set and price cache: `track`
+and `untrack` only enqueue commands, and the service run loop drains those
+commands before mutating `_tracked`, `_prices`, or related bookkeeping. Emits
+`PricesRefreshed` when a tracked underlying moves past `price_move_threshold`
+or `force_refresh_seconds` has elapsed since the last emission for it —
+behavior salvaged from the old `main.py` design notes ("Refresh all pricing
+on every 0.1% move, or 2 minutes elapsed").
 """
 
 import asyncio
@@ -27,6 +29,19 @@ class PriceSnapshot:
     fetched_at_ms: int
 
 
+@dataclass(frozen=True, slots=True)
+class _TrackUnderlying:
+    underlying: str
+
+
+@dataclass(frozen=True, slots=True)
+class _UntrackUnderlying:
+    underlying: str
+
+
+_Command = _TrackUnderlying | _UntrackUnderlying
+
+
 class MarketDataService:
     """Fetches and caches underlying index/mark prices for tracked instruments."""
 
@@ -44,14 +59,13 @@ class MarketDataService:
         self._prices: dict[str, PriceSnapshot] = {}
         self._tracked: set[str] = set()
         self._last_emitted_ms: dict[str, int] = {}
+        self._commands: asyncio.Queue[_Command] = asyncio.Queue()
 
     def track(self, underlying: str) -> None:
-        self._tracked.add(underlying)
+        self._commands.put_nowait(_TrackUnderlying(underlying))
 
     def untrack(self, underlying: str) -> None:
-        self._tracked.discard(underlying)
-        self._prices.pop(underlying, None)
-        self._last_emitted_ms.pop(underlying, None)
+        self._commands.put_nowait(_UntrackUnderlying(underlying))
 
     def get_price(self, underlying: str) -> float | None:
         snapshot = self._prices.get(underlying)
@@ -67,16 +81,24 @@ class MarketDataService:
 
     async def refresh_once(self, now_ms: int | None = None) -> None:
         """Fetch prices for all tracked underlyings; emit PricesRefreshed for movers."""
+        self._drain_commands()
         if not self._tracked:
             return
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         moved: list[str] = []
 
-        for underlying in list(self._tracked):
+        for underlying in tuple(self._tracked):
+            if underlying not in self._tracked:
+                continue
             try:
                 response = await self._rest.get_symbol_info(underlying)
             except Exception:
                 logger.exception("Failed to fetch symbol info for %s", underlying)
+                self._drain_commands()
+                continue
+
+            self._drain_commands()
+            if underlying not in self._tracked:
                 continue
 
             info = SymbolInfoPayload.model_validate(response.get("data") or {})
@@ -99,6 +121,9 @@ class MarketDataService:
                 moved.append(underlying)
 
         if moved:
+            self._drain_commands()
+            moved = [underlying for underlying in moved if underlying in self._tracked]
+        if moved:
             for underlying in moved:
                 self._last_emitted_ms[underlying] = now_ms
             await self._queue.put(PricesRefreshed(underlyings=tuple(moved), timestamp_ms=now_ms))
@@ -113,3 +138,20 @@ class MarketDataService:
                 return
             except TimeoutError:
                 continue
+
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                match command:
+                    case _TrackUnderlying(underlying=underlying):
+                        self._tracked.add(underlying)
+                    case _UntrackUnderlying(underlying=underlying):
+                        self._tracked.discard(underlying)
+                        self._prices.pop(underlying, None)
+                        self._last_emitted_ms.pop(underlying, None)
+            finally:
+                self._commands.task_done()

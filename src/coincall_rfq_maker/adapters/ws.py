@@ -206,4 +206,8 @@ class CoincallWsClient:
                 text = raw.decode() if isinstance(raw, bytes) else raw
                 event = parse_ws_message(text)
                 if event is not None:
-                    await self._queue.put(event)
+                    try:
+                        await self._queue.put(event)
+                    except asyncio.QueueShutDown:
+                        logger.debug("WS event queue shut down; exiting read loop")
+                        return

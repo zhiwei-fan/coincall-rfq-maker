@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from coincall_rfq_maker.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.adapters.ws import CoincallWsClient
+from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
 from coincall_rfq_maker.orchestration import Orchestrator
@@ -79,7 +80,7 @@ async def _shutdown_queue_on_signal(
 
 
 async def _quote_refresh_loop(
-    orchestrator: Orchestrator, shutdown: asyncio.Event, interval_seconds: float
+    events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
     while not shutdown.is_set():
         try:
@@ -87,11 +88,14 @@ async def _quote_refresh_loop(
                 await shutdown.wait()
             return
         except TimeoutError:
-            await orchestrator.reprice_all_active()
+            try:
+                await events.put(RepriceTick())
+            except asyncio.QueueShutDown:
+                return
 
 
 async def _reconcile_loop(
-    orchestrator: Orchestrator, shutdown: asyncio.Event, interval_seconds: float
+    events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
     while not shutdown.is_set():
         try:
@@ -99,7 +103,10 @@ async def _reconcile_loop(
                 await shutdown.wait()
             return
         except TimeoutError:
-            await orchestrator.reconcile_with_exchange()
+            try:
+                await events.put(ReconcileTick())
+            except asyncio.QueueShutDown:
+                return
 
 
 def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
@@ -157,11 +164,11 @@ async def run_async(settings: Settings) -> None:
                 tg.create_task(_dispatch_loop(events, orchestrator), name="dispatcher")
                 tg.create_task(_shutdown_queue_on_signal(shutdown, events), name="queue-shutdown")
                 tg.create_task(
-                    _quote_refresh_loop(orchestrator, shutdown, settings.quote_refresh_seconds),
+                    _quote_refresh_loop(events, shutdown, settings.quote_refresh_seconds),
                     name="quote-refresh",
                 )
                 tg.create_task(
-                    _reconcile_loop(orchestrator, shutdown, RECONCILE_INTERVAL_SECONDS),
+                    _reconcile_loop(events, shutdown, RECONCILE_INTERVAL_SECONDS),
                     name="reconciler",
                 )
         except* Exception as eg:

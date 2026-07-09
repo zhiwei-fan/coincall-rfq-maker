@@ -1,6 +1,12 @@
+import asyncio
 import json
+from types import TracebackType
+from typing import Any, Self
 
-from coincall_rfq_maker.adapters.ws import parse_ws_message
+import pytest
+
+from coincall_rfq_maker.adapters import ws
+from coincall_rfq_maker.adapters.ws import CoincallWsClient, parse_ws_message
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
@@ -95,3 +101,48 @@ def test_heartbeat_ignored() -> None:
 
 def test_non_json_message_ignored() -> None:
     assert parse_ws_message("not json{{{") is None
+
+
+class ShutdownQueue:
+    async def put(self, event: object) -> None:
+        raise asyncio.QueueShutDown
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.recv_calls = 0
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def send(self, message: str) -> None:
+        pass
+
+    async def recv(self) -> str:
+        self.recv_calls += 1
+        return json.dumps({"dt": 28, "d": {"requestId": "rfq-1", "state": "CANCELLED"}})
+
+
+@pytest.mark.asyncio
+async def test_queue_shutdown_while_putting_event_exits_read_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection()
+
+    async def fake_connect(*args: Any, **kwargs: Any) -> FakeConnection:
+        return connection
+
+    monkeypatch.setattr(ws.websockets, "connect", fake_connect)
+    client = CoincallWsClient("wss://example.test/ws", "key", "secret", ShutdownQueue())  # type: ignore[arg-type]
+
+    await client._connect_and_read(asyncio.Event())
+
+    assert connection.recv_calls == 1

@@ -54,3 +54,13 @@ class PricesRefreshed:
 
     underlyings: tuple[str, ...]
     timestamp_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class RepriceTick:
+    """The quote-refresh timer fired."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileTick:
+    """The exchange-reconciliation timer fired."""
