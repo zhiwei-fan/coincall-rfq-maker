@@ -71,17 +71,28 @@ uv run rfq-maker --dry-run  # explicit dry-run
 uv run rfq-maker --no-dry-run  # actually submit quotes (use with care)
 ```
 
-## Maker vs taker harness
+## Maker vs taker
 
 `rfq-maker` is the product: it receives RFQs, prices them, submits maker
-quotes, requotes on price moves, and records fills. `rfq-taker` is a supported
-test harness that drives those paths end to end against an in-process fake
-exchange. Live taker REST endpoints are not wired yet.
+quotes, requotes on price moves, and records fills. `rfq-taker` is a **live
+trading CLI** for a separate taker account — its `execute` and `trade`
+commands place **REAL block trades** against the configured Coincall host.
+It is not a simulator: the in-process fake exchange used by the test suite
+lives in `coincall_rfq_maker.testing` and is only reachable from tests.
+
+Safety rails on `rfq-taker`: it requires its own `TAKER_API_KEY` /
+`TAKER_API_SECRET` (it never falls back to the maker credentials), refuses a
+non-beta REST host unless `--allow-prod` is passed, and `execute`/`trade`
+require a typed confirmation unless `--yes` (a hard notional cap applies
+either way).
 
 ```sh
-uv run rfq-taker --scenario all
-uv run rfq-taker --scenario taker_executes
-uv run rfq-taker --live  # exits until Coincall taker endpoints/keys are available
+uv run rfq-taker instruments --base BTC --active-only
+uv run rfq-taker create-rfq --leg BTCUSD-9JUL26-56000-C:BUY:0.2
+uv run rfq-taker quotes --request-id <id>
+uv run rfq-taker cancel-rfq --request-id <id>
+uv run rfq-taker execute --request-id <id> --quote-id <id>   # REAL block trade
+uv run rfq-taker trade --leg <SYMBOL:SIDE:QTY>               # create, watch, confirm & execute
 ```
 
 ## Testing
