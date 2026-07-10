@@ -18,7 +18,8 @@ def test_blank_api_key_rejected() -> None:
         MakerSettings(_env_file=None, API_KEY="   ", API_SECRET="secret")  # type: ignore[call-arg]
 
 
-def test_valid_settings_apply_defaults() -> None:
+def test_valid_settings_apply_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LOG_FILE", raising=False)
     settings = MakerSettings(_env_file=None, API_KEY="key", API_SECRET="secret")  # type: ignore[call-arg]
     assert settings.credentials().api_key == "key"
     assert settings.credentials().api_secret.get_secret_value() == "secret"
@@ -40,6 +41,15 @@ def test_valid_settings_apply_defaults() -> None:
     assert settings.risk_free_rate == 0.05
     assert settings.stale_market_data_seconds == 30.0
     assert settings.db_path == "rfq_maker.db"
+    assert settings.log_file == "rfq_maker.log"
+
+
+def test_log_file_reads_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOG_FILE", "/tmp/test-rfq-maker.log")
+
+    settings = MakerSettings(_env_file=None, API_KEY="key", API_SECRET="secret")  # type: ignore[call-arg]
+
+    assert settings.log_file == "/tmp/test-rfq-maker.log"
 
 
 def test_dry_run_defaults_true_even_when_other_fields_overridden() -> None:

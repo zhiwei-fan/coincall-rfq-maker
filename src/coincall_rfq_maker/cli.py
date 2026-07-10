@@ -184,7 +184,7 @@ def _all_shutdown_race_failures(exceptions: Sequence[BaseException]) -> bool:
 
 
 async def run_async(settings: MakerSettings) -> None:
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_file)
     logger.info("Starting rfq-maker (dry_run=%s)", settings.dry_run)
 
     shutdown = asyncio.Event()

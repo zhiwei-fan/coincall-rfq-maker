@@ -37,6 +37,7 @@ class MakerSettings(CoincallClientSettings):
 
     db_path: str = Field(default="rfq_maker.db", alias="DB_PATH")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_file: str = Field(default="rfq_maker.log", alias="LOG_FILE")
 
     @field_validator("api_key")
     @classmethod

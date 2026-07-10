@@ -1,4 +1,6 @@
 import asyncio
+import logging.handlers
+from pathlib import Path
 from types import TracebackType
 from typing import Any, ClassVar, Self
 
@@ -170,6 +172,36 @@ async def test_startup_cancel_all_failure_exits_cleanly(
     assert capsys.readouterr().err == (
         "Startup error: failed to cancel all quotes: cancel-all unavailable\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_async_uses_settings_log_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    log_file = tmp_path / "configured.log"
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+        LOG_FILE=str(log_file),
+    )
+
+    await cli.run_async(settings)
+
+    file_handlers = [
+        handler
+        for handler in logging.getLogger().handlers
+        if isinstance(handler, logging.handlers.RotatingFileHandler)
+    ]
+    assert len(file_handlers) == 1
+    assert Path(file_handlers[0].baseFilename) == log_file
 
 
 @pytest.mark.asyncio

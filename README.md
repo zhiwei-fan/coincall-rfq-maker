@@ -61,6 +61,7 @@ The taker never falls back to the maker key.
 | `RISK_FREE_RATE` | `0.05` | Black-Scholes risk-free rate |
 | `DB_PATH` | `rfq_maker.db` | SQLite audit database path |
 | `LOG_LEVEL` | `INFO` | Root log level |
+| `LOG_FILE` | `rfq_maker.log` | Log file path |
 
 ## Running
 
