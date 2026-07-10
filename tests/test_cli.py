@@ -7,7 +7,10 @@ from typing import Any, ClassVar, Self
 import pytest
 
 from coincall_rfq_maker import cli
-from coincall_rfq_maker.core.adapters.rest import CoincallRequestError
+from coincall_rfq_maker.core.adapters.rest import (
+    CoincallConnectivityError,
+    CoincallRequestError,
+)
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.settings import MakerSettings
 
@@ -67,6 +70,31 @@ class RecordingQuoteLifecycle:
             raise type(self).cancel_all_exception
         if type(self).fail_on_cancel_all:
             raise CoincallRequestError("shutdown cancel-all unavailable")
+
+
+class FlakyFlattenQuoteLifecycle:
+    def __init__(self) -> None:
+        self.cancel_all_calls = 0
+
+    async def cancel_all(self) -> None:
+        self.cancel_all_calls += 1
+        if self.cancel_all_calls <= 2:
+            raise CoincallConnectivityError("cancel-all temporarily unavailable")
+
+
+class ShutdownAfterFailedFlattenQuoteLifecycle:
+    def __init__(self, shutdown: asyncio.Event) -> None:
+        self.shutdown = shutdown
+        self.cancel_all_calls = 0
+
+    async def cancel_all(self) -> None:
+        self.cancel_all_calls += 1
+        self.shutdown.set()
+        raise CoincallConnectivityError("cancel-all temporarily unavailable")
+
+
+class FakeRiskGate:
+    consecutive_failures = 3
 
 
 class SignalShutdownWsClient:
@@ -344,6 +372,74 @@ async def test_shutdown_cancel_all_non_coincall_failure_exits_cleanly(
 
 
 @pytest.mark.asyncio
+async def test_kill_switch_flatten_retries_until_cancel_all_succeeds(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(cli, "_FLATTEN_RETRY_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(cli, "_FLATTEN_RETRY_CAP_SECONDS", 0.001)
+    trip_event = asyncio.Event()
+    shutdown = asyncio.Event()
+    quote_lifecycle = FlakyFlattenQuoteLifecycle()
+    trip_event.set()
+
+    with caplog.at_level(logging.ERROR):
+        async with asyncio.timeout(1.0):
+            await cli._flatten_on_kill_switch(
+                trip_event,
+                shutdown,
+                quote_lifecycle,  # type: ignore[arg-type]
+                FakeRiskGate(),  # type: ignore[arg-type]
+            )
+
+    assert quote_lifecycle.cancel_all_calls == 3
+    assert (
+        "Kill-switch flatten completed after 3 consecutive API failures (attempt 3)" in caplog.text
+    )
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_flatten_stops_retrying_when_shutdown_is_set(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(cli, "_FLATTEN_RETRY_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(cli, "_FLATTEN_RETRY_CAP_SECONDS", 0.001)
+    trip_event = asyncio.Event()
+    shutdown = asyncio.Event()
+    quote_lifecycle = ShutdownAfterFailedFlattenQuoteLifecycle(shutdown)
+    trip_event.set()
+
+    with caplog.at_level(logging.ERROR):
+        async with asyncio.timeout(1.0):
+            await cli._flatten_on_kill_switch(
+                trip_event,
+                shutdown,
+                quote_lifecycle,  # type: ignore[arg-type]
+                FakeRiskGate(),  # type: ignore[arg-type]
+            )
+
+    assert quote_lifecycle.cancel_all_calls == 1
+    assert "Kill-switch flatten retry loop stopping for shutdown" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_flatten_does_not_cancel_without_a_trip() -> None:
+    trip_event = asyncio.Event()
+    shutdown = asyncio.Event()
+    quote_lifecycle = FlakyFlattenQuoteLifecycle()
+    shutdown.set()
+
+    async with asyncio.timeout(1.0):
+        await cli._flatten_on_kill_switch(
+            trip_event,
+            shutdown,
+            quote_lifecycle,  # type: ignore[arg-type]
+            FakeRiskGate(),  # type: ignore[arg-type]
+        )
+
+    assert quote_lifecycle.cancel_all_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_quote_refresh_loop_enqueues_reprice_tick() -> None:
     queue: asyncio.Queue[object] = asyncio.Queue()
     shutdown = asyncio.Event()
@@ -418,3 +514,13 @@ async def test_dispatch_loop_logs_bad_event_and_processes_next() -> None:
     await asyncio.wait_for(task, timeout=1.0)
 
     assert orchestrator.events == [first, second]
+
+
+def test_flatten_retry_delay_backs_off_and_stays_capped() -> None:
+    # Retries are unbounded, so an uncapped delay would double forever: attempt 20 would
+    # wait ~6 days before trying to cancel the live quotes of a halted process.
+    assert cli._flatten_retry_delay(1) == cli._FLATTEN_RETRY_INITIAL_SECONDS
+    assert cli._flatten_retry_delay(2) == 2 * cli._FLATTEN_RETRY_INITIAL_SECONDS
+    assert cli._flatten_retry_delay(3) == 4 * cli._FLATTEN_RETRY_INITIAL_SECONDS
+    assert cli._flatten_retry_delay(20) == cli._FLATTEN_RETRY_CAP_SECONDS
+    assert cli._flatten_retry_delay(200) == cli._FLATTEN_RETRY_CAP_SECONDS

@@ -30,6 +30,8 @@ from coincall_rfq_maker.ws import CoincallWsClient
 logger = logging.getLogger(__name__)
 
 RECONCILE_INTERVAL_SECONDS = 60.0
+_FLATTEN_RETRY_INITIAL_SECONDS = 1.0
+_FLATTEN_RETRY_CAP_SECONDS = 30.0
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -137,6 +139,15 @@ async def _cancel_all_on_graceful_stop(quote_lifecycle: QuoteLifecycle) -> None:
         )
 
 
+def _flatten_retry_delay(attempt: int) -> float:
+    """Exponential backoff for flatten retries, capped.
+
+    The cap matters: retries are unbounded, so without it the delay doubles without limit and a
+    tripped process would eventually wait hours between attempts to cancel its live quotes.
+    """
+    return min(_FLATTEN_RETRY_CAP_SECONDS, _FLATTEN_RETRY_INITIAL_SECONDS * 2 ** (attempt - 1))
+
+
 async def _flatten_on_kill_switch(
     trip_event: asyncio.Event,
     shutdown: asyncio.Event,
@@ -158,20 +169,44 @@ async def _flatten_on_kill_switch(
 
     failure_count = risk_gate.consecutive_failures
     logger.error("Kill-switch flatten starting after %d consecutive API failures", failure_count)
-    try:
-        await quote_lifecycle.cancel_all()
-    except Exception as exc:
-        logger.error(
-            "Kill-switch flatten FAILED after %d consecutive API failures; quotes may remain "
-            "live on the exchange: %s",
-            failure_count,
-            exc,
-            exc_info=exc,
-        )
-    else:
-        logger.error(
-            "Kill-switch flatten completed after %d consecutive API failures", failure_count
-        )
+    # Invariant: a tripped process must never idle with live quotes on the exchange while a
+    # retryable flatten is still available.
+    # Retries are unbounded: once halted, flattening is the only useful work left.
+    attempt = 1
+    while True:
+        try:
+            await quote_lifecycle.cancel_all()
+        except Exception as exc:
+            delay = _flatten_retry_delay(attempt)
+            logger.error(
+                "KILL-SWITCH FLATTEN attempt %d FAILED; retrying in %.0fs; "
+                "quotes may remain live: %s",
+                attempt,
+                delay,
+                exc,
+                exc_info=exc,
+            )
+            try:
+                async with asyncio.timeout(delay):
+                    await shutdown.wait()
+            except TimeoutError:
+                pass
+
+            if shutdown.is_set():
+                logger.error(
+                    "Kill-switch flatten retry loop stopping for shutdown; "
+                    "graceful-stop cancel-all takes over"
+                )
+                return
+
+            attempt += 1
+        else:
+            logger.error(
+                "Kill-switch flatten completed after %d consecutive API failures (attempt %d)",
+                failure_count,
+                attempt,
+            )
+            return
 
 
 def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
