@@ -54,6 +54,24 @@ def _quote(
     )
 
 
+def _quote_without_state() -> QuotePayload:
+    return QuotePayload.model_validate(
+        {
+            "quoteId": QUOTE_ID,
+            "requestId": REQUEST_ID,
+            "createTime": 1000,
+            "legs": [
+                {
+                    "instrumentName": INSTRUMENT_NAME,
+                    "side": "SELL",
+                    "price": "0.05",
+                    "quantity": "0.2",
+                }
+            ],
+        }
+    )
+
+
 def _exec_result() -> ExecuteQuoteResult:
     return ExecuteQuoteResult.model_validate(
         {
@@ -175,13 +193,49 @@ def test_refuses_when_quote_expired(tmp_path: Path) -> None:
 
 def test_refuses_terminal_quote_state_without_executing(tmp_path: Path) -> None:
     audit = AuditLog(tmp_path / "audit.jsonl")
-    rest = FakeRest(quotes=(_quote(state="FILLED"),), execute_result=_exec_result())
+    rest = FakeRest(quotes=(_quote(state="CANCELLED"),), execute_result=_exec_result())
 
     result, out = _run(rest, audit, assume_yes=True)
 
     assert result is execute.ExecuteOutcome.REFUSED
     assert rest.execute_calls == []
-    assert any("non-open quote" in line for line in out)
+    assert any("is CANCELLED;" in line and "non-open quote" in line for line in out)
+    assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "not_open"
+
+
+@pytest.mark.parametrize(
+    ("quote", "executable"),
+    [
+        (_quote(state="OPEN"), True),
+        (_quote(state="CANCELLED"), False),
+        (_quote(state="???"), False),
+        (_quote_without_state(), False),
+    ],
+)
+def test_quote_state_must_be_explicitly_open(quote: QuotePayload, executable: bool) -> None:
+    assert execute._is_executable_quote_state(quote) is executable
+
+
+def test_refuses_unrecognized_quote_state_without_executing(tmp_path: Path) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    rest = FakeRest(quotes=(_quote(state="???"),), execute_result=_exec_result())
+
+    result, out = _run(rest, audit, assume_yes=True)
+
+    assert result is execute.ExecuteOutcome.REFUSED
+    assert rest.execute_calls == []
+    assert any("state '???' is not recognized; refusing" in line for line in out)
+
+
+def test_refuses_defaulted_quote_state_without_executing(tmp_path: Path) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    rest = FakeRest(quotes=(_quote_without_state(),), execute_result=_exec_result())
+
+    result, out = _run(rest, audit, assume_yes=True)
+
+    assert result is execute.ExecuteOutcome.REFUSED
+    assert rest.execute_calls == []
+    assert any("exchange sent no state; refusing" in line for line in out)
     assert _read_audit(tmp_path / "audit.jsonl")[-1]["reason"] == "not_open"
 
 

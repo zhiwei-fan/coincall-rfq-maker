@@ -84,6 +84,25 @@ def _settings(**overrides: Any) -> TakerSettings:
 # -- safety gate ------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://betaapi.coincall.com", True),
+        ("https://betaapi.coincall.com/", True),
+        ("https://BETAAPI.COINCALL.COM/some/path", True),
+        ("https://api.coincall.com", False),
+        ("https://betaapi.coincall.com.evil.example", False),
+        ("https://evil.example/betaapi.coincall.com", False),
+        ("https://betaapi.coincall.com@evil.example", False),
+        ("https://notbetaapi.coincall.com", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_is_beta_host_uses_exact_hostname_allowlist(url: str, expected: bool) -> None:
+    assert cli._is_beta_host(url) is expected
+
+
 def test_missing_taker_creds_hard_fails_with_no_fallback_message(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -120,6 +139,18 @@ def test_non_beta_host_with_allow_prod_builds_client() -> None:
     rest = cli._build_taker_client(settings, allow_prod=True)
 
     assert isinstance(rest, CoincallRestClient)
+
+
+def test_host_lookalike_requires_allow_prod(capsys: pytest.CaptureFixture[str]) -> None:
+    hostile_url = "https://betaapi.coincall.com.evil.example"
+    settings = _settings(REST_BASE_URL=hostile_url)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._build_taker_client(settings, allow_prod=False)
+
+    assert exc_info.value.code == 2
+    assert hostile_url in capsys.readouterr().err
+    assert isinstance(cli._build_taker_client(settings, allow_prod=True), CoincallRestClient)
 
 
 def test_beta_host_with_taker_creds_builds_client() -> None:

@@ -283,6 +283,38 @@ def test_refusal_keeps_loop_alive_then_cancels(tmp_path: Path) -> None:
     ]
 
 
+def test_defaulted_quote_state_refuses_without_accept_and_cancels(tmp_path: Path) -> None:
+    quote = QuotePayload.model_validate(
+        {
+            "quoteId": QUOTE_ID,
+            "requestId": REQUEST_ID,
+            "createTime": 1000,
+            "legs": [
+                {
+                    "instrumentName": INSTRUMENT_NAME,
+                    "side": "SELL",
+                    "price": "0.05",
+                    "quantity": "0.2",
+                }
+            ],
+        }
+    )
+    rest = FakeRest(quotes=(quote,), execute_result=_exec_result())
+    audit = AuditLog(tmp_path / "audit.jsonl")
+
+    _run_trade(rest, audit, input_fn=_inputs("1", "c"), assume_yes=True)
+
+    assert rest.execute_calls == []
+    assert rest.cancelled == [REQUEST_ID]
+    assert [record["action"] for record in _read_audit(tmp_path / "audit.jsonl")] == [
+        "create_attempt",
+        "create_rfq",
+        "execute_refused",
+        "cancel_attempt",
+        "cancel_rfq",
+    ]
+
+
 def test_ambiguous_execution_breaks_loop_and_cancels(tmp_path: Path) -> None:
     rest = FakeRest(quotes=(_quote(),), execute_error=CoincallAmbiguousError("boom"))
     audit = AuditLog(tmp_path / "audit.jsonl")

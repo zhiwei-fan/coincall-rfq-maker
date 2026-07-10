@@ -209,6 +209,13 @@ def _is_terminal_quote_state(state: str) -> bool:
     return stage in {QuoteStage.CANCELLED, QuoteStage.FILLED, QuoteStage.EXPIRED}
 
 
+def _is_executable_quote_state(quote: QuotePayload) -> bool:
+    """Return whether the exchange explicitly reported this quote as open."""
+    if "state" not in quote.model_fields_set:
+        return False
+    return quote_stage_from_wire(quote.state) is QuoteStage.OPEN
+
+
 def _gross_premium(quote: QuotePayload) -> float:
     """Sum of ``abs(price * quantity)`` across legs (taker gross premium).
 
@@ -288,11 +295,19 @@ async def _confirm_and_execute(
             {"requestId": request_id, "quoteId": quote_id, "reason": "expired"},
         )
         return ExecuteOutcome.REFUSED
-    if _is_terminal_quote_state(quote.state):
-        out(
-            f"quote {quote_id} for RFQ {request_id} is {quote.state}; "
-            "refusing to execute a non-open quote"
-        )
+    if not _is_executable_quote_state(quote):
+        if "state" not in quote.model_fields_set:
+            out(f"quote {quote_id} for RFQ {request_id}: exchange sent no state; refusing")
+        elif _is_terminal_quote_state(quote.state):
+            out(
+                f"quote {quote_id} for RFQ {request_id} is {quote.state}; "
+                "refusing to execute a non-open quote"
+            )
+        else:
+            out(
+                f"quote {quote_id} for RFQ {request_id} state {quote.state!r} "
+                "is not recognized; refusing"
+            )
         audit.record(
             "execute_refused",
             {"requestId": request_id, "quoteId": quote_id, "reason": "not_open"},

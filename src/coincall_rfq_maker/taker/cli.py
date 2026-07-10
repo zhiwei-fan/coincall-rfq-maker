@@ -9,7 +9,8 @@ audit log is the orphan-recovery mechanism instead.
 Every networked command goes through a shared safety gate that:
   1. requires dedicated TAKER_API_KEY / TAKER_API_SECRET and NEVER falls back
      to the maker API_KEY / API_SECRET; and
-  2. refuses a non-beta REST host unless the global `--allow-prod` flag is passed.
+  2. refuses any REST host other than the known beta hostname unless the global
+     `--allow-prod` flag is passed.
 """
 
 import argparse
@@ -19,6 +20,7 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
@@ -35,6 +37,8 @@ from coincall_rfq_maker.taker.execute import (
     _now_ms,
 )
 from coincall_rfq_maker.taker.settings import TakerSettings
+
+_BETA_REST_HOSTS = frozenset({"betaapi.coincall.com"})
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -142,14 +146,24 @@ def load_settings_or_exit() -> TakerSettings:
         raise SystemExit(1) from exc
 
 
+def _is_beta_host(url: str) -> bool:
+    """Return whether ``url`` names one of the exact known beta REST hosts."""
+    try:
+        hostname = urlparse(url).hostname
+    except ValueError:
+        return False
+    return hostname is not None and hostname.lower() in _BETA_REST_HOSTS
+
+
 def _build_taker_client(settings: TakerSettings, *, allow_prod: bool) -> CoincallRestClient:
     """Return a REST client built from the TAKER creds, after the safety gates.
 
-    Raises ``SystemExit(2)`` if the REST host is non-beta without ``--allow-prod``.
+    Raises ``SystemExit(2)`` unless the REST host is the known beta hostname or
+    ``--allow-prod`` is passed.
     """
     creds = settings.credentials()
 
-    if "beta" not in settings.rest_base_url.lower() and not allow_prod:
+    if not _is_beta_host(settings.rest_base_url) and not allow_prod:
         sys.stderr.write(
             f"Refusing to run the taker against non-beta host {settings.rest_base_url!r}. "
             "Pass --allow-prod if you really intend to trade on this host.\n"
