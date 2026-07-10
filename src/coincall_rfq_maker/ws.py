@@ -47,7 +47,8 @@ _HEARTBEAT_MESSAGE = json.dumps({"action": "heartbeat"})
 _SIGNED_URL_RE = re.compile(
     r"(?P<prefix>\b(?:wss?|https?)://[^\s'\"<>?]+)\?(?P<query>[^\s'\"<>)]*)"
 )
-_SENSITIVE_QUERY_PARAM_RE = re.compile(r"([?&](?:apiKey|sign|ts)=)[^&\s'\"<>)]*")
+_SENSITIVE_QUERY_PARAM_RE = re.compile(r"([?&](?:apiKey|uuid|sign|ts)=)[^&\s'\"<>)]*")
+_MAX_NON_JSON_FRAME_CHARS = 100
 
 _TERMINAL_RFQ_STATES = {
     RfqStatus.CANCELLED,
@@ -82,13 +83,16 @@ def parse_ws_message(raw: str) -> WsEvent | None:
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Received non-JSON WS message: %.100s", raw)
+        logger.warning(
+            "Received non-JSON WS message: %s",
+            _redact_ws_exception_message(raw)[:_MAX_NON_JSON_FRAME_CHARS],
+        )
         return None
 
     try:
         envelope = WsEnvelope.model_validate(obj)
     except ValidationError as exc:
-        logger.warning("Malformed WS envelope: %s", exc)
+        logger.warning("Malformed WS envelope: %s", _redact_ws_exception_message(exc))
         return None
 
     if envelope.dt is None:
@@ -97,7 +101,7 @@ def parse_ws_message(raw: str) -> WsEvent | None:
         elif envelope.c == 11 and envelope.rc == 1:
             logger.debug("WS heartbeat received")
         else:
-            logger.debug("WS message with no dt/control fields: %s", obj)
+            logger.debug("WS message with no dt/control fields: %s", _render_frame(obj)[0])
         return None
 
     if envelope.dt in _CAPTURED_DT_CODES and logger.isEnabledFor(logging.DEBUG):
@@ -124,7 +128,7 @@ def _parse_rfq_event(data: dict[str, object]) -> RfqReceived | RfqTerminated | N
     try:
         payload = RfqPayload.model_validate(data)
     except ValidationError as exc:
-        logger.warning("Malformed RFQ WS payload: %s", exc)
+        logger.warning("Malformed RFQ WS payload: %s", _redact_ws_exception_message(exc))
         return None
     status = rfq_status_from_wire(payload.state)
     if status is None:
@@ -142,7 +146,9 @@ def _parse_quote_event(data: dict[str, object], dt: int) -> QuoteUpdated | None:
     try:
         payload = QuotePayload.model_validate(data)
     except ValidationError as exc:
-        logger.warning("Malformed quote WS payload (dt=%s): %s", dt, exc)
+        logger.warning(
+            "Malformed quote WS payload (dt=%s): %s", dt, _redact_ws_exception_message(exc)
+        )
         return None
     stage = quote_stage_from_wire(payload.state)
     if stage is None:
@@ -163,7 +169,7 @@ def _parse_trade_event(data: dict[str, object]) -> TradeExecuted | None:
     try:
         payload = BlockTradePayload.model_validate(data)
     except ValidationError as exc:
-        logger.warning("Malformed trade WS payload: %s", exc)
+        logger.warning("Malformed trade WS payload: %s", _redact_ws_exception_message(exc))
         return None
     return TradeExecuted(
         block_trade_id=payload.block_trade_id,
@@ -175,7 +181,7 @@ def _parse_trade_event(data: dict[str, object]) -> TradeExecuted | None:
     )
 
 
-def _redact_ws_exception_message(exc: Exception) -> str:
+def _redact_ws_exception_message(exc: Exception | str) -> str:
     message = str(exc)
 
     def redact_url(match: re.Match[str]) -> str:
@@ -189,7 +195,17 @@ def _redact_ws_exception_message(exc: Exception) -> str:
 
 
 _SENSITIVE_PAYLOAD_KEYS = frozenset(
-    {"apikey", "apisecret", "sign", "signature", "secret", "token", "authorization", "passphrase"}
+    {
+        "apikey",
+        "apisecret",
+        "uuid",
+        "sign",
+        "signature",
+        "secret",
+        "token",
+        "authorization",
+        "passphrase",
+    }
 )
 
 

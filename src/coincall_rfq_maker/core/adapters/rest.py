@@ -134,7 +134,7 @@ def classify_api_failure(exc: CoincallError) -> ApiFailureKind:
     if isinstance(exc, CoincallApiError):
         if exc.code == 10000:
             return ApiFailureKind.TRANSIENT
-        if exc.status == 429 or 500 <= exc.status <= 599:
+        if exc.status in {408, 425, 429} or 500 <= exc.status <= 599:
             return ApiFailureKind.TRANSIENT
     return ApiFailureKind.PERSISTENT
 

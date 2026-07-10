@@ -66,6 +66,12 @@ testpaths = ["tests"]
 root_package = "coincall_rfq_maker"
 
 [[tool.importlinter.contracts]]
+name = "ws is a parser: must not import risk"
+type = "forbidden"
+source_modules = ["coincall_rfq_maker.ws"]
+forbidden_modules = ["coincall_rfq_maker.risk"]
+
+[[tool.importlinter.contracts]]
 name = "core, domain and taker must not import maker-product modules"
 type = "forbidden"
 source_modules = [

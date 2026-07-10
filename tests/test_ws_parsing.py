@@ -172,6 +172,55 @@ def test_sanitizer_redacts_nested_api_key_in_captured_frame(
     assert "<redacted>" in caplog.text
 
 
+def test_uuid_is_redacted_from_query_params_and_payloads() -> None:
+    secret = "uuid-secret"
+
+    assert secret not in ws._redact_ws_exception_message(f"?uuid={secret}&sign=signature-secret")
+    assert ws._sanitize_payload({"uuid": secret}) == {"uuid": "<redacted>"}
+
+
+def test_non_json_message_redacts_sensitive_query_params(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = "bad frame ?uuid=uuid-secret&sign=signature-secret"
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert "uuid-secret" not in caplog.text
+    assert "signature-secret" not in caplog.text
+    assert "uuid=<redacted>" in caplog.text
+    assert "sign=<redacted>" in caplog.text
+
+
+def test_malformed_envelope_error_redacts_sensitive_query_params(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # pydantic v2 embeds input values in the error text; a bad dt carrying a signed
+    # query string must not leak it into the log.
+    raw = json.dumps({"dt": "?uuid=uuid-secret&sign=signature-secret"})
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert "Malformed WS envelope" in caplog.text
+    assert "uuid-secret" not in caplog.text
+    assert "signature-secret" not in caplog.text
+
+
+def test_no_dt_message_logs_sanitized_frame(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = json.dumps({"uuid": "uuid-secret", "other": "value"})
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert "uuid-secret" not in caplog.text
+    assert '"uuid":"<redacted>"' in caplog.text
+    assert "{'uuid': 'uuid-secret'" not in caplog.text
+
+
 def test_captured_frame_over_cap_truncates_message_but_reports_full_length(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -182,6 +182,12 @@ def test_api_failure_classifier_contract() -> None:
     assert classify_api_failure(CoincallApiError(429, None, "rate limited")) is (
         ApiFailureKind.TRANSIENT
     )
+    assert classify_api_failure(CoincallApiError(408, None, "request timeout")) is (
+        ApiFailureKind.TRANSIENT
+    )
+    assert classify_api_failure(CoincallApiError(425, None, "too early")) is (
+        ApiFailureKind.TRANSIENT
+    )
     assert classify_api_failure(CoincallMalformedResponseError("bad json")) is (
         ApiFailureKind.TRANSIENT
     )
@@ -195,6 +201,9 @@ def test_api_failure_classifier_contract() -> None:
         ApiFailureKind.PERSISTENT
     )
     assert classify_api_failure(CoincallApiError(200, 499999, "unknown")) is (
+        ApiFailureKind.PERSISTENT
+    )
+    assert classify_api_failure(CoincallApiError(400, None, "bad request")) is (
         ApiFailureKind.PERSISTENT
     )
     assert classify_api_failure(CoincallRequestError("Session not started")) is (
