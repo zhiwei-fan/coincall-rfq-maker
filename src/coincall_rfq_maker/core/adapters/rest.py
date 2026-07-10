@@ -495,12 +495,20 @@ class CoincallRestClient:
 
 
 def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
-    data = response.get("data") or {}
+    if "data" not in response:
+        raise CoincallMalformedResponseError("Malformed RFQ REST response: missing data")
+    data = response["data"]
     if not isinstance(data, dict):
-        raise CoincallMalformedResponseError("Malformed RFQ REST response data: expected object")
-    raw_items = data.get("rfqList") or []
+        raise CoincallMalformedResponseError(
+            f"Malformed RFQ REST response data: expected object, got {type(data).__name__}"
+        )
+    if "rfqList" not in data:
+        raise CoincallMalformedResponseError("Malformed RFQ REST response data: missing rfqList")
+    raw_items = data["rfqList"]
     if not isinstance(raw_items, list):
-        raise CoincallMalformedResponseError("Malformed RFQ REST response rfqList: expected list")
+        raise CoincallMalformedResponseError(
+            f"Malformed RFQ REST response rfqList: expected list, got {type(raw_items).__name__}"
+        )
     payloads, malformed_request_ids = _validated_rfq_items(raw_items)
     valid_payloads: list[RfqPayload] = []
     for payload in payloads:
@@ -518,27 +526,43 @@ def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
 
 
 def _parse_quote_list(response: dict[str, Any]) -> QuoteListSnapshot:
-    raw_items = response.get("data") or []
+    if "data" not in response:
+        raise CoincallMalformedResponseError("Malformed quote REST response: missing data")
+    raw_items = response["data"]
     if not isinstance(raw_items, list):
-        raise CoincallMalformedResponseError("Malformed quote REST response data: expected list")
+        raise CoincallMalformedResponseError(
+            f"Malformed quote REST response data: expected list, got {type(raw_items).__name__}"
+        )
     payloads, malformed_id_pairs = _validated_quote_items(raw_items)
     return QuoteListSnapshot(tuple(payloads), frozenset(malformed_id_pairs))
 
 
 def _parse_quotes_received(response: dict[str, Any]) -> tuple[QuotePayload, ...]:
-    raw_items = response.get("data") or []
+    if "data" not in response:
+        raise CoincallMalformedResponseError(
+            "Malformed quotes-received REST response: missing data"
+        )
+    raw_items = response["data"]
     if not isinstance(raw_items, list):
-        logger.warning("Malformed quotes-received REST response data: expected list")
-        return ()
+        raise CoincallMalformedResponseError(
+            "Malformed quotes-received REST response data: expected list, "
+            f"got {type(raw_items).__name__}"
+        )
     payloads, _malformed_id_pairs = _validated_quote_items(raw_items)
     return tuple(payloads)
 
 
 def _parse_option_instruments(response: dict[str, Any]) -> tuple[OptionInstrument, ...]:
-    raw_items = response.get("data") or []
+    if "data" not in response:
+        raise CoincallMalformedResponseError(
+            "Malformed option instruments REST response: missing data"
+        )
+    raw_items = response["data"]
     if not isinstance(raw_items, list):
-        logger.warning("Malformed option instruments REST response data: expected list")
-        return ()
+        raise CoincallMalformedResponseError(
+            "Malformed option instruments REST response data: expected list, "
+            f"got {type(raw_items).__name__}"
+        )
     items: list[OptionInstrument] = []
     for item in raw_items:
         if not isinstance(item, dict):

@@ -410,7 +410,7 @@ async def test_reconciler_malformed_rfq_snapshot_expires_nothing_and_records_no_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rest = FakeRest()
-    rest.rfq_list_response = {"code": 0, "data": "not-an-object"}
+    rest.rfq_list_response = {"code": 0, "data": 0}
     quotes = FakeQuoteLifecycle()
     risk_gate = RecordingRiskGate()
     orchestrator = Orchestrator(
@@ -578,7 +578,7 @@ def make_reconciler_risk_gate() -> RiskGate:
     return RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=5,
     )
@@ -1020,7 +1020,7 @@ async def test_persistent_cancel_failure_reverts_open_skips_replacement_and_reco
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
     )
@@ -1334,7 +1334,7 @@ async def test_repeated_persistent_create_failures_trip_and_flatten_promptly() -
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=5,
         on_trip=trip_event.set,
@@ -1414,7 +1414,7 @@ async def test_quiet_book_recovery_comes_from_reconciler_not_noop_reprices(
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=2,
     )
@@ -1495,7 +1495,7 @@ async def test_unresolved_conflicting_create_does_not_set_global_cooldown(
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
     )
@@ -1535,7 +1535,7 @@ async def test_unverified_ambiguous_create_uses_cooldown_without_tripping_kill_s
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
     )
@@ -1618,7 +1618,7 @@ async def test_reconciler_records_request_error_without_raising() -> None:
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
     )
@@ -1697,7 +1697,7 @@ async def test_quote_list_only_persistent_outage_accumulates_to_trip() -> None:
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=5,
     )
@@ -1735,7 +1735,7 @@ async def test_trip_flattens_once_with_stale_market_data_and_open_quote(
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
         on_trip=signal_trip,
@@ -1778,7 +1778,7 @@ async def test_trip_flatten_bypasses_active_outage_cooldown() -> None:
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=1,
         on_trip=trip_event.set,

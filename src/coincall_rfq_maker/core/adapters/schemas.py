@@ -5,10 +5,11 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 """
 
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
@@ -44,6 +45,17 @@ class RfqLegPayload(BaseModel):
     instrument_name: str = Field(alias="instrumentName")
     side: Side
     quantity: str
+
+    @field_validator("quantity")
+    @classmethod
+    def quantity_must_be_finite_and_positive(cls, value: str) -> str:
+        try:
+            quantity = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("quantity must be a finite positive number") from None
+        if not math.isfinite(quantity) or quantity <= 0:
+            raise ValueError("quantity must be a finite positive number")
+        return value
 
 
 class RfqPayload(BaseModel):

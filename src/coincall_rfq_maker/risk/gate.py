@@ -13,6 +13,7 @@ cooldown's business, not the kill switch's.
 """
 
 import logging
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -24,6 +25,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_KILL_SWITCH_THRESHOLD = 5
 KillSwitchTripHandler = Callable[[], None]
+
+
+def _finite_positive(value: str) -> float | None:
+    """Return a value only when it proves to be finite and strictly positive."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _validated_finite_positive_config(name: str, value: float) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be finite and > 0")
+    return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,10 +81,20 @@ class RiskGate:
         exposure_provider: ExposureProvider | None = None,
         on_trip: KillSwitchTripHandler | None = None,
     ) -> None:
-        self._max_notional = max_quote_notional_usd
-        self._max_leg_qty = max_leg_qty
-        self._min_tte_hours = min_time_to_expiry_hours
-        self._stale_seconds = stale_market_data_seconds
+        self._max_notional = _validated_finite_positive_config(
+            "max_quote_notional_usd", max_quote_notional_usd
+        )
+        self._max_leg_qty = _validated_finite_positive_config("max_leg_qty", max_leg_qty)
+        self._min_tte_hours = _validated_finite_positive_config(
+            "min_time_to_expiry_hours", min_time_to_expiry_hours
+        )
+        self._stale_seconds = _validated_finite_positive_config(
+            "stale_market_data_seconds", stale_market_data_seconds
+        )
+        if not isinstance(kill_switch_threshold, int) or isinstance(kill_switch_threshold, bool):
+            raise ValueError("kill_switch_threshold must be an int >= 1")
+        if kill_switch_threshold < 1:
+            raise ValueError("kill_switch_threshold must be an int >= 1")
         self._kill_switch_threshold = kill_switch_threshold
         self._on_trip = on_trip
         self._exposure_provider = (
@@ -148,20 +179,35 @@ class RiskGate:
                 f"below minimum {self._min_tte_hours}h"
             )
 
+        quantities: list[float] = []
         for leg in rfq.legs:
-            quantity = float(leg.quantity)
+            # Wire schemas validate this too, but the gate is the final control and must
+            # hold even when a caller constructs an Rfq without using those schemas.
+            quantity = _finite_positive(leg.quantity)
+            if quantity is None:
+                return self._reject(
+                    f"leg {leg.instrument_name} has invalid quantity {leg.quantity!r}"
+                )
             if quantity > self._max_leg_qty:
                 return self._reject(
                     f"leg {leg.instrument_name} quantity {quantity} exceeds max {self._max_leg_qty}"
                 )
+            quantities.append(quantity)
 
-        prices_by_instrument = {leg.instrument_name: leg.price for leg in intent.legs}
+        prices_by_instrument: dict[str, float] = {}
+        for intent_leg in intent.legs:
+            price = _finite_positive(str(intent_leg.price))
+            if price is None:
+                return self._reject(
+                    f"leg {intent_leg.instrument_name} has invalid price {intent_leg.price!r}"
+                )
+            prices_by_instrument[intent_leg.instrument_name] = price
         notional = 0.0
-        for leg in rfq.legs:
+        for leg, quantity in zip(rfq.legs, quantities, strict=True):
             price = prices_by_instrument.get(leg.instrument_name)
             if price is None:
                 return self._reject(f"missing quote price for leg {leg.instrument_name}")
-            notional += float(leg.quantity) * price
+            notional += quantity * price
         if notional > self._max_notional:
             return self._reject(f"quote notional {notional:.2f} exceeds max {self._max_notional}")
 

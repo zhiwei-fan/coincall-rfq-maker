@@ -36,6 +36,27 @@ def test_dt_28_active_rfq_produces_rfq_received() -> None:
     assert event.rfq.legs[0].side is Side.BUY
 
 
+def test_dt_28_rfq_with_nan_quantity_is_ignored() -> None:
+    raw = json.dumps(
+        {
+            "dt": 28,
+            "d": {
+                "requestId": "rfq-1",
+                "state": "ACTIVE",
+                "legs": [
+                    {
+                        "instrumentName": "BTCUSD-21AUG25-120000-C",
+                        "side": "BUY",
+                        "quantity": "nan",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert parse_ws_message(raw) is None
+
+
 def test_dt_28_terminal_state_produces_rfq_terminated() -> None:
     raw = json.dumps({"dt": 28, "d": {"requestId": "rfq-1", "state": "CANCELLED"}})
     event = parse_ws_message(raw)

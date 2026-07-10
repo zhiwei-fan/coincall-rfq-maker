@@ -58,7 +58,7 @@ def make_gate(**overrides: float | int) -> RiskGate:
     defaults: dict[str, float | int] = {
         "max_quote_notional_usd": 1_000_000.0,
         "max_leg_qty": 100.0,
-        "min_time_to_expiry_hours": 0.0,
+        "min_time_to_expiry_hours": 0.000001,
         "stale_market_data_seconds": 30.0,
         "kill_switch_threshold": 5,
     }

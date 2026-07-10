@@ -15,7 +15,9 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallMalformedResponseError,
     CoincallRequestError,
     CoincallRestClient,
+    _parse_option_instruments,
     _parse_quote_list,
+    _parse_quotes_received,
     _parse_rfq_list,
     _wire_id,
     classify_api_failure,
@@ -566,17 +568,62 @@ def test_quote_list_salvages_integer_ids_from_malformed_items() -> None:
 @pytest.mark.parametrize(
     "response",
     [
-        {"code": 0, "data": "not-an-object"},
-        {"code": 0, "data": {"rfqList": "not-a-list"}},
+        {"code": 0, "data": 0},
+        {"code": 0, "data": ""},
+        {"code": 0, "data": []},
+        {"code": 0, "data": None},
+        {"code": 0},
+        {"code": 0, "data": {"rfqList": 0}},
+        {"code": 0, "data": {"rfqList": None}},
+        {"code": 0, "data": {}},
     ],
 )
-def test_rfq_list_rejects_truthy_malformed_top_level_structure(
+def test_rfq_list_rejects_all_malformed_top_level_structure(
     response: dict[str, Any],
 ) -> None:
     with pytest.raises(CoincallMalformedResponseError):
         _parse_rfq_list(response)
 
 
-def test_quote_list_rejects_truthy_malformed_top_level_data() -> None:
+def test_rfq_list_accepts_live_empty_book_shape() -> None:
+    snapshot = _parse_rfq_list(
+        {
+            "code": 0,
+            "msg": "Success",
+            "i18nArgs": None,
+            "data": {"userId": 1695796693388666, "rfqList": []},
+        }
+    )
+
+    assert snapshot.payloads == ()
+    assert snapshot.malformed_request_ids == frozenset()
+
+
+def test_quote_list_accepts_live_empty_book_shape() -> None:
+    snapshot = _parse_quote_list({"code": 0, "msg": "Success", "i18nArgs": None, "data": []})
+
+    assert snapshot.payloads == ()
+    assert snapshot.malformed_id_pairs == frozenset()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"code": 0, "data": {}},
+        {"code": 0, "data": 0},
+        {"code": 0, "data": None},
+        {"code": 0},
+    ],
+)
+def test_quote_list_rejects_all_malformed_top_level_data(response: dict[str, Any]) -> None:
     with pytest.raises(CoincallMalformedResponseError):
-        _parse_quote_list({"code": 0, "data": "not-a-list"})
+        _parse_quote_list(response)
+
+
+@pytest.mark.parametrize("parser", [_parse_quotes_received, _parse_option_instruments])
+@pytest.mark.parametrize("response", [{"code": 0, "data": 0}, {"code": 0}])
+def test_other_list_parsers_reject_falsy_malformed_data(
+    parser: object, response: dict[str, Any]
+) -> None:
+    with pytest.raises(CoincallMalformedResponseError):
+        parser(response)  # type: ignore[operator]

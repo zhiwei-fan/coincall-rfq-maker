@@ -1,3 +1,7 @@
+import math
+
+import pytest
+
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.risk.gate import ExposureSnapshot, NullExposureProvider, RiskGate
@@ -80,6 +84,74 @@ def test_rejects_leg_qty_over_max() -> None:
     decision = gate.evaluate(make_rfq(quantity="1"), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
     assert not decision.approved
     assert "quantity" in decision.reason
+
+
+@pytest.mark.parametrize("quantity", ["nan", "inf", "-1", "0"])
+def test_rejects_non_finite_or_non_positive_leg_quantity(quantity: str) -> None:
+    decision = make_gate().evaluate(make_rfq(quantity), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert not decision.approved
+    assert decision.reason is not None and "quantity" in decision.reason
+
+
+def test_approves_finite_positive_leg_quantity() -> None:
+    decision = make_gate().evaluate(make_rfq("0.01"), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert decision.approved
+
+
+def test_rejects_notional_cancellation_by_negative_quantity() -> None:
+    rfq = Rfq(
+        request_id="rfq-1",
+        status=RfqStatus.ACTIVE,
+        legs=(
+            RfqLeg(instrument_name=INSTRUMENT, side=Side.BUY, quantity="100"),
+            RfqLeg(instrument_name=INSTRUMENT, side=Side.SELL, quantity="-99"),
+        ),
+        create_time_ms=0,
+        expiry_time_ms=NOW_MS + 10 * 3600 * 1000,
+    )
+
+    decision = make_gate(max_quote_notional_usd=500.0).evaluate(
+        rfq, make_intent(price=100.0), {INSTRUMENT: 1.0}, NOW_MS
+    )
+
+    assert not decision.approved
+    assert decision.reason is not None and "quantity" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("max_quote_notional_usd", float("nan")),
+        ("max_quote_notional_usd", math.inf),
+        ("max_quote_notional_usd", 0.0),
+        ("max_quote_notional_usd", -1.0),
+        ("max_leg_qty", float("nan")),
+        ("max_leg_qty", math.inf),
+        ("max_leg_qty", 0.0),
+        ("max_leg_qty", -1.0),
+        ("min_time_to_expiry_hours", math.inf),
+        ("stale_market_data_seconds", -1.0),
+    ],
+)
+def test_rejects_invalid_numeric_config(parameter: str, value: float) -> None:
+    with pytest.raises(ValueError, match=parameter):
+        make_gate(**{parameter: value})
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.0, True])
+def test_rejects_invalid_kill_switch_threshold(value: object) -> None:
+    with pytest.raises(ValueError, match="kill_switch_threshold"):
+        make_gate(kill_switch_threshold=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("price", [float("nan"), math.inf, -1.0, 0.0])
+def test_rejects_non_finite_or_non_positive_intent_price(price: float) -> None:
+    decision = make_gate().evaluate(make_rfq(), make_intent(price), {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert not decision.approved
+    assert decision.reason is not None and "price" in decision.reason
 
 
 def test_rejects_notional_over_max() -> None:

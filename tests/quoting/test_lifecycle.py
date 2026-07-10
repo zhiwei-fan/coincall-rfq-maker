@@ -200,7 +200,7 @@ async def test_conflicting_create_adopts_matching_open_exchange_quote_without_st
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
     )
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
@@ -241,7 +241,7 @@ async def test_conflicting_create_stops_after_one_recreate_without_strike() -> N
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
     )
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
@@ -261,7 +261,7 @@ async def test_unresolved_conflicting_create_propagates_without_strike() -> None
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
     )
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
@@ -361,7 +361,7 @@ async def test_malformed_successful_create_response_adopts_open_quote_and_resets
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=5,
     )
@@ -406,7 +406,7 @@ async def test_malformed_successful_create_response_not_listed_never_trips_kill_
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=5,
     )
@@ -706,7 +706,7 @@ async def test_reconcile_pending_cancel_terminal_verification_resets_api_failure
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=2,
     )
@@ -740,7 +740,7 @@ async def test_reconcile_pending_create_adoption_resets_api_failure_streak() -> 
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
         kill_switch_threshold=2,
     )
@@ -836,7 +836,7 @@ async def test_withdraw_pending_create_within_grace_remains_ambiguous_without_ri
     risk_gate = RiskGate(
         max_quote_notional_usd=1_000_000.0,
         max_leg_qty=100.0,
-        min_time_to_expiry_hours=0.0,
+        min_time_to_expiry_hours=0.000001,
         stale_market_data_seconds=30.0,
     )
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
