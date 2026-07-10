@@ -221,15 +221,32 @@ class RecordingRiskGate:
     def __init__(self, decision: RiskDecision | None = None) -> None:
         self.calls: list[str] = []
         self.decision = decision or RiskDecision(approved=True)
+        self._consecutive_failures = 0
+        self._failures_total = 0
+        self.kill_switch_tripped = False
 
     def evaluate(self, *args: object, **kwargs: object) -> RiskDecision:
         return self.decision
 
     def record_api_failure(self) -> None:
         self.calls.append("failure")
+        self._consecutive_failures += 1
+        self._failures_total += 1
 
     def record_api_success(self) -> None:
         self.calls.append("success")
+        self._consecutive_failures = 0
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    @property
+    def failures_total(self) -> int:
+        return self._failures_total
+
+    def trip_kill_switch(self, reason: str) -> None:
+        self.kill_switch_tripped = True
 
 
 def make_rfq(request_id: str) -> Rfq:
@@ -455,6 +472,139 @@ async def test_reconciler_cancels_unknown_exchange_open_quote() -> None:
     await orchestrator.reconcile_with_exchange()
 
     assert rest.cancel_calls == ["q-orphan"]
+
+
+def make_reconciler_risk_gate() -> RiskGate:
+    return RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=5,
+    )
+
+
+def make_orphan_reconciler(rest: FakeRest, risk_gate: RiskGate) -> tuple[Orchestrator, list[str]]:
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=risk_gate,
+        quote_lifecycle=quotes,
+    )
+    recoveries: list[str] = []
+    orchestrator._reconciler._on_api_recovery = lambda: recoveries.append("recovered")
+    return orchestrator, recoveries
+
+
+def orphan_quote_snapshot() -> dict[str, Any]:
+    return {
+        "code": 0,
+        "data": [{"requestId": "rfq-ghost", "quoteId": "q-orphan", "state": "OPEN"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconciler_preserves_persistent_cleanup_strike_but_recovers_outage_gate() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.quote_list_response = orphan_quote_snapshot()
+    rest.cancel_error = CoincallApiError(200, 51234, "cannot cancel")
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, recoveries = make_orphan_reconciler(rest, risk_gate)
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert risk_gate.consecutive_failures == 1
+    assert recoveries == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_clean_quiet_book_recovers_and_clears_streak() -> None:
+    rest = FakeRest(open_request_ids=[])
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, recoveries = make_orphan_reconciler(rest, risk_gate)
+    for _ in range(3):
+        risk_gate.record_api_failure()
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert recoveries == ["recovered"]
+    assert risk_gate.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciler_transient_orphan_cleanup_does_not_withhold_streak_clear() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.quote_list_response = orphan_quote_snapshot()
+    rest.cancel_error = CoincallApiError(200, 10000, "Try again later")
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, recoveries = make_orphan_reconciler(rest, risk_gate)
+    risk_gate.record_api_failure()
+    risk_gate.record_api_failure()
+
+    await orchestrator.reconcile_with_exchange()
+
+    assert risk_gate.consecutive_failures == 0
+    assert recoveries == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_orphan_cancel_ladder_cancel_all_then_prunes_when_orphan_vanishes() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.quote_list_response = orphan_quote_snapshot()
+    rest.cancel_error = CoincallApiError(200, 10000, "Try again later")
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, _ = make_orphan_reconciler(rest, risk_gate)
+
+    await orchestrator.reconcile_with_exchange()
+    await orchestrator.reconcile_with_exchange()
+    assert rest.cancel_all_calls == 0
+
+    await orchestrator.reconcile_with_exchange()
+    assert rest.cancel_all_calls == 1
+    assert orchestrator._reconciler._orphan_cancel_failures == {"q-orphan": 3}
+
+    rest.quote_list_response = {"code": 0, "data": []}
+    await orchestrator.reconcile_with_exchange()
+
+    assert not risk_gate.kill_switch_tripped
+    assert orchestrator._reconciler._orphan_cancel_failures == {}
+
+
+@pytest.mark.asyncio
+async def test_orphan_cancel_ladder_trips_when_orphan_remains_after_cancel_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.quote_list_response = orphan_quote_snapshot()
+    rest.cancel_error = CoincallApiError(200, 10000, "Try again later")
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, _ = make_orphan_reconciler(rest, risk_gate)
+
+    for _ in range(4):
+        await orchestrator.reconcile_with_exchange()
+
+    assert rest.cancel_all_calls == 1
+    assert risk_gate.kill_switch_tripped
+    assert "orphan exchange quote q-orphan uncancellable after 4 reconcile cycles" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_orphan_cancel_failure_counter_is_pruned_when_orphan_is_absent() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.quote_list_response = orphan_quote_snapshot()
+    rest.cancel_error = CoincallApiError(200, 10000, "Try again later")
+    risk_gate = make_reconciler_risk_gate()
+    orchestrator, _ = make_orphan_reconciler(rest, risk_gate)
+
+    await orchestrator.reconcile_with_exchange()
+    assert orchestrator._reconciler._orphan_cancel_failures == {"q-orphan": 1}
+
+    rest.quote_list_response = {"code": 0, "data": []}
+    await orchestrator.reconcile_with_exchange()
+
+    assert orchestrator._reconciler._orphan_cancel_failures == {}
 
 
 @pytest.mark.asyncio

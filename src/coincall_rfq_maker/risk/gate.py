@@ -70,6 +70,8 @@ class RiskGate:
             exposure_provider if exposure_provider is not None else NullExposureProvider()
         )
         self._consecutive_failures = 0
+        # Monotonic; used to detect whether a reconcile cycle recorded any persistent failure.
+        self._failures_total = 0
         self._kill_switch_tripped = False
 
     @property
@@ -80,8 +82,13 @@ class RiskGate:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
+    @property
+    def failures_total(self) -> int:
+        return self._failures_total
+
     def record_api_failure(self) -> None:
         self._consecutive_failures += 1
+        self._failures_total += 1
         already_tripped = self._kill_switch_tripped
         if self._consecutive_failures >= self._kill_switch_threshold and not already_tripped:
             self._kill_switch_tripped = True
@@ -97,6 +104,15 @@ class RiskGate:
     def reset_kill_switch(self) -> None:
         self._kill_switch_tripped = False
         self._consecutive_failures = 0
+
+    def trip_kill_switch(self, reason: str) -> None:
+        """Trip for an escalation that is not countered by consecutive API failures."""
+        if self._kill_switch_tripped:
+            return
+        self._kill_switch_tripped = True
+        logger.error("Kill switch TRIPPED: %s", reason)
+        if self._on_trip is not None:
+            self._on_trip()
 
     def evaluate(
         self,

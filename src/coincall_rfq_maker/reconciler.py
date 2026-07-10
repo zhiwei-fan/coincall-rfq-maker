@@ -60,8 +60,10 @@ class Reconciler:
         self._on_terminal_rfq = on_terminal_rfq
         self._on_api_recovery = on_api_recovery
         self._persistence = persistence
+        self._orphan_cancel_failures: dict[str, int] = {}
 
     async def reconcile_with_exchange(self) -> None:
+        strikes_before = self._risk_gate.failures_total
         # Treats the OPEN rfqList response as a COMPLETE snapshot: RFQs absent from it
         # (past the grace window) are expired locally. Owner-confirmed 2026-07-09 that
         # Coincall's rfqList does not paginate. If it ever gains paging, this single-page
@@ -105,8 +107,22 @@ class Reconciler:
         if not await self._reconcile_quote_state():
             return
 
-        self._risk_gate.record_api_success()
+        # INVARIANT: cleanup failures may withhold the streak-clear, but must NEVER withhold the
+        # outage-gate recovery -- the reconciler's GETs are the sole quiet-book recovery signal,
+        # and withholding them latches the backoff on a healthy exchange.
         self._on_api_recovery()
+        # A mid-cycle boundary SUCCESS (a resolve/cancel that worked) still resets the streak on
+        # its own -- that is real exchange I/O and is correct.
+        strikes = self._risk_gate.failures_total - strikes_before
+        if strikes == 0:
+            self._risk_gate.record_api_success()
+        else:
+            logger.warning(
+                "Reconcile cycle completed with %d persistent failure(s); kill-switch streak "
+                "preserved (streak=%d)",
+                strikes,
+                self._risk_gate.consecutive_failures,
+            )
 
     async def _expire_rfqs_absent_from_open_snapshot(self, remote_ids: set[str]) -> None:
         now_ms = get_timestamp_ms()
@@ -151,6 +167,7 @@ class Reconciler:
             )
             self._quotes.adopt_open_exchange_quote(request_id, quote_id)
 
+        failed_orphans: dict[str, int] = {}
         for item in remote_quotes.payloads:
             quote_id = item.quote_id
             remote_open_quote_ids.add(quote_id)
@@ -162,8 +179,8 @@ class Reconciler:
                     if item_request_id is None
                     else self._quotes.adopt_open_exchange_quote(item_request_id, quote_id, item)
                 )
-                if adopted is None:
-                    await self._cancel_orphan_exchange_quote(quote_id)
+                if adopted is None and not await self._cancel_orphan_exchange_quote(quote_id):
+                    failed_orphans[quote_id] = self._orphan_cancel_failures.get(quote_id, 0) + 1
 
         for quote in self._quotes.non_terminal_quotes():
             if quote.is_open and quote.quote_id in remote_open_quote_ids:
@@ -178,13 +195,42 @@ class Reconciler:
                 )
                 continue
             await self._record_terminal_quote(resolved)
+
+        self._orphan_cancel_failures = failed_orphans
+        cancel_all_orphan = next(
+            (quote_id for quote_id, count in failed_orphans.items() if count == 3), None
+        )
+        if cancel_all_orphan is not None:
+            logger.error(
+                "orphan exchange quote %s uncancellable for 3 cycles; escalating to cancel-all",
+                cancel_all_orphan,
+            )
+            try:
+                await self._quotes.cancel_all()
+            except CoincallError:
+                logger.exception("Reconciler failed to cancel all quotes for uncancellable orphan")
+
+        kill_switch_orphan = next(
+            (quote_id for quote_id, count in failed_orphans.items() if count >= 4), None
+        )
+        if kill_switch_orphan is not None:
+            count = failed_orphans[kill_switch_orphan]
+            # On 2026-07-10 beta's per-quote cancel was throttled with code 10000 for 2+ minutes
+            # while cancel-all SUCCEEDED, so observed throttle weather reaches rung 2 and stops,
+            # and never trips.
+            self._risk_gate.trip_kill_switch(
+                f"orphan exchange quote {kill_switch_orphan} uncancellable after "
+                f"{count} reconcile cycles including a cancel-all attempt"
+            )
         return True
 
-    async def _cancel_orphan_exchange_quote(self, quote_id: str) -> None:
+    async def _cancel_orphan_exchange_quote(self, quote_id: str) -> bool:
         try:
             await self._quotes.cancel_exchange_quote(quote_id)
         except CoincallError:
             logger.exception("Reconciler failed to cancel orphan exchange quote %s", quote_id)
+            return False
+        return True
 
     async def _record_terminal_quote(self, quote: Quote | None) -> None:
         if quote is not None and quote.is_terminal and self._persistence is not None:

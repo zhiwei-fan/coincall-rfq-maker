@@ -132,6 +132,43 @@ def test_api_success_resets_failure_count_before_trip() -> None:
     assert not gate.kill_switch_tripped
 
 
+def test_failure_total_is_monotonic_across_success_and_reset() -> None:
+    gate = make_gate()
+
+    gate.record_api_failure()
+    gate.record_api_failure()
+    gate.record_api_success()
+    gate.reset_kill_switch()
+
+    assert gate.failures_total == 2
+    assert gate.consecutive_failures == 0
+
+
+def test_explicit_kill_switch_trip_is_idempotent_and_preserves_streak() -> None:
+    trips = 0
+
+    def on_trip() -> None:
+        nonlocal trips
+        trips += 1
+
+    gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=1.0,
+        stale_market_data_seconds=30.0,
+        on_trip=on_trip,
+    )
+    gate.record_api_failure()
+    gate.record_api_failure()
+
+    gate.trip_kill_switch("orphan cannot be cancelled")
+    gate.trip_kill_switch("ignored duplicate")
+
+    assert gate.kill_switch_tripped
+    assert gate.consecutive_failures == 2
+    assert trips == 1
+
+
 def test_fail_closed_on_missing_leg_price() -> None:
     gate = make_gate()
     empty_intent = QuoteIntent(request_id="rfq-1", legs=())
