@@ -30,6 +30,10 @@ from coincall_rfq_maker.quoting.strategy import QuoteIntent, matches
 
 logger = logging.getLogger(__name__)
 
+# Matches reconciler.RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS (120s). One read proves nothing,
+# but sustained absence across several reads over 120s does.
+PENDING_CREATE_UNRESOLVED_GRACE_MS = 120_000
+
 
 class QuoteLifecycle:
     """In-memory quote store plus create/cancel/replace against the exchange."""
@@ -121,6 +125,15 @@ class QuoteLifecycle:
             opened = None if self._dry_run else await self._verify_pending_create(existing)
             if opened is not None:
                 return await self._cancel(opened)
+            # Absence from ONE OPEN-list read never proves a create failed. Only sustained
+            # absence past the grace window does.
+            if not self._dry_run:
+                age_ms = current_time_ms() - existing.create_time_ms
+                if age_ms < PENDING_CREATE_UNRESOLVED_GRACE_MS:
+                    raise CoincallAmbiguousError(
+                        f"Create for RFQ {request_id} unresolved; absence from one OPEN "
+                        f"read is not proof (age {age_ms}ms)"
+                    )
             cancelled = existing.with_stage(QuoteStage.CANCELLED)
             self._store.store(cancelled)
             return cancelled

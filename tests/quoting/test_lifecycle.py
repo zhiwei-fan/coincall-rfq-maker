@@ -15,6 +15,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     classify_api_failure,
 )
 from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
+from coincall_rfq_maker.core.clock import current_time_ms
 from coincall_rfq_maker.domain.quote import Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -825,6 +826,115 @@ async def test_withdraw_pending_create_verifies_open_quote_then_cancels() -> Non
     assert current.stage is QuoteStage.CANCELLED
     assert current.quote_id == "exchange-q-1"
     assert rest.cancel_calls == ["exchange-q-1"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_pending_create_within_grace_remains_ambiguous_without_risk_strike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000
+    monkeypatch.setattr("coincall_rfq_maker.quoting.lifecycle.current_time_ms", lambda: now)
+    rest = FakeRestClient()
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+    )
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 100.0),),
+            create_time_ms=now,
+        )
+    )
+
+    with pytest.raises(CoincallAmbiguousError, match="absence from one OPEN read is not proof"):
+        await lifecycle.withdraw_for_rfq("rfq-1")
+
+    current = lifecycle.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is QuoteStage.PENDING_CREATE
+    assert risk_gate.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_withdraw_pending_create_after_grace_marks_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000
+    monkeypatch.setattr("coincall_rfq_maker.quoting.lifecycle.current_time_ms", lambda: now)
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 100.0),),
+            create_time_ms=now - 121_000,
+        )
+    )
+
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    assert withdrawn is not None
+    assert withdrawn.stage is QuoteStage.CANCELLED
+    assert lifecycle.get_for_rfq("rfq-1") is withdrawn
+
+
+@pytest.mark.asyncio
+async def test_withdraw_pending_create_cancels_quote_that_lands_within_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000
+    monkeypatch.setattr("coincall_rfq_maker.quoting.lifecycle.current_time_ms", lambda: now)
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 100.0),),
+            create_time_ms=now,
+        )
+    )
+
+    with pytest.raises(CoincallAmbiguousError):
+        await lifecycle.withdraw_for_rfq("rfq-1")
+
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [{"requestId": "rfq-1", "quoteId": "q-1", "state": "OPEN"}],
+    }
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    assert withdrawn is not None
+    assert withdrawn.stage is QuoteStage.CANCELLED
+    assert rest.cancel_calls == ["q-1"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_withdraw_pending_create_cancels_without_rest_call() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=True)  # type: ignore[arg-type]
+    # create_time_ms is *fresh* on purpose: a stale timestamp would sit past the grace
+    # window and pass even if dry-run wrongly took the unresolved-create path.
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 100.0),),
+            create_time_ms=current_time_ms(),
+        )
+    )
+
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    assert withdrawn is not None
+    assert withdrawn.stage is QuoteStage.CANCELLED
+    assert rest.quote_list_calls == []
 
 
 @pytest.mark.asyncio
