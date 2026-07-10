@@ -8,7 +8,7 @@ NOW_MS = 1_000_000
 
 class UnusableExposureProvider:
     def current_exposure(self) -> ExposureSnapshot:
-        return ExposureSnapshot(exposures_by_underlying={}, usable=False, reason="stale snapshot")
+        return ExposureSnapshot(usable=False, reason="stale snapshot")
 
 
 def make_gate(**overrides: float | int) -> RiskGate:

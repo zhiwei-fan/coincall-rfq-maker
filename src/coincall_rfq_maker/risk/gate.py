@@ -26,14 +26,9 @@ class RiskDecision:
 
 
 @dataclass(frozen=True, slots=True)
-class UnderlyingExposure:
-    net_position_quantity: float = 0.0
-    premium_notional: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
 class ExposureSnapshot:
-    exposures_by_underlying: Mapping[str, UnderlyingExposure]
+    # Seam for future position/greek limits; today it only carries provider
+    # health. The fail-closed check mirrors the stale-market-data pattern.
     usable: bool = True
     reason: str | None = None
 
@@ -44,7 +39,7 @@ class ExposureProvider(Protocol):
 
 class NullExposureProvider:
     def current_exposure(self) -> ExposureSnapshot:
-        return ExposureSnapshot(exposures_by_underlying={})
+        return ExposureSnapshot()
 
 
 class RiskGate:
