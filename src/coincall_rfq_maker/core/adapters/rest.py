@@ -118,11 +118,16 @@ class CoincallAmbiguousError(CoincallRequestError):
 
 
 class ApiFailureKind(Enum):
-    """Failure classes used by retry and kill-switch accounting."""
+    """Failure classes used by retry and kill-switch accounting.
+
+    ``CONFLICT`` means the request was refused because the desired state already exists. Neither
+    a retryable outage nor a fatal error.
+    """
 
     TRANSIENT = auto()
     PERSISTENT = auto()
     AMBIGUOUS = auto()
+    CONFLICT = auto()
 
 
 def classify_api_failure(exc: CoincallError) -> ApiFailureKind:
@@ -132,6 +137,10 @@ def classify_api_failure(exc: CoincallError) -> ApiFailureKind:
     if isinstance(exc, (CoincallConnectivityError, CoincallMalformedResponseError)):
         return ApiFailureKind.TRANSIENT
     if isinstance(exc, CoincallApiError):
+        # Live-verified 2026-07-10; 50012 = "Block trade quote exist". Classification is by
+        # code alone because only quote-create emits it.
+        if exc.code == 50012:
+            return ApiFailureKind.CONFLICT
         if exc.code == 10000:
             return ApiFailureKind.TRANSIENT
         if exc.status in {408, 425, 429} or 500 <= exc.status <= 599:

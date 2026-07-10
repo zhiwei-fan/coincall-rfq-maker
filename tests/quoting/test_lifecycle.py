@@ -65,6 +65,26 @@ class FakeRestClient:
         return _quote_payloads(self.quote_list_response)
 
 
+class ScriptedCreateRestClient(FakeRestClient):
+    def __init__(self, create_outcomes: list[Exception | CreateQuoteResult]) -> None:
+        super().__init__()
+        self._create_outcomes = create_outcomes
+        self.operations: list[tuple[str, str]] = []
+
+    async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
+        _mark_exchange_io_attempted()
+        self.operations.append(("create", request_id))
+        self.create_calls.append((request_id, legs))
+        outcome = self._create_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
+        self.operations.append(("cancel", quote_id))
+        return await super().cancel_quote(quote_id)
+
+
 class RecordingApiReporter:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -84,6 +104,20 @@ def make_intent(price: float = 100.0) -> QuoteIntent:
     return QuoteIntent(
         request_id="rfq-1", legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=price),)
     )
+
+
+def quote_payload(quote_id: str, price: float) -> dict[str, Any]:
+    return {
+        "code": 0,
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": quote_id,
+                "state": "OPEN",
+                "legs": [{"instrumentName": INSTRUMENT, "price": str(price)}],
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -158,6 +192,86 @@ async def test_create_failure_propagates_without_synthetic_cancelled_quote() -> 
     current = lifecycle.get_for_rfq("rfq-1")
     assert current is not None
     assert current.stage is QuoteStage.PENDING_CREATE
+
+
+@pytest.mark.asyncio
+async def test_conflicting_create_adopts_matching_open_exchange_quote_without_strike() -> None:
+    rest = ScriptedCreateRestClient([CoincallApiError(200, 50012, "Block trade quote exist")])
+    rest.quote_list_response = quote_payload("q-1", 100.0)
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+    )
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+
+    quote = await lifecycle.reconcile(make_intent())
+
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "q-1"
+    assert quote.legs == (QuoteLeg(instrument_name=INSTRUMENT, price=100.0),)
+    assert risk_gate.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_conflicting_create_cancels_mismatch_then_recreates_once() -> None:
+    rest = ScriptedCreateRestClient(
+        [
+            CoincallApiError(200, 50012, "Block trade quote exist"),
+            CreateQuoteResult(quote_id="q-2"),
+        ]
+    )
+    rest.quote_list_response = quote_payload("q-1", 99.0)
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+
+    quote = await lifecycle.reconcile(make_intent())
+
+    assert rest.operations == [("create", "rfq-1"), ("cancel", "q-1"), ("create", "rfq-1")]
+    assert rest.cancel_calls == ["q-1"]
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "q-2"
+    assert quote.legs == (QuoteLeg(instrument_name=INSTRUMENT, price=100.0),)
+
+
+@pytest.mark.asyncio
+async def test_conflicting_create_stops_after_one_recreate_without_strike() -> None:
+    conflict = CoincallApiError(200, 50012, "Block trade quote exist")
+    rest = ScriptedCreateRestClient([conflict, conflict])
+    rest.quote_list_response = quote_payload("q-1", 99.0)
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+    )
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await lifecycle.reconcile(make_intent())
+
+    assert exc_info.value.code == 50012
+    assert len(rest.create_calls) == 2
+    assert rest.cancel_calls == ["q-1"]
+    assert risk_gate.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_unresolved_conflicting_create_propagates_without_strike() -> None:
+    rest = ScriptedCreateRestClient([CoincallApiError(200, 50012, "Block trade quote exist")])
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+    )
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await lifecycle.reconcile(make_intent())
+
+    assert exc_info.value.code == 50012
+    assert risk_gate.consecutive_failures == 0
 
 
 @pytest.mark.asyncio

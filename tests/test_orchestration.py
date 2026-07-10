@@ -25,7 +25,7 @@ from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
-from coincall_rfq_maker.orchestration import Orchestrator
+from coincall_rfq_maker.orchestration import Orchestrator, TransientOutageGate
 from coincall_rfq_maker.pricing.engine import LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
@@ -1099,6 +1099,40 @@ async def test_ambiguous_quote_failure_sets_global_cooldown(
 
     assert quotes.reconcile_calls == 1
     assert orchestrator._outage_gate.cooldown_until_ms > 1_000
+
+
+@pytest.mark.asyncio
+async def test_unresolved_conflicting_create_does_not_set_global_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coincall_rfq_maker.orchestration.get_timestamp_ms", lambda: 1_000)
+    rest = FakeRest()
+    rest.create_error = CoincallApiError(200, 50012, "Block trade quote exist")
+    market_data = FakeMarketData(price=50_000.0)
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=1,
+    )
+    outage_gate = TransientOutageGate()
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=risk_gate,
+        quote_lifecycle=quotes,
+        outage_gate=outage_gate,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+
+    assert not risk_gate.kill_switch_tripped
+    assert risk_gate.consecutive_failures == 0
+    assert outage_gate.cooldown_until_ms == 0
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
+    CoincallApiError,
     CoincallError,
     CoincallRestClient,
 )
@@ -283,7 +284,7 @@ class QuoteLifecycle:
         self._store.store(updated)
         return updated
 
-    async def _create(self, intent: QuoteIntent) -> Quote:
+    async def _create(self, intent: QuoteIntent, _conflict_retry: bool = False) -> Quote:
         now = current_time_ms()
         pending = Quote(
             request_id=intent.request_id,
@@ -313,6 +314,30 @@ class QuoteLifecycle:
                 intent.request_id,
             )
             return await self._resolve_ambiguous_create(pending, exc)
+        except CoincallApiError as exc:
+            if exc.code != 50012:
+                logger.exception("Failed to create quote for RFQ %s", intent.request_id)
+                raise
+
+            # The exchange enforces <=1 OPEN quote per account per RFQ; 50012 proves one
+            # exists, so it must never strike the kill switch or pause unrelated RFQs.
+            logger.info(
+                "create for RFQ %s rejected 50012 (quote exists); resolving exchange truth",
+                intent.request_id,
+            )
+            opened = await self._verify_pending_create(pending)
+            if opened is None:
+                # Absence from one OPEN-list read never proves a create failed, so do not
+                # blind-create after a 50012; a future reprice pass will resolve it again.
+                raise exc
+            if matches(opened, intent):
+                return opened
+            # Exactly one re-create attempt per pass: a second 50012 must not loop or repeat
+            # the cancellation of an exchange quote that is still reported as OPEN.
+            if _conflict_retry:
+                raise exc
+            await self._cancel(opened)
+            return await self._create(intent, _conflict_retry=True)
         except CoincallError:
             logger.exception("Failed to create quote for RFQ %s", intent.request_id)
             raise

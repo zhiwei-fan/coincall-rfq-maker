@@ -197,6 +197,9 @@ def test_api_failure_classifier_contract() -> None:
     assert classify_api_failure(CoincallAmbiguousError("unknown outcome")) is (
         ApiFailureKind.AMBIGUOUS
     )
+    assert classify_api_failure(CoincallApiError(200, 50012, "Block trade quote exist")) is (
+        ApiFailureKind.CONFLICT
+    )
     assert classify_api_failure(CoincallApiError(200, 10004, "Parameter illegal")) is (
         ApiFailureKind.PERSISTENT
     )
