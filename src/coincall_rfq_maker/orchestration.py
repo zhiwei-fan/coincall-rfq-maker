@@ -22,6 +22,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallError,
     CoincallRestClient,
     classify_api_failure,
+    track_exchange_io,
 )
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
@@ -176,13 +177,14 @@ class Orchestrator:
         risk_gate: RiskGate,
         quote_lifecycle: QuoteLifecycle,
         persistence: PersistenceStore | None = None,
+        outage_gate: TransientOutageGate | None = None,
     ) -> None:
         self._market_data = market_data
         self._pricing_model = pricing_model
         self._risk_gate = risk_gate
         self._quotes = quote_lifecycle
         self._persistence = persistence
-        self._outage_gate = TransientOutageGate()
+        self._outage_gate = outage_gate if outage_gate is not None else TransientOutageGate()
         self.rfq_store = RfqStore()
         self._reconciler = Reconciler(
             rest_client=rest_client,
@@ -191,6 +193,7 @@ class Orchestrator:
             risk_gate=risk_gate,
             on_rfq_backfill=self._handle_rfq_received,
             on_terminal_rfq=self._handle_reconciled_terminal_rfq,
+            on_api_recovery=self._outage_gate.record_success,
             persistence=persistence,
         )
 
@@ -342,21 +345,23 @@ class Orchestrator:
             )
             return
 
-        try:
-            quote = await self._quotes.reconcile(intent)
-        except CoincallError as exc:
-            kind = classify_api_failure(exc)
-            if kind in {ApiFailureKind.TRANSIENT, ApiFailureKind.AMBIGUOUS}:
-                self._outage_gate.record_transient(get_timestamp_ms())
-                logger.warning(
-                    "Quoting paused after %s Coincall failure for RFQ %s until %d",
-                    kind.name.lower(),
-                    request_id,
-                    self._outage_gate.cooldown_until_ms,
-                )
-            logger.exception("REST error quoting RFQ %s", request_id)
-            return
-        self._outage_gate.record_success()
+        with track_exchange_io() as exchange_io:
+            try:
+                quote = await self._quotes.reconcile(intent)
+            except CoincallError as exc:
+                kind = classify_api_failure(exc)
+                if kind in {ApiFailureKind.TRANSIENT, ApiFailureKind.AMBIGUOUS}:
+                    self._outage_gate.record_transient(get_timestamp_ms())
+                    logger.warning(
+                        "Quoting paused after %s Coincall failure for RFQ %s until %d",
+                        kind.name.lower(),
+                        request_id,
+                        self._outage_gate.cooldown_until_ms,
+                    )
+                logger.exception("REST error quoting RFQ %s", request_id)
+                return
+        if exchange_io.attempted:
+            self._outage_gate.record_success()
 
         if rfq.stage is RfqStage.PRICED:
             rfq = rfq.with_stage(RfqStage.QUOTED)

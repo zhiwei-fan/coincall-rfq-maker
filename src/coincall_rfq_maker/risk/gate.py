@@ -2,12 +2,18 @@
 
 Fail-closed: any check that cannot be positively confirmed (missing price,
 malformed quantity, an internal error) results in rejection, never approval.
-Every rejection is logged with its reason. A kill switch trips after
-repeated consecutive API failures and rejects everything until reset.
+Every rejection is logged with its reason. A kill switch trips after repeated
+consecutive PERSISTENT API failures; on trip it fires `on_trip`, which the CLI
+wires to a one-shot flatten (cancel every live quote), and thereafter rejects
+everything for the life of the process. There is no runtime reset: recovery
+means a restart.
+
+Only PERSISTENT failures count. Transient and ambiguous outcomes are the outage
+cooldown's business, not the kill switch's.
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,6 +23,7 @@ from coincall_rfq_maker.quoting.strategy import QuoteIntent
 logger = logging.getLogger(__name__)
 
 DEFAULT_KILL_SWITCH_THRESHOLD = 5
+KillSwitchTripHandler = Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,12 +58,14 @@ class RiskGate:
         stale_market_data_seconds: float,
         kill_switch_threshold: int = DEFAULT_KILL_SWITCH_THRESHOLD,
         exposure_provider: ExposureProvider | None = None,
+        on_trip: KillSwitchTripHandler | None = None,
     ) -> None:
         self._max_notional = max_quote_notional_usd
         self._max_leg_qty = max_leg_qty
         self._min_tte_hours = min_time_to_expiry_hours
         self._stale_seconds = stale_market_data_seconds
         self._kill_switch_threshold = kill_switch_threshold
+        self._on_trip = on_trip
         self._exposure_provider = (
             exposure_provider if exposure_provider is not None else NullExposureProvider()
         )
@@ -67,6 +76,10 @@ class RiskGate:
     def kill_switch_tripped(self) -> bool:
         return self._kill_switch_tripped
 
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
     def record_api_failure(self) -> None:
         self._consecutive_failures += 1
         already_tripped = self._kill_switch_tripped
@@ -75,6 +88,8 @@ class RiskGate:
             logger.error(
                 "Kill switch TRIPPED after %d consecutive API failures", self._consecutive_failures
             )
+            if self._on_trip is not None:
+                self._on_trip()
 
     def record_api_success(self) -> None:
         self._consecutive_failures = 0

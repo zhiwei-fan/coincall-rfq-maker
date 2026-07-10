@@ -10,6 +10,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallApiError,
     CoincallRequestError,
     CoincallRestClient,
+    _mark_exchange_io_attempted,
     _parse_quote_list,
     classify_api_failure,
 )
@@ -38,6 +39,7 @@ class FakeRestClient:
         self.quote_list_calls: list[dict[str, Any]] = []
 
     async def create_quote(self, request_id: str, legs: list[dict[str, str]]) -> CreateQuoteResult:
+        _mark_exchange_io_attempted()
         self.create_calls.append((request_id, legs))
         if self.create_error is not None:
             raise self.create_error
@@ -46,16 +48,19 @@ class FakeRestClient:
         return CreateQuoteResult(quote_id=quote_id)
 
     async def cancel_quote(self, quote_id: str) -> dict[str, Any]:
+        _mark_exchange_io_attempted()
         self.cancel_calls.append(quote_id)
         if self.cancel_error is not None:
             raise self.cancel_error
         return {"code": 0, "data": {}}
 
     async def cancel_all_quotes(self) -> dict[str, Any]:
+        _mark_exchange_io_attempted()
         self.cancel_all_calls += 1
         return {"code": 0, "data": {}}
 
     async def get_quote_list(self, **kwargs: Any) -> QuoteListSnapshot:
+        _mark_exchange_io_attempted()
         self.quote_list_calls.append(kwargs)
         return _quote_payloads(self.quote_list_response)
 
@@ -251,6 +256,7 @@ async def test_malformed_successful_create_response_adopts_open_quote_and_resets
         risk_gate.record_api_failure()
 
     async def fake_request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        _mark_exchange_io_attempted()
         path = _args[1]
         if path == "/open/option/blocktrade/quote/create/v1":
             return {"code": 0, "data": {"quoteId": {"not": "parseable"}}}
@@ -308,6 +314,21 @@ async def test_malformed_successful_create_response_not_listed_never_trips_kill_
             await lifecycle.reconcile(make_intent())
         assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
         assert not risk_gate.kill_switch_tripped
+
+
+@pytest.mark.asyncio
+async def test_noop_withdraw_cancel_and_dry_run_cancel_all_record_no_success() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=True, api_reporter=reporter)  # type: ignore[arg-type]
+
+    assert await lifecycle.withdraw_for_rfq("missing-rfq") is None
+    await lifecycle.cancel_for_rfq("missing-rfq")
+    await lifecycle.cancel_all()
+
+    assert reporter.calls == []
+    assert rest.cancel_calls == []
+    assert rest.cancel_all_calls == 0
 
 
 @pytest.mark.asyncio

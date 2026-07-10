@@ -8,6 +8,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     ApiFailureKind,
     CoincallError,
     classify_api_failure,
+    track_exchange_io,
 )
 
 
@@ -38,13 +39,15 @@ class ApiOutcomeBoundary:
 
         token = self._api_operation.set(True)
         try:
-            result = await operation()
+            with track_exchange_io() as exchange_io:
+                result = await operation()
         except CoincallError as exc:
             if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
                 self._reporter.record_api_failure()
             raise
         else:
-            self._reporter.record_api_success()
+            if exchange_io.attempted:
+                self._reporter.record_api_success()
             return result
         finally:
             self._api_operation.reset(token)

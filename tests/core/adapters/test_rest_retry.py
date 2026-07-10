@@ -19,6 +19,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     _parse_rfq_list,
     _wire_id,
     classify_api_failure,
+    track_exchange_io,
 )
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -207,10 +208,14 @@ async def test_state_changing_post_timeout_is_not_retried_and_is_ambiguous() -> 
     client = CoincallRestClient("key", "secret")
     client._session = session  # type: ignore[assignment]
 
-    with pytest.raises(CoincallAmbiguousError):
+    with (
+        track_exchange_io() as exchange_io,
+        pytest.raises(CoincallAmbiguousError),
+    ):
         await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
 
     assert session.post_attempts == 1
+    assert exchange_io.attempted
 
 
 @pytest.mark.asyncio

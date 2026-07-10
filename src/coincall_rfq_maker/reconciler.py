@@ -35,6 +35,7 @@ class RfqRepository(Protocol):
 
 RfqBackfillHandler = Callable[[Rfq], Awaitable[None]]
 TerminalRfqHandler = Callable[[str, RfqStatus], Awaitable[None]]
+ApiRecoveryHandler = Callable[[], None]
 
 
 class Reconciler:
@@ -48,6 +49,7 @@ class Reconciler:
         risk_gate: RiskGate,
         on_rfq_backfill: RfqBackfillHandler,
         on_terminal_rfq: TerminalRfqHandler,
+        on_api_recovery: ApiRecoveryHandler,
         persistence: PersistenceStore | None = None,
     ) -> None:
         self._rest = rest_client
@@ -56,6 +58,7 @@ class Reconciler:
         self._risk_gate = risk_gate
         self._on_rfq_backfill = on_rfq_backfill
         self._on_terminal_rfq = on_terminal_rfq
+        self._on_api_recovery = on_api_recovery
         self._persistence = persistence
 
     async def reconcile_with_exchange(self) -> None:
@@ -70,8 +73,6 @@ class Reconciler:
             if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
                 self._risk_gate.record_api_failure()
             return
-        self._risk_gate.record_api_success()
-
         remote_ids = set(remote_rfqs.malformed_request_ids)
         for request_id in remote_rfqs.malformed_request_ids:
             logger.warning(
@@ -101,7 +102,11 @@ class Reconciler:
                 )
                 await self._on_terminal_rfq(rfq.request_id, rfq.status)
 
-        await self._reconcile_quote_state()
+        if not await self._reconcile_quote_state():
+            return
+
+        self._risk_gate.record_api_success()
+        self._on_api_recovery()
 
     async def _expire_rfqs_absent_from_open_snapshot(self, remote_ids: set[str]) -> None:
         now_ms = get_timestamp_ms()
@@ -125,7 +130,7 @@ class Reconciler:
             )
             await self._on_terminal_rfq(rfq.request_id, RfqStatus.EXPIRED)
 
-    async def _reconcile_quote_state(self) -> None:
+    async def _reconcile_quote_state(self) -> bool:
         # Same complete-snapshot assumption as reconcile_with_exchange: quoteList OPEN does
         # not paginate (owner-confirmed 2026-07-09). Revisit if the endpoint gains paging.
         try:
@@ -134,8 +139,7 @@ class Reconciler:
             logger.exception("Reconciler failed to fetch quote list")
             if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
                 self._risk_gate.record_api_failure()
-            return
-        self._risk_gate.record_api_success()
+            return False
 
         remote_open_quote_ids = {quote_id for _, quote_id in remote_quotes.malformed_id_pairs}
         for request_id, quote_id in remote_quotes.malformed_id_pairs:
@@ -174,6 +178,7 @@ class Reconciler:
                 )
                 continue
             await self._record_terminal_quote(resolved)
+        return True
 
     async def _cancel_orphan_exchange_quote(self, quote_id: str) -> None:
         try:

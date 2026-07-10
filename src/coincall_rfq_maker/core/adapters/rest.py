@@ -9,6 +9,9 @@ errors reported via persistent `code` values).
 import asyncio
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum, auto
 from types import TracebackType
 from typing import Any, Literal, Self
@@ -42,6 +45,46 @@ _REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 0.5
 _MAX_QUOTE_LIST_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
+
+
+class _ExchangeIoTracker:
+    """Reports whether an exchange HTTP attempt occurred in a scoped region."""
+
+    def __init__(self) -> None:
+        self._attempted = False
+
+    @property
+    def attempted(self) -> bool:
+        return self._attempted
+
+    def _mark_attempted(self) -> None:
+        self._attempted = True
+
+
+_exchange_io_trackers: ContextVar[tuple[_ExchangeIoTracker, ...]] = ContextVar(
+    "exchange_io_trackers", default=()
+)
+
+
+@contextmanager
+def track_exchange_io() -> Iterator[_ExchangeIoTracker]:
+    """Scope a region and report whether it attempted exchange HTTP I/O.
+
+    Trackers form a stack so a request inside nested accounting boundaries is
+    visible to every enclosing caller. The tracker exposes only the fact that an
+    attempt happened, not transport implementation details.
+    """
+    tracker = _ExchangeIoTracker()
+    token = _exchange_io_trackers.set((*_exchange_io_trackers.get(), tracker))
+    try:
+        yield tracker
+    finally:
+        _exchange_io_trackers.reset(token)
+
+
+def _mark_exchange_io_attempted() -> None:
+    for tracker in _exchange_io_trackers.get():
+        tracker._mark_attempted()
 
 
 class CoincallError(Exception):
@@ -150,6 +193,7 @@ class CoincallRestClient:
                 async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
                     if method.upper() == "GET":
                         url += encode_query_params(params or {})
+                        _mark_exchange_io_attempted()
                         async with self._session.get(url, headers=headers) as resp:
                             return await self._parse_response(resp)
                     elif method.upper() == "POST":
@@ -161,8 +205,10 @@ class CoincallRestClient:
                             body = urlencode(
                                 {k: str(v) for k, v in (params or {}).items() if v is not None}
                             )
+                            _mark_exchange_io_attempted()
                             async with self._session.post(url, headers=headers, data=body) as resp:
                                 return await self._parse_response(resp)
+                        _mark_exchange_io_attempted()
                         async with self._session.post(
                             url, headers=headers, json=params or {}
                         ) as resp:

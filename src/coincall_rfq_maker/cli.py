@@ -19,7 +19,7 @@ from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestCli
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
-from coincall_rfq_maker.orchestration import Orchestrator
+from coincall_rfq_maker.orchestration import Orchestrator, TransientOutageGate
 from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -137,6 +137,43 @@ async def _cancel_all_on_graceful_stop(quote_lifecycle: QuoteLifecycle) -> None:
         )
 
 
+async def _flatten_on_kill_switch(
+    trip_event: asyncio.Event,
+    shutdown: asyncio.Event,
+    quote_lifecycle: QuoteLifecycle,
+    risk_gate: RiskGate,
+) -> None:
+    trip_wait = asyncio.create_task(trip_event.wait())
+    shutdown_wait = asyncio.create_task(shutdown.wait())
+    try:
+        await asyncio.wait((trip_wait, shutdown_wait), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (trip_wait, shutdown_wait):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(trip_wait, shutdown_wait, return_exceptions=True)
+
+    if not trip_event.is_set():
+        return
+
+    failure_count = risk_gate.consecutive_failures
+    logger.error("Kill-switch flatten starting after %d consecutive API failures", failure_count)
+    try:
+        await quote_lifecycle.cancel_all()
+    except Exception as exc:
+        logger.error(
+            "Kill-switch flatten FAILED after %d consecutive API failures; quotes may remain "
+            "live on the exchange: %s",
+            failure_count,
+            exc,
+            exc_info=exc,
+        )
+    else:
+        logger.error(
+            "Kill-switch flatten completed after %d consecutive API failures", failure_count
+        )
+
+
 def _log_task_failures(exceptions: Sequence[BaseException]) -> None:
     for exc in exceptions:
         logger.error("Task failed: %s", exc, exc_info=exc)
@@ -151,6 +188,7 @@ async def run_async(settings: MakerSettings) -> None:
     logger.info("Starting rfq-maker (dry_run=%s)", settings.dry_run)
 
     shutdown = asyncio.Event()
+    kill_switch_trip = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown.set)
@@ -175,10 +213,18 @@ async def run_async(settings: MakerSettings) -> None:
             min_time_to_expiry_hours=settings.min_time_to_expiry_hours,
             stale_market_data_seconds=settings.stale_market_data_seconds,
             exposure_provider=NullExposureProvider(),
+            on_trip=kill_switch_trip.set,
         )
         quote_lifecycle = QuoteLifecycle(rest, dry_run=settings.dry_run, api_reporter=risk_gate)
+        outage_gate = TransientOutageGate()
         orchestrator = Orchestrator(
-            rest, market_data, pricing_model, risk_gate, quote_lifecycle, persistence
+            rest,
+            market_data,
+            pricing_model,
+            risk_gate,
+            quote_lifecycle,
+            persistence,
+            outage_gate,
         )
         ws_client = CoincallWsClient(
             settings.ws_url,
@@ -213,6 +259,10 @@ async def run_async(settings: MakerSettings) -> None:
                 tg.create_task(
                     _reconcile_loop(events, shutdown, RECONCILE_INTERVAL_SECONDS),
                     name="reconciler",
+                )
+                tg.create_task(
+                    _flatten_on_kill_switch(kill_switch_trip, shutdown, quote_lifecycle, risk_gate),
+                    name="kill-switch-flatten",
                 )
         except* Exception as eg:
             if shutdown.is_set() and _all_shutdown_race_failures(eg.exceptions):
