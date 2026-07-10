@@ -217,6 +217,21 @@ class FakePricingModel:
         return LegPrice(bid=self.ask - 1.0, ask=self.ask)
 
 
+class UnpriceablePricingModel:
+    def price(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class RecordingQuoteLifecycle(QuoteLifecycle):
+    def __init__(self, rest_client: object) -> None:
+        super().__init__(rest_client, dry_run=False)  # type: ignore[arg-type]
+        self.withdrawn_for: list[str] = []
+
+    async def withdraw_for_rfq(self, request_id: str) -> Quote | None:
+        self.withdrawn_for.append(request_id)
+        return await super().withdraw_for_rfq(request_id)
+
+
 class RecordingRiskGate:
     def __init__(self, decision: RiskDecision | None = None) -> None:
         self.calls: list[str] = []
@@ -1020,6 +1035,31 @@ async def test_risk_reject_cancels_existing_open_quote() -> None:
     assert current.stage is QuoteStage.CANCELLED
     assert rest.cancel_calls == [quote.quote_id]
     assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpriceable_leg_withdraws_existing_open_quote_without_creating() -> None:
+    rest = FakeRest()
+    quotes = RecordingQuoteLifecycle(rest)
+    existing = await quotes.reconcile(make_intent())
+    assert existing.stage is QuoteStage.OPEN
+    assert existing.quote_id is not None
+    rest.create_calls.clear()
+
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=50_000.0),  # type: ignore[arg-type]
+        pricing_model=UnpriceablePricingModel(),
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+
+    assert rest.create_calls == []
+    assert quotes.withdrawn_for == ["rfq-1"]
+    assert rest.cancel_calls == [existing.quote_id]
 
 
 @pytest.mark.asyncio

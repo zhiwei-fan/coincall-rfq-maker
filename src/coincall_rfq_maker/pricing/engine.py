@@ -6,6 +6,7 @@ surface, no skew). It is deliberately swappable via the `PricingModel`
 Protocol so a real model can replace it later without touching callers.
 """
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -26,7 +27,7 @@ class LegPrice:
 class PricingModel(Protocol):
     def price(
         self, instrument: Instrument, underlying_price: float, now: datetime | None = None
-    ) -> LegPrice: ...
+    ) -> LegPrice | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +40,11 @@ class BlackScholesModel:
 
     def price(
         self, instrument: Instrument, underlying_price: float, now: datetime | None = None
-    ) -> LegPrice:
+    ) -> LegPrice | None:
         reference = now if now is not None else datetime.now(UTC)
         time_to_expiry = instrument.time_to_expiry_years(reference)
         if time_to_expiry <= 0:
-            return LegPrice(bid=round_option_price(0.0), ask=round_option_price(0.0))
+            return None
 
         bid = _black_scholes(
             underlying_price,
@@ -61,6 +62,11 @@ class BlackScholesModel:
             self.ask_vol,
             instrument.option_type,
         )
+        # Invariant: no path from non-positive TTE or a non-finite valuation reaches
+        # LegPrice. MIN_OPTION_PRICE is applied only to a finite model valuation, never a
+        # cannot-price sentinel.
+        if not math.isfinite(bid) or not math.isfinite(ask):
+            return None
         return LegPrice(bid=round_option_price(bid), ask=round_option_price(ask))
 
 

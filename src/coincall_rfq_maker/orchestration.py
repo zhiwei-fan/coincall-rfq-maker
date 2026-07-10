@@ -323,7 +323,16 @@ class Orchestrator:
             if underlying_price is None:
                 logger.debug("No price yet for %s (RFQ %s)", instrument.underlying, request_id)
                 return
-            leg_prices[name] = self._pricing_model.price(instrument, underlying_price)
+            leg_price = self._pricing_model.price(instrument, underlying_price)
+            if leg_price is None:
+                logger.warning(
+                    "Not quoting RFQ %s: cannot price %s (expired or unpriceable)",
+                    request_id,
+                    name,
+                )
+                await self._withdraw_rejected_quote(request_id, f"cannot price {name}")
+                return
+            leg_prices[name] = leg_price
             ages[name] = self._market_data.age_seconds(instrument.underlying)
 
         intent = build_quote_intent(rfq, leg_prices)
