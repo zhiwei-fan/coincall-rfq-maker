@@ -7,7 +7,7 @@ Quotes are stored together with the market snapshot that priced them.
 
 import json
 from types import TracebackType
-from typing import Any, Self
+from typing import Self
 
 import aiosqlite
 
@@ -160,63 +160,3 @@ class PersistenceStore:
             ),
         )
         await self.connection.commit()
-
-    async def fetch_rfq_history(self, request_id: str) -> list[dict[str, Any]]:
-        cursor = await self.connection.execute(
-            "SELECT request_id, status, stage, legs_json, recorded_at_ms FROM rfqs "
-            "WHERE request_id = ? ORDER BY id",
-            (request_id,),
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "request_id": row[0],
-                "status": row[1],
-                "stage": row[2],
-                "legs": json.loads(row[3]),
-                "recorded_at_ms": row[4],
-            }
-            for row in rows
-        ]
-
-    async def fetch_quote_history(self, request_id: str) -> list[dict[str, Any]]:
-        cursor = await self.connection.execute(
-            "SELECT quote_id, request_id, stage, legs_json, market_snapshot_json, "
-            "filled_price, filled_quantity, fill_time_ms, recorded_at_ms "
-            "FROM quotes WHERE request_id = ? ORDER BY id",
-            (request_id,),
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "quote_id": row[0],
-                "request_id": row[1],
-                "stage": row[2],
-                "legs": json.loads(row[3]),
-                "market_snapshot": json.loads(row[4]) if row[4] else None,
-                "filled_price": row[5],
-                "filled_quantity": row[6],
-                "fill_time_ms": row[7],
-                "recorded_at_ms": row[8],
-            }
-            for row in rows
-        ]
-
-    async def fetch_fills(self) -> list[dict[str, Any]]:
-        cursor = await self.connection.execute(
-            "SELECT block_trade_id, quote_id, request_id, filled_price, filled_quantity, "
-            "fill_time_ms, recorded_at_ms FROM fills ORDER BY id"
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "block_trade_id": row[0],
-                "quote_id": row[1],
-                "request_id": row[2],
-                "filled_price": row[3],
-                "filled_quantity": row[4],
-                "fill_time_ms": row[5],
-                "recorded_at_ms": row[6],
-            }
-            for row in rows
-        ]

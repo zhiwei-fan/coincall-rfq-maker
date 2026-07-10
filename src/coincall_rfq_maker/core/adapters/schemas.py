@@ -4,9 +4,8 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 `model_validate` raw exchange JSON directly.
 """
 
-from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Annotated, Any, overload
+from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
@@ -60,36 +59,11 @@ class RfqPayload(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
-class RfqListSnapshot(Sequence[RfqPayload]):
+class RfqListSnapshot:
     """Typed RFQ list plus IDs salvaged from malformed REST items."""
 
     payloads: tuple[RfqPayload, ...] = ()
     malformed_request_ids: frozenset[str] = field(default_factory=frozenset)
-
-    def __iter__(self) -> Iterator[RfqPayload]:
-        return iter(self.payloads)
-
-    def __len__(self) -> int:
-        return len(self.payloads)
-
-    @overload
-    def __getitem__(self, index: int) -> RfqPayload: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> tuple[RfqPayload, ...]: ...
-
-    def __getitem__(self, index: int | slice) -> RfqPayload | tuple[RfqPayload, ...]:
-        return self.payloads[index]
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, RfqListSnapshot):
-            return (
-                self.payloads == other.payloads
-                and self.malformed_request_ids == other.malformed_request_ids
-            )
-        if isinstance(other, list | tuple):
-            return list(self.payloads) == list(other)
-        return NotImplemented
 
 
 def rfq_status_from_wire(state: str) -> RfqStatus | None:
@@ -145,36 +119,11 @@ class QuotePayload(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
-class QuoteListSnapshot(Sequence[QuotePayload]):
+class QuoteListSnapshot:
     """Typed quote list plus ID pairs salvaged from malformed REST items."""
 
     payloads: tuple[QuotePayload, ...] = ()
     malformed_id_pairs: frozenset[tuple[str, str]] = field(default_factory=frozenset)
-
-    def __iter__(self) -> Iterator[QuotePayload]:
-        return iter(self.payloads)
-
-    def __len__(self) -> int:
-        return len(self.payloads)
-
-    @overload
-    def __getitem__(self, index: int) -> QuotePayload: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> tuple[QuotePayload, ...]: ...
-
-    def __getitem__(self, index: int | slice) -> QuotePayload | tuple[QuotePayload, ...]:
-        return self.payloads[index]
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, QuoteListSnapshot):
-            return (
-                self.payloads == other.payloads
-                and self.malformed_id_pairs == other.malformed_id_pairs
-            )
-        if isinstance(other, list | tuple):
-            return list(self.payloads) == list(other)
-        return NotImplemented
 
 
 class CreateQuoteResult(BaseModel):
