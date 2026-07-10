@@ -11,6 +11,7 @@ from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
 from coincall_rfq_maker.core.adapters.schemas import QuoteListSnapshot, QuotePayload
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqLeg, Side
+from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.orchestration import Orchestrator
 from coincall_rfq_maker.persistence.store import PersistenceStore
@@ -101,6 +102,7 @@ async def fake_harness(db_path: str) -> AsyncIterator[FakeHarness]:
             pricing_model,
             risk_gate,
             quote_lifecycle,
+            InstrumentCatalog(rest),
             persistence,
         )
         yield FakeHarness(

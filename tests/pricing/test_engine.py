@@ -2,7 +2,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from coincall_rfq_maker.domain.instruments import Instrument, OptionType
+from coincall_rfq_maker.domain.instruments import (
+    Instrument,
+    OptionType,
+    parse_instrument,
+    resolve_instrument,
+)
 from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.pricing.rounding import round_option_price
 
@@ -59,6 +64,21 @@ def test_expired_deep_itm_instrument_is_unpriceable() -> None:
     )
     priced = model.price(expired, 60_000.0, datetime(2026, 7, 9, 2, 0, tzinfo=UTC))
     assert priced is None
+
+
+def test_exchange_resolved_expiry_prices_on_the_expiry_date_before_settlement() -> None:
+    parsed = parse_instrument("BTCUSD-09JUL26-56000-C")
+    instrument = resolve_instrument(parsed, 1_783_584_000_000)
+
+    priced = BlackScholesModel().price(
+        instrument,
+        60_000.0,
+        datetime(2026, 7, 9, 2, tzinfo=UTC),
+    )
+
+    assert priced is not None
+    assert priced.ask > 3500.0
+    assert 0 < priced.bid <= priced.ask
 
 
 def test_floor_applies_to_small_finite_valuations() -> None:

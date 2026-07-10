@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
+from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
 from coincall_rfq_maker.orchestration import Orchestrator, TransientOutageGate
@@ -269,6 +270,7 @@ async def run_async(settings: MakerSettings) -> None:
         PersistenceStore(settings.db_path) as persistence,
     ):
         market_data = MarketDataService(rest, events, settings.price_move_threshold)
+        instrument_catalog = InstrumentCatalog(rest)
         pricing_model = BlackScholesModel(
             bid_vol=settings.bid_vol,
             ask_vol=settings.ask_vol,
@@ -290,6 +292,7 @@ async def run_async(settings: MakerSettings) -> None:
             pricing_model,
             risk_gate,
             quote_lifecycle,
+            instrument_catalog,
             persistence,
             outage_gate,
         )

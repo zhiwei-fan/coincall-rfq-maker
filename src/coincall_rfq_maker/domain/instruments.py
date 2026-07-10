@@ -5,7 +5,7 @@ Symbol format ported exactly from the old ``pricing_engine.InstrumentParser``:
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 
 _MONTHS = {
@@ -33,6 +33,21 @@ class InstrumentParseError(ValueError):
     """Raised when an instrument symbol does not match the expected format."""
 
 
+class ExpiryMismatchError(ValueError):
+    """Raised when exchange expiry metadata contradicts the symbol's calendar date."""
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedInstrument:
+    """Symbol-derived option fields, deliberately without an expiry instant."""
+
+    symbol: str
+    underlying: str
+    expiry_date: date
+    strike: float
+    option_type: OptionType
+
+
 @dataclass(frozen=True, slots=True)
 class Instrument:
     """Immutable option instrument definition."""
@@ -53,8 +68,8 @@ class Instrument:
         return max(seconds / (60 * 60 * 24 * 365), 0.0)
 
 
-def parse_instrument(symbol: str) -> Instrument:
-    """Parse an instrument symbol string into an `Instrument`.
+def parse_instrument(symbol: str) -> ParsedInstrument:
+    """Parse an instrument symbol string into a `ParsedInstrument`.
 
     Raises `InstrumentParseError` on any malformed input.
     """
@@ -97,14 +112,31 @@ def parse_instrument(symbol: str) -> Instrument:
         raise InstrumentParseError(f"Invalid option type {option_type_str!r} in {symbol!r}")
 
     try:
-        expiry = datetime(year, month, day, tzinfo=UTC)
+        expiry_date = date(year, month, day)
     except ValueError as exc:
         raise InstrumentParseError(f"Invalid expiry date in {symbol!r}") from exc
 
-    return Instrument(
+    return ParsedInstrument(
         symbol=symbol,
         underlying=underlying,
-        expiry=expiry,
+        expiry_date=expiry_date,
         strike=strike,
         option_type=OptionType(option_type_upper),
+    )
+
+
+def resolve_instrument(parsed: ParsedInstrument, expiration_ms: int) -> Instrument:
+    """Attach exchange-validated expiry metadata to a parsed option symbol."""
+    expiry = datetime.fromtimestamp(expiration_ms / 1000, tz=UTC)
+    if expiry.date() != parsed.expiry_date:
+        raise ExpiryMismatchError(
+            f"Exchange expiry {expiry.isoformat()} contradicts symbol date "
+            f"{parsed.expiry_date.isoformat()} for {parsed.symbol!r}"
+        )
+    return Instrument(
+        symbol=parsed.symbol,
+        underlying=parsed.underlying,
+        expiry=expiry,
+        strike=parsed.strike,
+        option_type=parsed.option_type,
     )

@@ -3,17 +3,20 @@
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from coincall_rfq_maker.core.adapters.rest import CoincallApiError, CoincallRequestError
 from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
+    OptionInstrument,
     QuoteListSnapshot,
     QuotePayload,
     RfqListSnapshot,
     RfqPayload,
     SymbolInfoPayload,
 )
+from coincall_rfq_maker.domain.instruments import InstrumentParseError, parse_instrument
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
@@ -141,6 +144,32 @@ class FakeExchange:
         return SymbolInfoPayload.model_validate(
             {"symbol": underlying, "indexPrice": price, "markPrice": price}
         )
+
+    async def get_option_instruments(self, base_currency: str) -> tuple[OptionInstrument, ...]:
+        symbols = {leg.instrument_name for rfq in self._rfqs.values() for leg in rfq.legs}
+        instruments = []
+        for symbol in symbols:
+            try:
+                parsed = parse_instrument(symbol)
+            except InstrumentParseError:
+                continue
+            if parsed.underlying != f"{base_currency}USD":
+                continue
+            expiry = datetime.combine(parsed.expiry_date, datetime.min.time(), tzinfo=UTC)
+            instruments.append(
+                OptionInstrument.model_validate(
+                    {
+                        "symbolName": symbol,
+                        "baseCurrency": base_currency,
+                        "strike": parsed.strike,
+                        "expirationTimestamp": int(expiry.timestamp() * 1000),
+                        "isActive": True,
+                        "minQty": 0.01,
+                        "tickSize": 0.01,
+                    }
+                )
+            )
+        return tuple(instruments)
 
     async def create_rfq(self, legs: tuple[RfqLeg, ...]) -> str:
         request_id = f"rfq-{self._next_rfq_id}"

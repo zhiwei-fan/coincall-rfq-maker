@@ -25,7 +25,13 @@ from coincall_rfq_maker.core.adapters.rest import (
     track_exchange_io,
 )
 from coincall_rfq_maker.core.clock import get_timestamp_ms
-from coincall_rfq_maker.domain.instruments import Instrument, InstrumentParseError, parse_instrument
+from coincall_rfq_maker.domain.instruments import (
+    ExpiryMismatchError,
+    InstrumentParseError,
+    ParsedInstrument,
+    parse_instrument,
+    resolve_instrument,
+)
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStage, RfqStatus
 from coincall_rfq_maker.events import (
@@ -37,6 +43,7 @@ from coincall_rfq_maker.events import (
     RfqTerminated,
     TradeExecuted,
 )
+from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import PricingModel
@@ -176,6 +183,7 @@ class Orchestrator:
         pricing_model: PricingModel,
         risk_gate: RiskGate,
         quote_lifecycle: QuoteLifecycle,
+        instrument_catalog: InstrumentCatalog,
         persistence: PersistenceStore | None = None,
         outage_gate: TransientOutageGate | None = None,
     ) -> None:
@@ -183,6 +191,7 @@ class Orchestrator:
         self._pricing_model = pricing_model
         self._risk_gate = risk_gate
         self._quotes = quote_lifecycle
+        self._instruments = instrument_catalog
         self._persistence = persistence
         self._outage_gate = outage_gate if outage_gate is not None else TransientOutageGate()
         self.rfq_store = RfqStore()
@@ -315,10 +324,33 @@ class Orchestrator:
         ages: dict[str, float] = {}
         for name in rfq.instrument_names():
             try:
-                instrument = parse_instrument(name)
+                parsed = parse_instrument(name)
             except InstrumentParseError:
                 logger.warning("Cannot price unparseable instrument %s", name)
                 return
+            expiration_ms = await self._instruments.expiration_ms(name)
+            if expiration_ms is None:
+                logger.warning(
+                    "Not quoting RFQ %s: expiry metadata unavailable for %s (fail-closed)",
+                    request_id,
+                    name,
+                )
+                await self._withdraw_rejected_quote(request_id, f"no expiry metadata for {name}")
+                return
+            try:
+                instrument = resolve_instrument(parsed, expiration_ms)
+            except ExpiryMismatchError:
+                logger.error(
+                    "Not quoting RFQ %s: exchange expiry for %s contradicts its symbol date",
+                    request_id,
+                    name,
+                    exc_info=True,
+                )
+                await self._withdraw_rejected_quote(request_id, f"expiry mismatch for {name}")
+                return
+            # Pricing only receives exchange expiry metadata that passed the symbol-date
+            # cross-check. ParsedInstrument has no expiry instant, making 00:00 UTC
+            # fabrication a type error; missing or contradictory metadata withdraws.
             underlying_price = self._market_data.get_price(instrument.underlying)
             if underlying_price is None:
                 logger.debug("No price yet for %s (RFQ %s)", instrument.underlying, request_id)
@@ -412,7 +444,7 @@ class Orchestrator:
                 )
 
 
-def _safe_parse(name: str) -> Instrument | None:
+def _safe_parse(name: str) -> ParsedInstrument | None:
     try:
         return parse_instrument(name)
     except InstrumentParseError:

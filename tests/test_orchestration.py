@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -22,17 +23,38 @@ from coincall_rfq_maker.core.adapters.schemas import (
     RfqListSnapshot,
 )
 from coincall_rfq_maker.core.clock import get_timestamp_ms
+from coincall_rfq_maker.domain.instruments import parse_instrument
 from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
-from coincall_rfq_maker.orchestration import Orchestrator, TransientOutageGate
-from coincall_rfq_maker.pricing.engine import LegPrice
+from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
+from coincall_rfq_maker.orchestration import Orchestrator as _Orchestrator
+from coincall_rfq_maker.orchestration import TransientOutageGate
+from coincall_rfq_maker.pricing import engine as pricing_engine
+from coincall_rfq_maker.pricing.engine import BlackScholesModel, LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.reconciler import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS
 from coincall_rfq_maker.risk.gate import RiskDecision, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
+
+
+class FakeInstrumentCatalog:
+    """Exchange expiry metadata fixture for legacy orchestration test setup."""
+
+    async def expiration_ms(self, symbol: str) -> int:
+        parsed = parse_instrument(symbol)
+        expiry = datetime.combine(parsed.expiry_date, datetime.min.time(), tzinfo=UTC)
+        return int(expiry.replace(hour=8).timestamp() * 1000)
+
+
+class Orchestrator(_Orchestrator):
+    """Supply valid exchange metadata to tests unrelated to expiry resolution."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("instrument_catalog", FakeInstrumentCatalog())
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
 
 class FakeRest:
@@ -220,6 +242,26 @@ class FakePricingModel:
 class UnpriceablePricingModel:
     def price(self, *args: object, **kwargs: object) -> None:
         return None
+
+
+class AssertionPricingModel:
+    def price(self, *args: object, **kwargs: object) -> LegPrice:
+        raise AssertionError("pricing must not receive missing expiry metadata")
+
+
+class StaticInstrumentCatalog:
+    def __init__(self, expiration: int | None) -> None:
+        self.expiration = expiration
+
+    async def expiration_ms(self, symbol: str) -> int | None:
+        assert symbol == "BTCUSD-09JUL26-56000-C"
+        return self.expiration
+
+
+class FailingInstrumentRest(FakeRest):
+    async def get_option_instruments(self, base: str) -> tuple[object, ...]:
+        assert base == "BTC"
+        raise RuntimeError("exchange unavailable")
 
 
 class RecordingQuoteLifecycle(QuoteLifecycle):
@@ -1054,6 +1096,114 @@ async def test_unpriceable_leg_withdraws_existing_open_quote_without_creating() 
         quote_lifecycle=quotes,
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+
+    assert rest.create_calls == []
+    assert quotes.withdrawn_for == ["rfq-1"]
+    assert rest.cancel_calls == [existing.quote_id]
+
+
+@pytest.mark.asyncio
+async def test_exchange_expiry_on_expiry_day_submits_a_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object | None = None) -> datetime:
+            return datetime(2026, 7, 9, 2, tzinfo=UTC)
+
+    monkeypatch.setattr(pricing_engine, "datetime", FrozenDateTime)
+    rest = FakeRest()
+    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    orchestrator = _Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=60_000.0),  # type: ignore[arg-type]
+        pricing_model=BlackScholesModel(),
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+        instrument_catalog=StaticInstrumentCatalog(1_783_584_000_000),  # type: ignore[arg-type]
+    )
+    rfq = Rfq(
+        request_id="rfq-1",
+        status=RfqStatus.ACTIVE,
+        legs=(RfqLeg("BTCUSD-09JUL26-56000-C", Side.BUY, "1"),),
+        create_time_ms=0,
+        expiry_time_ms=4_000_000_000_000,
+    )
+    orchestrator.rfq_store.upsert(rfq)
+
+    await orchestrator.reprice_all_active()
+
+    assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_expiry_mismatch_withdraws_without_submitting() -> None:
+    rest = FakeRest()
+    quotes = RecordingQuoteLifecycle(rest)
+    existing = await quotes.reconcile(
+        QuoteIntent(
+            request_id="rfq-1",
+            legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+        )
+    )
+    assert existing.quote_id is not None
+    rest.create_calls.clear()
+    orchestrator = _Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=60_000.0),  # type: ignore[arg-type]
+        pricing_model=AssertionPricingModel(),  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+        instrument_catalog=StaticInstrumentCatalog(1_783_670_400_000),  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(
+        Rfq(
+            request_id="rfq-1",
+            status=RfqStatus.ACTIVE,
+            legs=(RfqLeg("BTCUSD-09JUL26-56000-C", Side.BUY, "1"),),
+            create_time_ms=0,
+            expiry_time_ms=4_000_000_000_000,
+        )
+    )
+
+    await orchestrator.reprice_all_active()
+
+    assert rest.create_calls == []
+    assert quotes.withdrawn_for == ["rfq-1"]
+    assert rest.cancel_calls == [existing.quote_id]
+
+
+@pytest.mark.asyncio
+async def test_missing_exchange_expiry_metadata_never_calls_pricing_and_withdraws() -> None:
+    rest = FailingInstrumentRest()
+    quotes = RecordingQuoteLifecycle(rest)
+    existing = await quotes.reconcile(
+        QuoteIntent(
+            request_id="rfq-1",
+            legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+        )
+    )
+    assert existing.quote_id is not None
+    rest.create_calls.clear()
+    orchestrator = _Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=60_000.0),  # type: ignore[arg-type]
+        pricing_model=AssertionPricingModel(),  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,
+        instrument_catalog=InstrumentCatalog(rest),  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(
+        Rfq(
+            request_id="rfq-1",
+            status=RfqStatus.ACTIVE,
+            legs=(RfqLeg("BTCUSD-09JUL26-56000-C", Side.BUY, "1"),),
+            create_time_ms=0,
+            expiry_time_ms=4_000_000_000_000,
+        )
+    )
 
     await orchestrator.reprice_all_active()
 
