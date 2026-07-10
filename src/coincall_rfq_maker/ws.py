@@ -73,6 +73,9 @@ class DtCode(IntEnum):
     BLOCK_TRADE_PUBLIC = 23
 
 
+_CAPTURED_DT_CODES = frozenset({DtCode.RFQ_QUOTE, DtCode.RFQ_QUOTE_PUSH})
+
+
 def parse_ws_message(raw: str) -> WsEvent | None:
     """Parse one raw WS text frame into a typed event, or None if it's a
     control message / heartbeat / unroutable payload (which is logged)."""
@@ -97,18 +100,23 @@ def parse_ws_message(raw: str) -> WsEvent | None:
             logger.debug("WS message with no dt/control fields: %s", obj)
         return None
 
+    if envelope.dt in _CAPTURED_DT_CODES and logger.isEnabledFor(logging.DEBUG):
+        text, size = _render_frame(obj)
+        logger.debug("WS quote frame dt=%s (%d chars): %s", envelope.dt, size, text)
+
     data = envelope.d or {}
     if envelope.dt == DtCode.RFQ_MAKER:
         return _parse_rfq_event(data)
     if envelope.dt in {DtCode.RFQ_QUOTE, DtCode.RFQ_QUOTE_PUSH}:
-        return _parse_quote_event(data)
+        return _parse_quote_event(data, envelope.dt)
     if envelope.dt == DtCode.BLOCK_TRADE_DETAIL:
         return _parse_trade_event(data)
     if envelope.dt == DtCode.BLOCK_TRADE_PUBLIC:
         logger.debug("Ignoring public block trade tape message")
         return None
 
-    logger.warning("Unknown WS dt code %s, ignoring", envelope.dt)
+    text, size = _render_frame(obj)
+    logger.warning("Unknown WS dt code %s, ignoring frame (%d chars): %s", envelope.dt, size, text)
     return None
 
 
@@ -130,19 +138,15 @@ def _parse_rfq_event(data: dict[str, object]) -> RfqReceived | RfqTerminated | N
     return None
 
 
-def _parse_quote_event(data: dict[str, object]) -> QuoteUpdated | None:
+def _parse_quote_event(data: dict[str, object], dt: int) -> QuoteUpdated | None:
     try:
         payload = QuotePayload.model_validate(data)
     except ValidationError as exc:
-        logger.warning("Malformed quote WS payload: %s", exc)
-        logger.debug(
-            "Malformed quote WS raw payload: %.200s",
-            _redact_ws_exception_message(Exception(str(data))),
-        )
+        logger.warning("Malformed quote WS payload (dt=%s): %s", dt, exc)
         return None
     stage = quote_stage_from_wire(payload.state)
     if stage is None:
-        logger.warning("Unknown quote state %r for %s", payload.state, payload.quote_id)
+        logger.warning("Unknown quote state %r for %s (dt=%s)", payload.state, payload.quote_id, dt)
         return None
     return QuoteUpdated(
         quote_id=payload.quote_id,
@@ -182,6 +186,33 @@ def _redact_ws_exception_message(exc: Exception) -> str:
 
     message = _SIGNED_URL_RE.sub(redact_url, message)
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", message)
+
+
+_SENSITIVE_PAYLOAD_KEYS = frozenset(
+    {"apikey", "apisecret", "sign", "signature", "secret", "token", "authorization", "passphrase"}
+)
+
+
+def _sanitize_payload(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(k): (
+                "<redacted>" if str(k).lower() in _SENSITIVE_PAYLOAD_KEYS else _sanitize_payload(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_payload(item) for item in value]
+    return value
+
+
+_MAX_FRAME_CHARS = 8192
+
+
+def _render_frame(obj: object) -> tuple[str, int]:
+    """Return (sanitized canonical JSON capped at `_MAX_FRAME_CHARS`, its true char count)."""
+    text = json.dumps(_sanitize_payload(obj), separators=(",", ":"), sort_keys=True, default=str)
+    return text[:_MAX_FRAME_CHARS], len(text)
 
 
 class CoincallWsClient:

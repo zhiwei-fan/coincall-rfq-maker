@@ -99,7 +99,31 @@ def test_malformed_dt_20_quote_update_ignored() -> None:
     assert parse_ws_message(raw) is None
 
 
-def test_malformed_dt_130_quote_push_logs_debug_payload_not_unknown(
+def test_dt_130_and_dt_20_well_formed_capture_debug_frame(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "quoteId": "q-1",
+        "requestId": "rfq-1",
+        "state": "FILLED",
+        "filledPrice": 22.5,
+        "filledQuantity": 1.0,
+        "blockTradeId": "bt-1",
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        parse_ws_message(json.dumps({"dt": 20, "d": payload}))
+        parse_ws_message(json.dumps({"dt": 130, "d": payload}))
+
+    dt_20_records = [r for r in caplog.records if r.message.startswith("WS quote frame dt=20 ")]
+    dt_130_records = [r for r in caplog.records if r.message.startswith("WS quote frame dt=130 ")]
+    assert len(dt_20_records) == 1
+    assert len(dt_130_records) == 1
+    assert '"quoteId":"q-1"' in dt_20_records[0].message
+    assert '"quoteId":"q-1"' in dt_130_records[0].message
+
+
+def test_malformed_dt_130_quote_push_warns_with_dt_and_captures_full_frame(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     raw = json.dumps(
@@ -108,7 +132,6 @@ def test_malformed_dt_130_quote_push_logs_debug_payload_not_unknown(
             "d": {
                 "requestId": "rfq-1",
                 "state": "FILLED",
-                "apiKey": "secret-key",
                 "note": "x" * 300,
             },
         }
@@ -117,12 +140,79 @@ def test_malformed_dt_130_quote_push_logs_debug_payload_not_unknown(
     with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
         assert parse_ws_message(raw) is None
 
-    assert "Malformed quote WS payload" in caplog.text
-    assert "Malformed quote WS raw payload" in caplog.text
+    assert "Malformed quote WS payload (dt=130)" in caplog.text
     assert "Unknown WS dt code" not in caplog.text
-    for record in caplog.records:
-        if record.message.startswith("Malformed quote WS raw payload"):
-            assert len(record.message.removeprefix("Malformed quote WS raw payload: ")) <= 200
+
+    capture_records = [r for r in caplog.records if r.message.startswith("WS quote frame dt=130")]
+    assert len(capture_records) == 1
+    assert ("x" * 300) in capture_records[0].message
+
+
+def test_sanitizer_redacts_nested_api_key_in_captured_frame(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = json.dumps(
+        {
+            "dt": 130,
+            "d": {
+                "quoteId": "q-1",
+                "requestId": "rfq-1",
+                "state": "FILLED",
+                "filledPrice": 22.5,
+                "filledQuantity": 1.0,
+                "blockTradeId": "bt-1",
+                "apiKey": "secret-key",
+            },
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        parse_ws_message(raw)
+
+    assert "secret-key" not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+def test_captured_frame_over_cap_truncates_message_but_reports_full_length(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "quoteId": "q-1",
+        "requestId": "rfq-1",
+        "state": "FILLED",
+        "filledPrice": 22.5,
+        "filledQuantity": 1.0,
+        "blockTradeId": "bt-1",
+        "note": "y" * 9000,
+    }
+    raw = json.dumps({"dt": 130, "d": payload})
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        parse_ws_message(raw)
+
+    capture_records = [r for r in caplog.records if r.message.startswith("WS quote frame dt=130")]
+    assert len(capture_records) == 1
+    message = capture_records[0].message
+
+    prefix = "WS quote frame dt=130 ("
+    assert message.startswith(prefix)
+    size_str, rendered = message[len(prefix) :].split(" chars): ", 1)
+    reported_size = int(size_str)
+
+    assert reported_size > ws._MAX_FRAME_CHARS
+    assert len(rendered) <= ws._MAX_FRAME_CHARS
+    assert ("y" * 9000) not in rendered
+
+
+def test_dt_23_block_trade_public_does_not_emit_quote_frame_capture(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = json.dumps({"dt": 23, "d": {"instrumentName": "BTCUSD-21AUG25-120000-C"}})
+
+    with caplog.at_level(logging.DEBUG, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert not any(record.message.startswith("WS quote frame") for record in caplog.records)
 
 
 def test_dt_22_block_trade_detail_produces_trade_executed() -> None:
@@ -185,9 +275,16 @@ def test_dt_23_block_trade_public_ignored() -> None:
     assert parse_ws_message(raw) is None
 
 
-def test_unknown_dt_code_ignored() -> None:
-    raw = json.dumps({"dt": 9999, "d": {}})
-    assert parse_ws_message(raw) is None
+def test_unknown_dt_code_ignored_but_payload_is_captured_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = json.dumps({"dt": 9999, "d": {"foo": "bar"}})
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.ws"):
+        assert parse_ws_message(raw) is None
+
+    assert "Unknown WS dt code 9999" in caplog.text
+    assert '"foo":"bar"' in caplog.text
 
 
 def test_subscription_ack_ignored() -> None:
