@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Any
 
@@ -21,7 +20,6 @@ from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.risk.gate import RiskGate
-from coincall_rfq_maker.testing.fake_exchange import FakeExchange
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 
@@ -1210,14 +1208,3 @@ async def test_apply_ws_update_for_unknown_quote_is_ignored() -> None:
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
     event = QuoteUpdated(quote_id="ghost", request_id="rfq-x", stage=QuoteStage.OPEN)
     assert lifecycle.apply_ws_update(event) is None
-
-
-@pytest.mark.asyncio
-async def test_fake_exchange_unknown_symbol_raises_api_error() -> None:
-    exchange = FakeExchange(asyncio.Queue())
-
-    with pytest.raises(CoincallApiError) as exc_info:
-        await exchange.get_symbol_info("ETHUSD")
-
-    assert exc_info.value.status == 200
-    assert exc_info.value.code == 400001

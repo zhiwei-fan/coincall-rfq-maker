@@ -92,7 +92,6 @@ forbidden_modules = [
     "coincall_rfq_maker.quoting",
     "coincall_rfq_maker.risk",
     "coincall_rfq_maker.persistence",
-    "coincall_rfq_maker.testing",
 ]
 
 [[tool.importlinter.contracts]]

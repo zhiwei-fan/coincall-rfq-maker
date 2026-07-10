@@ -78,8 +78,7 @@ uv run rfq-maker --no-dry-run  # actually submit quotes (use with care)
 quotes, requotes on price moves, and records fills. `rfq-taker` is a **live
 trading CLI** for a separate taker account — its `execute` and `trade`
 commands place **REAL block trades** against the configured Coincall host.
-It is not a simulator: the in-process fake exchange used by the test suite
-lives in `coincall_rfq_maker.testing` and is only reachable from tests.
+It is not a simulator.
 
 Safety rails on `rfq-taker`: it requires its own `TAKER_API_KEY` /
 `TAKER_API_SECRET` (it never falls back to the maker credentials), refuses a
