@@ -61,68 +61,82 @@ class Reconciler:
         self._on_api_recovery = on_api_recovery
         self._persistence = persistence
         self._orphan_cancel_failures: dict[str, int] = {}
+        self.last_cycle_completed_ms: int | None = None
 
     async def reconcile_with_exchange(self) -> None:
-        strikes_before = self._risk_gate.failures_total
-        # Treats the OPEN rfqList response as a COMPLETE snapshot: RFQs absent from it
-        # (past the grace window) are expired locally. Owner-confirmed 2026-07-09 that
-        # Coincall's rfqList does not paginate. If it ever gains paging, this single-page
-        # fetch would wrongly expire RFQs on later pages — page through all results first.
         try:
-            remote_rfqs = await self._rest.get_rfq_list(state="OPEN")
-        except CoincallError as exc:
-            logger.exception("Reconciler failed to fetch RFQ list")
-            if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
-                self._risk_gate.record_api_failure()
-            return
-        remote_ids = set(remote_rfqs.malformed_request_ids)
-        for request_id in remote_rfqs.malformed_request_ids:
-            logger.warning(
-                "Reconciler: RFQ %s present in exchange OPEN snapshot but payload was malformed",
-                request_id,
-            )
-        seen_remote_ids = set()
-        for payload in remote_rfqs.payloads:
-            if payload.request_id in seen_remote_ids:
-                continue
-            seen_remote_ids.add(payload.request_id)
-            remote_ids.add(payload.request_id)
-            if self._rfqs.get(payload.request_id) is not None:
-                continue
-            rfq = rfq_from_payload(payload)
-            if rfq.status is not RfqStatus.ACTIVE:
-                continue
-            logger.info("Reconciler: backfilling open RFQ %s from exchange", rfq.request_id)
-            await self._on_rfq_backfill(rfq)
-
-        await self._expire_rfqs_absent_from_open_snapshot(remote_ids)
-        for rfq in self._rfqs.terminal():
-            if self._quotes.has_open_or_pending_quote_for_rfq(rfq.request_id):
-                logger.info(
-                    "Reconciler: retrying terminal cleanup for RFQ %s",
-                    rfq.request_id,
+            strikes_before = self._risk_gate.failures_total
+            # Treats the OPEN rfqList response as a COMPLETE snapshot: RFQs absent from it
+            # (past the grace window) are expired locally. Owner-confirmed 2026-07-09 that
+            # Coincall's rfqList does not paginate. If it ever gains paging, this single-page
+            # fetch would wrongly expire RFQs on later pages — page through all results first.
+            try:
+                remote_rfqs = await self._rest.get_rfq_list(state="OPEN")
+            except CoincallError as exc:
+                logger.exception("Reconciler failed to fetch RFQ list")
+                if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
+                    self._risk_gate.record_api_failure()
+                return
+            remote_ids = set(remote_rfqs.malformed_request_ids)
+            for request_id in remote_rfqs.malformed_request_ids:
+                logger.warning(
+                    "Reconciler: RFQ %s present in exchange OPEN snapshot but payload was "
+                    "malformed",
+                    request_id,
                 )
-                await self._on_terminal_rfq(rfq.request_id, rfq.status)
+            seen_remote_ids = set()
+            for payload in remote_rfqs.payloads:
+                if payload.request_id in seen_remote_ids:
+                    continue
+                seen_remote_ids.add(payload.request_id)
+                remote_ids.add(payload.request_id)
+                if self._rfqs.get(payload.request_id) is not None:
+                    continue
+                rfq = rfq_from_payload(payload)
+                if rfq.status is not RfqStatus.ACTIVE:
+                    continue
+                logger.info("Reconciler: backfilling open RFQ %s from exchange", rfq.request_id)
+                await self._on_rfq_backfill(rfq)
 
-        if not await self._reconcile_quote_state():
-            return
+            await self._expire_rfqs_absent_from_open_snapshot(remote_ids)
+            for rfq in self._rfqs.terminal():
+                if self._quotes.has_open_or_pending_quote_for_rfq(rfq.request_id):
+                    logger.info(
+                        "Reconciler: retrying terminal cleanup for RFQ %s",
+                        rfq.request_id,
+                    )
+                    await self._on_terminal_rfq(rfq.request_id, rfq.status)
 
-        # INVARIANT: cleanup failures may withhold the streak-clear, but must NEVER withhold the
-        # outage-gate recovery -- the reconciler's GETs are the sole quiet-book recovery signal,
-        # and withholding them latches the backoff on a healthy exchange.
-        self._on_api_recovery()
-        # A mid-cycle boundary SUCCESS (a resolve/cancel that worked) still resets the streak on
-        # its own -- that is real exchange I/O and is correct.
-        strikes = self._risk_gate.failures_total - strikes_before
-        if strikes == 0:
-            self._risk_gate.record_api_success()
-        else:
-            logger.warning(
-                "Reconcile cycle completed with %d persistent failure(s); kill-switch streak "
-                "preserved (streak=%d)",
-                strikes,
+            if not await self._reconcile_quote_state():
+                return
+
+            # INVARIANT: cleanup failures may withhold the streak-clear, but must NEVER withhold
+            # the outage-gate recovery -- the reconciler's GETs are the sole quiet-book recovery
+            # signal, and withholding them latches the backoff on a healthy exchange.
+            self._on_api_recovery()
+            # A mid-cycle boundary SUCCESS (a resolve/cancel that worked) still resets the streak
+            # on its own -- that is real exchange I/O and is correct.
+            strikes = self._risk_gate.failures_total - strikes_before
+            if strikes == 0:
+                self._risk_gate.record_api_success()
+            else:
+                logger.warning(
+                    "Reconcile cycle completed with %d persistent failure(s); kill-switch streak "
+                    "preserved (streak=%d)",
+                    strikes,
+                    self._risk_gate.consecutive_failures,
+                )
+            logger.info(
+                "Reconcile cycle ok: rfqs_active=%d quotes_tracked=%d clean=%s streak=%d",
+                len(self._rfqs.active()),
+                len(self._quotes.non_terminal_quotes()),
+                strikes == 0,
                 self._risk_gate.consecutive_failures,
             )
+        finally:
+            # This is a LIVENESS stamp, not a health stamp: failed fetches stamp too.
+            # The watchdog detects a wedged loop, not a failing exchange.
+            self.last_cycle_completed_ms = get_timestamp_ms()
 
     async def _expire_rfqs_absent_from_open_snapshot(self, remote_ids: set[str]) -> None:
         now_ms = get_timestamp_ms()

@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from pydantic import ValidationError
 
 from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
@@ -30,6 +31,7 @@ from coincall_rfq_maker.ws import CoincallWsClient
 logger = logging.getLogger(__name__)
 
 RECONCILE_INTERVAL_SECONDS = 60.0
+_RECONCILER_STALL_FACTOR = 3
 _FLATTEN_RETRY_INITIAL_SECONDS = 1.0
 _FLATTEN_RETRY_CAP_SECONDS = 30.0
 
@@ -100,6 +102,36 @@ async def _reconcile_loop(
     events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
     await _tick_loop(events, shutdown, interval_seconds, ReconcileTick())
+
+
+def _reconciler_is_stalled(now_ms: int, baseline_ms: int, interval_seconds: float) -> bool:
+    """A reconcile cycle should complete every interval; tolerate _RECONCILER_STALL_FACTOR of them.
+
+    The factor is the whole knob: too small and a merely busy dispatcher cries stall, too large and
+    a wedged reconciler -- the sole quiet-book recovery signal -- goes unreported for many minutes.
+    """
+    return now_ms - baseline_ms > _RECONCILER_STALL_FACTOR * interval_seconds * 1000
+
+
+async def _reconciler_watchdog(orchestrator: Orchestrator, shutdown: asyncio.Event) -> None:
+    started_ms = get_timestamp_ms()
+    while not shutdown.is_set():
+        try:
+            async with asyncio.timeout(RECONCILE_INTERVAL_SECONDS):
+                await shutdown.wait()
+            return
+        except TimeoutError:
+            last = orchestrator.reconciler_last_cycle_ms
+            baseline = last if last is not None else started_ms
+            now_ms = get_timestamp_ms()
+            if _reconciler_is_stalled(now_ms, baseline, RECONCILE_INTERVAL_SECONDS):
+                # A busy serial dispatcher must never turn this observation into a process-lifetime
+                # halt. This is deliberately ERROR-only; external monitoring escalates.
+                logger.error(
+                    "RECONCILER STALLED: no completed reconcile cycle for %.0fs -- sole "
+                    "quiet-book recovery signal (backoff may latch); investigate the dispatcher",
+                    (now_ms - baseline) / 1000,
+                )
 
 
 async def _tick_loop(
@@ -275,6 +307,12 @@ async def run_async(settings: MakerSettings) -> None:
             except CoincallError as exc:
                 sys.stderr.write(f"Startup error: failed to cancel all quotes: {exc}\n")
                 raise SystemExit(1) from exc
+        else:
+            logger.warning(
+                "CANCEL_ALL_ON_START=false: pre-existing exchange quotes will be adopted or "
+                "50012-conflict-resolved on first reconcile; startup ordering may produce "
+                "transient duplicate-quote conflicts (supported config is true)"
+            )
 
         await _enqueue_startup_backfill(events)
 
@@ -294,6 +332,10 @@ async def run_async(settings: MakerSettings) -> None:
                 tg.create_task(
                     _reconcile_loop(events, shutdown, RECONCILE_INTERVAL_SECONDS),
                     name="reconciler",
+                )
+                tg.create_task(
+                    _reconciler_watchdog(orchestrator, shutdown),
+                    name="reconciler-watchdog",
                 )
                 tg.create_task(
                     _flatten_on_kill_switch(kill_switch_trip, shutdown, quote_lifecycle, risk_gate),

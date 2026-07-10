@@ -421,6 +421,49 @@ async def test_reconciler_converges_when_exchange_matches_local_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconciler_quiet_cycle_emits_one_heartbeat_per_cycle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = FakeRest(open_request_ids=[])
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=FakeQuoteLifecycle(),  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level(logging.INFO, logger="coincall_rfq_maker.reconciler"):
+        await orchestrator.reconcile_with_exchange()
+        await orchestrator.reconcile_with_exchange()
+
+    heartbeats = [
+        record for record in caplog.records if record.getMessage().startswith("Reconcile cycle ok:")
+    ]
+    assert len(heartbeats) == 2
+
+
+@pytest.mark.asyncio
+async def test_reconciler_stamps_liveness_when_rfq_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.get_rfq_error = CoincallRequestError("network down")
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=None,  # type: ignore[arg-type]
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=FakeQuoteLifecycle(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(reconciler, "get_timestamp_ms", lambda: 123_456)
+
+    assert orchestrator.reconciler_last_cycle_ms is None
+    await orchestrator.reconcile_with_exchange()
+    assert orchestrator.reconciler_last_cycle_ms == 123_456
+
+
+@pytest.mark.asyncio
 async def test_reconciler_backfills_unknown_open_rfq_and_dedupes_next_pass() -> None:
     rest = FakeRest()
     rest.rfq_list_items = [make_rfq_payload("rfq-1"), make_rfq_payload("rfq-1")]

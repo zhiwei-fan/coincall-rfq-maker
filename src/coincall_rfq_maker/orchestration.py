@@ -217,6 +217,10 @@ class Orchestrator:
     async def reconcile_with_exchange(self) -> None:
         await self._reconciler.reconcile_with_exchange()
 
+    @property
+    def reconciler_last_cycle_ms(self) -> int | None:
+        return self._reconciler.last_cycle_completed_ms
+
     async def _handle_rfq_received(self, rfq: Rfq) -> None:
         now_ms = get_timestamp_ms()
         self.rfq_store.upsert(rfq, received_at_ms=now_ms)

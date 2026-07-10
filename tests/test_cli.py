@@ -139,6 +139,8 @@ class ShutdownRaceMarketData:
 
 
 class NoopOrchestrator:
+    reconciler_last_cycle_ms = None
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
 
@@ -163,6 +165,24 @@ class ShutdownOnPutQueue:
     async def put(self, event: object) -> None:
         self.puts += 1
         raise asyncio.QueueShutDown
+
+
+class WatchdogRiskGate:
+    def __init__(self) -> None:
+        self.kill_switch_tripped = False
+        self.failures_recorded = 0
+
+
+class WatchdogOrchestrator:
+    def __init__(self, last_cycle_ms: int, shutdown: asyncio.Event) -> None:
+        self._last_cycle_ms = last_cycle_ms
+        self._shutdown = shutdown
+        self.risk_gate = WatchdogRiskGate()
+
+    @property
+    def reconciler_last_cycle_ms(self) -> int:
+        self._shutdown.set()
+        return self._last_cycle_ms
 
 
 def test_load_settings_error_does_not_print_secret_value(
@@ -490,6 +510,66 @@ async def test_reconcile_loop_exits_cleanly_when_queue_shutdown_races_put() -> N
 
 
 @pytest.mark.asyncio
+async def test_reconciler_watchdog_logs_stall_without_recording_a_risk_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    shutdown = asyncio.Event()
+    orchestrator = WatchdogOrchestrator(last_cycle_ms=800_000, shutdown=shutdown)
+    monkeypatch.setattr(cli, "RECONCILE_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(cli, "get_timestamp_ms", lambda: 1_000_000)
+
+    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.cli"):
+        await asyncio.wait_for(cli._reconciler_watchdog(orchestrator, shutdown), timeout=1.0)  # type: ignore[arg-type]
+
+    assert "RECONCILER STALLED" in caplog.text
+    assert orchestrator.risk_gate.kill_switch_tripped is False
+    assert orchestrator.risk_gate.failures_recorded == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciler_watchdog_is_quiet_for_a_fresh_cycle(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    shutdown = asyncio.Event()
+    orchestrator = WatchdogOrchestrator(last_cycle_ms=999_999, shutdown=shutdown)
+    monkeypatch.setattr(cli, "RECONCILE_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(cli, "get_timestamp_ms", lambda: 1_000_000)
+
+    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.cli"):
+        await asyncio.wait_for(cli._reconciler_watchdog(orchestrator, shutdown), timeout=1.0)  # type: ignore[arg-type]
+
+    assert "RECONCILER STALLED" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_all_on_start", [False, True])
+async def test_run_async_warns_only_when_startup_cancel_all_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cancel_all_on_start: bool,
+) -> None:
+    monkeypatch.setattr(cli, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=cancel_all_on_start,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.cli"):
+        await cli.run_async(settings)
+
+    warning = "CANCEL_ALL_ON_START=false: pre-existing exchange quotes"
+    assert (warning in caplog.text) is (not cancel_all_on_start)
+
+
+@pytest.mark.asyncio
 async def test_startup_backfill_tick_is_enqueued_before_timer_events() -> None:
     queue: asyncio.Queue[object] = asyncio.Queue()
 
@@ -524,3 +604,14 @@ def test_flatten_retry_delay_backs_off_and_stays_capped() -> None:
     assert cli._flatten_retry_delay(3) == 4 * cli._FLATTEN_RETRY_INITIAL_SECONDS
     assert cli._flatten_retry_delay(20) == cli._FLATTEN_RETRY_CAP_SECONDS
     assert cli._flatten_retry_delay(200) == cli._FLATTEN_RETRY_CAP_SECONDS
+
+
+def test_reconciler_stall_threshold_is_three_intervals() -> None:
+    # The tolerated silence is exactly _RECONCILER_STALL_FACTOR intervals. Without this the
+    # factor is unpinned: the stall tests use a stamp so old that any factor fires.
+    interval = 60.0
+    three_intervals_ms = int(3 * interval * 1000)
+    now = 10_000_000
+    assert not cli._reconciler_is_stalled(now, now - (three_intervals_ms - 1), interval)
+    assert not cli._reconciler_is_stalled(now, now - three_intervals_ms, interval)
+    assert cli._reconciler_is_stalled(now, now - (three_intervals_ms + 1), interval)
