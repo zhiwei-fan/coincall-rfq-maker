@@ -11,7 +11,6 @@ from dataclasses import replace
 from coincall_rfq_maker.core.adapters.rest import (
     CoincallAmbiguousError,
     CoincallError,
-    CoincallRequestError,
     CoincallRestClient,
 )
 from coincall_rfq_maker.core.adapters.schemas import (
@@ -337,9 +336,8 @@ class QuoteLifecycle:
     async def _resolve_ambiguous_create(self, pending: Quote, exc: CoincallAmbiguousError) -> Quote:
         opened = await self._verify_pending_create(pending)
         if opened is None:
-            raise CoincallRequestError(
-                f"Ambiguous create for RFQ {pending.request_id} was not found open on exchange"
-            ) from exc
+            # One OPEN-list read may lag the exchange, so absence does not prove failure.
+            raise exc
         return opened
 
     async def _verify_pending_create(self, pending: Quote) -> Quote | None:

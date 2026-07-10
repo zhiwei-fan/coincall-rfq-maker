@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from coincall_rfq_maker import reconciler
+from coincall_rfq_maker import cli, reconciler
 from coincall_rfq_maker.core.adapters.rest import (
     ApiFailureKind,
     CoincallAmbiguousError,
@@ -18,6 +18,7 @@ from coincall_rfq_maker.core.adapters.schemas import (
     QuoteListSnapshot,
     RfqListSnapshot,
 )
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
@@ -884,6 +885,47 @@ async def test_ambiguous_quote_failure_sets_global_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_unverified_ambiguous_create_uses_cooldown_without_tripping_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wall_now_ms = get_timestamp_ms()
+    timestamps = iter((wall_now_ms - 10_000, wall_now_ms))
+    monkeypatch.setattr(
+        "coincall_rfq_maker.orchestration.get_timestamp_ms",
+        lambda: next(timestamps),
+    )
+    rest = FakeRest()
+    rest.create_error = CoincallAmbiguousError("timeout")
+    rest.quote_list_response = {"code": 0, "data": []}
+    market_data = FakeMarketData(price=50_000.0)
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=0.0,
+        stale_market_data_seconds=30.0,
+        kill_switch_threshold=1,
+    )
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
+    orchestrator = Orchestrator(
+        rest_client=rest,  # type: ignore[arg-type]
+        market_data=market_data,  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=risk_gate,
+        quote_lifecycle=quotes,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=wall_now_ms)
+
+    await orchestrator.reprice_all_active()
+
+    assert not risk_gate.kill_switch_tripped
+    assert orchestrator._outage_gate.in_cooldown(wall_now_ms)
+    current = quotes.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is QuoteStage.PENDING_CREATE
+    assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancel_all_bypasses_active_outage_cooldown() -> None:
     rest = FakeRest()
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
@@ -894,9 +936,13 @@ async def test_shutdown_cancel_all_bypasses_active_outage_cooldown() -> None:
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
     )
-    orchestrator._outage_gate.record_transient(1_000)
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+    orchestrator._outage_gate.record_transient(get_timestamp_ms() + 60_000)
 
-    await quotes.cancel_all()
+    await orchestrator.reprice_all_active()
+    assert rest.create_calls == []
+
+    await cli._cancel_all_on_graceful_stop(quotes)
 
     assert rest.cancel_all_calls == 1
 
@@ -1078,7 +1124,7 @@ async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evi
     assert rest.cancel_calls == [quote.quote_id]
 
     rest.cancel_error = None
-    orchestrator._outage_gate.record_transient(1_000)
+    orchestrator._outage_gate.record_transient(get_timestamp_ms() + 60_000)
     await orchestrator.handle_event(ReconcileTick())
 
     assert orchestrator.rfq_store.get("rfq-1") is None

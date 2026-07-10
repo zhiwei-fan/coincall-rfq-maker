@@ -188,9 +188,11 @@ async def test_idempotent_get_transient_failure_retries_max_attempts_then_raises
 
     monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.asyncio.sleep", fake_sleep)
 
-    with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
+    with pytest.raises(CoincallConnectivityError, match="failed after 3 attempts") as exc_info:
         await client._request("GET", "/open/option/blocktrade/rfqList/v1")
 
+    assert type(exc_info.value) is CoincallConnectivityError
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.TRANSIENT
     assert session.get_attempts == _MAX_ATTEMPTS
     assert sleeps == [_RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, _MAX_ATTEMPTS)]
 
@@ -274,7 +276,7 @@ async def test_non_idempotent_execute_json_array_200_body_is_ambiguous() -> None
 
 
 @pytest.mark.asyncio
-async def test_idempotent_get_non_json_200_body_retries_then_request_error(
+async def test_idempotent_get_non_json_200_body_retries_then_connectivity_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = StaticGetSession("not json")
@@ -286,9 +288,11 @@ async def test_idempotent_get_non_json_200_body_retries_then_request_error(
 
     monkeypatch.setattr("coincall_rfq_maker.core.adapters.rest.asyncio.sleep", fake_sleep)
 
-    with pytest.raises(CoincallRequestError, match="failed after 3 attempts"):
+    with pytest.raises(CoincallConnectivityError, match="failed after 3 attempts") as exc_info:
         await client._request("GET", "/open/option/blocktrade/rfqList/v1")
 
+    assert type(exc_info.value) is CoincallConnectivityError
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.TRANSIENT
     assert session.get_attempts == _MAX_ATTEMPTS
 
 

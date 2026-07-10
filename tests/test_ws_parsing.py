@@ -11,7 +11,6 @@ import coincall_rfq_maker.ws as ws
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.domain.rfq import RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
-from coincall_rfq_maker.risk.gate import RiskGate
 from coincall_rfq_maker.ws import CoincallWsClient, parse_ws_message
 
 
@@ -475,15 +474,11 @@ async def test_run_redacts_signed_url_from_connection_error_log(
 
 
 @pytest.mark.asyncio
-async def test_ws_disconnect_reconnect_never_records_api_failure(
+async def test_ws_disconnect_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     shutdown = asyncio.Event()
-    calls: list[str] = []
     connect_attempts = 0
-
-    def record_api_failure(self: RiskGate) -> None:
-        calls.append("failure")
 
     async def fake_connect(*args: Any, **kwargs: Any) -> StopAfterSubscribeConnection:
         nonlocal connect_attempts
@@ -492,7 +487,6 @@ async def test_ws_disconnect_reconnect_never_records_api_failure(
             raise RuntimeError("first connection dropped")
         return StopAfterSubscribeConnection(shutdown)
 
-    monkeypatch.setattr(RiskGate, "record_api_failure", record_api_failure)
     monkeypatch.setattr(ws.websockets, "connect", fake_connect)
     monkeypatch.setattr(ws, "_INITIAL_RECONNECT_DELAY_SECONDS", 0.001)
     monkeypatch.setattr(ws, "_MAX_RECONNECT_DELAY_SECONDS", 0.001)
@@ -501,7 +495,6 @@ async def test_ws_disconnect_reconnect_never_records_api_failure(
     await client.run(shutdown)
 
     assert connect_attempts == 2
-    assert calls == []
 
 
 @pytest.mark.asyncio

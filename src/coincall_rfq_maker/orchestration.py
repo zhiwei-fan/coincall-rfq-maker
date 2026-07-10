@@ -347,7 +347,7 @@ class Orchestrator:
         except CoincallError as exc:
             kind = classify_api_failure(exc)
             if kind in {ApiFailureKind.TRANSIENT, ApiFailureKind.AMBIGUOUS}:
-                self._outage_gate.record_transient(now_ms)
+                self._outage_gate.record_transient(get_timestamp_ms())
                 logger.warning(
                     "Quoting paused after %s Coincall failure for RFQ %s until %d",
                     kind.name.lower(),

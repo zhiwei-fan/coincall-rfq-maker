@@ -5,11 +5,13 @@ from typing import Any
 import pytest
 
 from coincall_rfq_maker.core.adapters.rest import (
+    ApiFailureKind,
     CoincallAmbiguousError,
     CoincallApiError,
     CoincallRequestError,
     CoincallRestClient,
     _parse_quote_list,
+    classify_api_failure,
 )
 from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
 from coincall_rfq_maker.domain.quote import QuoteStage
@@ -204,9 +206,11 @@ async def test_ambiguous_create_does_not_adopt_empty_quote_id() -> None:
     }
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
 
-    with pytest.raises(CoincallRequestError):
+    with pytest.raises(CoincallAmbiguousError) as exc_info:
         await lifecycle.reconcile(make_intent())
 
+    assert type(exc_info.value) is CoincallAmbiguousError
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
     current = lifecycle.get_for_rfq("rfq-1")
     assert current is not None
     assert current.stage is QuoteStage.PENDING_CREATE
@@ -215,15 +219,17 @@ async def test_ambiguous_create_does_not_adopt_empty_quote_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_create_not_listed_is_treated_as_failure() -> None:
+async def test_ambiguous_create_not_listed_remains_ambiguous() -> None:
     rest = FakeRestClient()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
     lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
 
-    with pytest.raises(CoincallRequestError):
+    with pytest.raises(CoincallAmbiguousError) as exc_info:
         await lifecycle.reconcile(make_intent())
 
+    assert type(exc_info.value) is CoincallAmbiguousError
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
     current = lifecycle.get_for_rfq("rfq-1")
     assert current is not None
     assert current.stage is QuoteStage.PENDING_CREATE
@@ -274,7 +280,7 @@ async def test_malformed_successful_create_response_adopts_open_quote_and_resets
 
 
 @pytest.mark.asyncio
-async def test_malformed_successful_create_response_not_listed_counts_and_trips_after_five(
+async def test_malformed_successful_create_response_not_listed_never_trips_kill_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rest = CoincallRestClient("key", "secret")
@@ -297,14 +303,11 @@ async def test_malformed_successful_create_response_not_listed_counts_and_trips_
     monkeypatch.setattr(rest, "_request", fake_request)
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)
 
-    for _ in range(4):
-        with pytest.raises(CoincallRequestError):
+    for _ in range(5):
+        with pytest.raises(CoincallAmbiguousError) as exc_info:
             await lifecycle.reconcile(make_intent())
-    assert not risk_gate.kill_switch_tripped
-
-    with pytest.raises(CoincallRequestError):
-        await lifecycle.reconcile(make_intent())
-    assert risk_gate.kill_switch_tripped
+        assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
+        assert not risk_gate.kill_switch_tripped
 
 
 @pytest.mark.asyncio
@@ -592,17 +595,18 @@ async def test_settle_filled_unknown_remote_quote_state_records_one_failure() ->
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_create_failure_is_not_double_counted() -> None:
+async def test_ambiguous_create_failure_is_not_counted_as_persistent() -> None:
     rest = FakeRestClient()
     reporter = RecordingApiReporter()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
 
-    with pytest.raises(CoincallRequestError):
+    with pytest.raises(CoincallAmbiguousError) as exc_info:
         await lifecycle.reconcile(make_intent())
 
-    assert reporter.calls == ["failure"]
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
+    assert reporter.calls == []
 
 
 @pytest.mark.asyncio
