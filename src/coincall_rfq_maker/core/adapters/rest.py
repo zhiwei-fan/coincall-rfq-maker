@@ -185,6 +185,22 @@ class CoincallRestClient:
                     )
                     await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
                     continue
+                if (
+                    not idempotent
+                    and exc.code != 10000
+                    and (exc.status == 408 or 500 <= exc.status <= 599)
+                ):
+                    logger.warning(
+                        "Request %s %s failed (attempt %d/%d): %s",
+                        method,
+                        path,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    raise CoincallAmbiguousError(
+                        f"{method} {path} outcome ambiguous after API error: {exc}"
+                    ) from exc
                 raise
             except (TimeoutError, aiohttp.ClientError, CoincallMalformedResponseError) as exc:
                 last_error = exc
@@ -426,12 +442,10 @@ class CoincallRestClient:
 def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
     data = response.get("data") or {}
     if not isinstance(data, dict):
-        logger.warning("Malformed RFQ REST response data: expected object")
-        return RfqListSnapshot()
+        raise CoincallMalformedResponseError("Malformed RFQ REST response data: expected object")
     raw_items = data.get("rfqList") or []
     if not isinstance(raw_items, list):
-        logger.warning("Malformed RFQ REST response rfqList: expected list")
-        return RfqListSnapshot()
+        raise CoincallMalformedResponseError("Malformed RFQ REST response rfqList: expected list")
     payloads, malformed_request_ids = _validated_rfq_items(raw_items)
     valid_payloads: list[RfqPayload] = []
     for payload in payloads:
@@ -451,8 +465,7 @@ def _parse_rfq_list(response: dict[str, Any]) -> RfqListSnapshot:
 def _parse_quote_list(response: dict[str, Any]) -> QuoteListSnapshot:
     raw_items = response.get("data") or []
     if not isinstance(raw_items, list):
-        logger.warning("Malformed quote REST response data: expected list")
-        return QuoteListSnapshot()
+        raise CoincallMalformedResponseError("Malformed quote REST response data: expected list")
     payloads, malformed_id_pairs = _validated_quote_items(raw_items)
     return QuoteListSnapshot(tuple(payloads), frozenset(malformed_id_pairs))
 

@@ -16,9 +16,13 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallRequestError,
     CoincallRestClient,
     _parse_quote_list,
+    _parse_rfq_list,
     _wire_id,
     classify_api_failure,
 )
+from coincall_rfq_maker.domain.quote import QuoteStage
+from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 
 
 class TimeoutContext:
@@ -113,13 +117,14 @@ class SequencedGetSession:
 
 
 class StaticPostSession:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, status: int = 200) -> None:
         self._text = text
+        self._status = status
         self.post_attempts = 0
 
     def post(self, *args: Any, **kwargs: Any) -> ResponseContext:
         self.post_attempts += 1
-        return ResponseContext(200, self._text)
+        return ResponseContext(self._status, self._text)
 
 
 class StaticGetSession:
@@ -130,6 +135,40 @@ class StaticGetSession:
     def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
         self.get_attempts += 1
         return ResponseContext(200, self._text)
+
+
+class SequencedPostGetSession:
+    def __init__(
+        self,
+        post_responses: list[tuple[int, str]],
+        get_responses: list[tuple[int, str]],
+    ) -> None:
+        self._post_responses = post_responses
+        self._get_responses = get_responses
+        self.post_attempts = 0
+        self.get_attempts = 0
+
+    def post(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        status, response = self._post_responses[self.post_attempts]
+        self.post_attempts += 1
+        return ResponseContext(status, response)
+
+    def get(self, *args: Any, **kwargs: Any) -> ResponseContext:
+        status, response = self._get_responses[self.get_attempts]
+        self.get_attempts += 1
+        return ResponseContext(status, response)
+
+
+def _quote_intent(price: float = 100.0) -> QuoteIntent:
+    return QuoteIntent(
+        request_id="rfq-1",
+        legs=(
+            QuoteLegIntent(
+                instrument_name="BTCUSD-21AUG25-120000-C",
+                price=price,
+            ),
+        ),
+    )
 
 
 def test_api_failure_classifier_contract() -> None:
@@ -235,6 +274,110 @@ async def test_non_idempotent_post_code_10000_is_not_retried() -> None:
 
     assert exc_info.value.code == 10000
     assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_code_10000_is_never_wrapped_as_ambiguous() -> None:
+    # "Try again later" means the write did not land. Wrapping it as ambiguous would send
+    # the maker off verifying, and then re-creating, a quote that never existed.
+    session = StaticPostSession('{"code":10000,"msg":"Try again later"}')
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallApiError) as exc_info:
+        await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
+
+    assert not isinstance(exc_info.value, CoincallAmbiguousError)
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.TRANSIENT
+    assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_5xx_create_is_ambiguous_and_not_retried() -> None:
+    session = StaticPostSession("upstream unavailable", status=503)
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallAmbiguousError, match="quote/create/v1") as exc_info:
+        await client.create_quote("rfq-1", [{"instrumentName": "BTCUSD-21AUG25-120000-C"}])
+
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
+    assert isinstance(exc_info.value.__cause__, CoincallApiError)
+    assert exc_info.value.__cause__.status == 503
+    assert exc_info.value.__cause__.message == "upstream unavailable"
+    assert session.post_attempts == 1
+
+
+@pytest.mark.parametrize("status", [408, 500, 504])
+@pytest.mark.asyncio
+async def test_non_idempotent_http_failure_cancel_is_ambiguous_and_not_retried(
+    status: int,
+) -> None:
+    session = StaticPostSession("possibly accepted", status=status)
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+
+    with pytest.raises(CoincallAmbiguousError, match="quote/cancel/v1") as exc_info:
+        await client.cancel_quote("quote-1")
+
+    assert classify_api_failure(exc_info.value) is ApiFailureKind.AMBIGUOUS
+    assert isinstance(exc_info.value.__cause__, CoincallApiError)
+    assert exc_info.value.__cause__.status == status
+    assert exc_info.value.__cause__.message == "possibly accepted"
+    assert session.post_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_5xx_create_drives_lifecycle_ambiguous_verification() -> None:
+    session = SequencedPostGetSession(
+        post_responses=[(503, "upstream unavailable")],
+        get_responses=[
+            (
+                200,
+                '{"code":0,"data":[{"requestId":"rfq-1","quoteId":"exchange-q-1","state":"OPEN"}]}',
+            )
+        ],
+    )
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+    lifecycle = QuoteLifecycle(client, dry_run=False)
+
+    quote = await lifecycle.reconcile(_quote_intent())
+
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "exchange-q-1"
+    assert session.post_attempts == 1
+    assert session.get_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_5xx_cancel_drives_lifecycle_ambiguous_verification() -> None:
+    session = SequencedPostGetSession(
+        post_responses=[
+            (200, '{"code":0,"data":{"quoteId":"exchange-q-1"}}'),
+            (503, "upstream unavailable"),
+        ],
+        get_responses=[
+            (
+                200,
+                '{"code":0,"data":['
+                '{"requestId":"rfq-1","quoteId":"exchange-q-1","state":"FILLED"}'
+                "]}",
+            )
+        ],
+    )
+    client = CoincallRestClient("key", "secret")
+    client._session = session  # type: ignore[assignment]
+    lifecycle = QuoteLifecycle(client, dry_run=False)
+    await lifecycle.reconcile(_quote_intent())
+
+    await lifecycle.cancel_for_rfq("rfq-1")
+
+    quote = lifecycle.get_for_rfq("rfq-1")
+    assert quote is not None
+    assert quote.stage is QuoteStage.FILLED
+    assert session.post_attempts == 2
+    assert session.get_attempts == 1
 
 
 @pytest.mark.asyncio
@@ -401,3 +544,22 @@ def test_quote_list_salvages_integer_ids_from_malformed_items() -> None:
     assert snapshot.malformed_id_pairs == frozenset(
         {("2075207481654804480", "2075207494989787138")}
     )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"code": 0, "data": "not-an-object"},
+        {"code": 0, "data": {"rfqList": "not-a-list"}},
+    ],
+)
+def test_rfq_list_rejects_truthy_malformed_top_level_structure(
+    response: dict[str, Any],
+) -> None:
+    with pytest.raises(CoincallMalformedResponseError):
+        _parse_rfq_list(response)
+
+
+def test_quote_list_rejects_truthy_malformed_top_level_data() -> None:
+    with pytest.raises(CoincallMalformedResponseError):
+        _parse_quote_list({"code": 0, "data": "not-a-list"})

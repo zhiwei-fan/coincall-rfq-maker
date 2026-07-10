@@ -17,6 +17,9 @@ class QuoteStore:
     def open_quotes(self) -> list[Quote]:
         return [quote for quote in self._by_request.values() if quote.is_open]
 
+    def non_terminal_quotes(self) -> list[Quote]:
+        return [quote for quote in self._by_request.values() if not quote.is_terminal]
+
     def store(self, quote: Quote) -> None:
         self._by_request[quote.request_id] = quote
         if quote.quote_id:

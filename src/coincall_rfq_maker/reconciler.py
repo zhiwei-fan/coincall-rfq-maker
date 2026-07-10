@@ -161,13 +161,17 @@ class Reconciler:
                 if adopted is None:
                     await self._cancel_orphan_exchange_quote(quote_id)
 
-        for quote in self._quotes.open_quotes():
-            if quote.quote_id is None or quote.quote_id in remote_open_quote_ids:
+        for quote in self._quotes.non_terminal_quotes():
+            if quote.is_open and quote.quote_id in remote_open_quote_ids:
                 continue
             try:
                 resolved = await self._quotes.resolve_remote_quote(quote)
             except CoincallError:
-                logger.exception("Reconciler failed to resolve quote %s", quote.quote_id)
+                logger.exception(
+                    "Reconciler failed to resolve quote %s for RFQ %s",
+                    quote.quote_id,
+                    quote.request_id,
+                )
                 continue
             await self._record_terminal_quote(resolved)
 

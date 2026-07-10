@@ -53,6 +53,9 @@ class QuoteLifecycle:
     def open_quotes(self) -> list[Quote]:
         return self._store.open_quotes()
 
+    def non_terminal_quotes(self) -> list[Quote]:
+        return self._store.non_terminal_quotes()
+
     def has_open_or_pending_quote_for_rfq(self, request_id: str) -> bool:
         quote = self._store.get_for_rfq(request_id)
         if quote is None or quote.is_terminal:
@@ -216,6 +219,10 @@ class QuoteLifecycle:
         return self._adopt_open_quote(existing, quote_id)
 
     async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
+        if quote.quote_id is None:
+            return await self._api_boundary.run(
+                lambda: self._resolve_remote_quote_by_request(quote)
+            )
         return await self._api_boundary.run(lambda: self._resolve_remote_quote(quote))
 
     async def _resolve_remote_quote(self, quote: Quote) -> Quote | None:
