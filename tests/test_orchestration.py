@@ -18,6 +18,7 @@ from coincall_rfq_maker.core.adapters.rest import (
 from coincall_rfq_maker.core.adapters.schemas import (
     CreateQuoteResult,
     QuoteListSnapshot,
+    QuotePayload,
     RfqListSnapshot,
 )
 from coincall_rfq_maker.core.clock import get_timestamp_ms
@@ -174,7 +175,12 @@ class FakeQuoteLifecycle:
     async def cancel_exchange_quote(self, quote_id: str) -> None:
         pass
 
-    def adopt_open_exchange_quote(self, request_id: str, quote_id: str) -> Quote | None:
+    def adopt_open_exchange_quote(
+        self,
+        request_id: str,
+        quote_id: str,
+        payload: QuotePayload | None = None,
+    ) -> Quote | None:
         return None
 
     async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
@@ -493,7 +499,14 @@ async def test_reconciler_adopts_unknown_exchange_quote_for_local_pending_create
 
     rest.quote_list_response = {
         "code": 0,
-        "data": [{"requestId": "rfq-1", "quoteId": "exchange-q-1", "state": "OPEN"}],
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": "exchange-q-1",
+                "state": "OPEN",
+                "legs": [{"instrumentName": INSTRUMENT, "price": "1.0"}],
+            }
+        ],
     }
 
     await orchestrator.reconcile_with_exchange()
@@ -502,6 +515,7 @@ async def test_reconciler_adopts_unknown_exchange_quote_for_local_pending_create
     assert current is not None
     assert current.stage is QuoteStage.OPEN
     assert current.quote_id == "exchange-q-1"
+    assert current.legs[0].price == 1.0
     assert rest.cancel_calls == []
 
 

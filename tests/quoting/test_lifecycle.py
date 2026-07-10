@@ -15,7 +15,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     classify_api_failure,
 )
 from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteListSnapshot
-from coincall_rfq_maker.domain.quote import QuoteStage
+from coincall_rfq_maker.domain.quote import Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
@@ -528,6 +528,63 @@ async def test_reconcile_pending_create_reverifies_and_adopts_without_second_cre
     assert quote.stage is QuoteStage.OPEN
     assert quote.quote_id == "exchange-q-1"
     assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_create_adoption_mirrors_exchange_legs_before_repricing() -> None:
+    rest = FakeRestClient()
+    rest.quote_list_response = {
+        "code": 0,
+        "data": [
+            {
+                "requestId": "rfq-1",
+                "quoteId": "exchange-q-1",
+                "state": "OPEN",
+                "legs": [{"instrumentName": INSTRUMENT, "price": "1.0"}],
+            }
+        ],
+    }
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 2.0),),
+            create_time_ms=0,
+        )
+    )
+
+    quote = await lifecycle.reconcile(make_intent(price=2.0))
+
+    assert rest.cancel_calls == ["exchange-q-1"]
+    assert len(rest.create_calls) == 1
+    assert quote.stage is QuoteStage.OPEN
+    assert quote.quote_id == "q-1"
+    assert quote.legs == (QuoteLeg(INSTRUMENT, 2.0),)
+
+
+@pytest.mark.asyncio
+async def test_payloadless_adoption_uses_price_unknown_sentinel_and_reprices() -> None:
+    rest = FakeRestClient()
+    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=QuoteStage.PENDING_CREATE,
+            legs=(QuoteLeg(INSTRUMENT, 2.0),),
+            create_time_ms=0,
+        )
+    )
+
+    adopted = lifecycle.adopt_open_exchange_quote("rfq-1", "salvaged-q-1")
+
+    assert adopted is not None
+    assert adopted.legs == ()
+    quote = await lifecycle.reconcile(make_intent(price=2.0))
+    assert rest.cancel_calls == ["salvaged-q-1"]
+    assert len(rest.create_calls) == 1
+    assert quote.quote_id == "q-1"
+    assert quote.legs == (QuoteLeg(INSTRUMENT, 2.0),)
 
 
 @pytest.mark.asyncio

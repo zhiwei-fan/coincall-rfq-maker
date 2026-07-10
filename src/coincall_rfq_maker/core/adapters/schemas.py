@@ -4,13 +4,16 @@ Field names mirror the wire's camelCase exactly (via aliases) so we can
 `model_validate` raw exchange JSON directly.
 """
 
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
-from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteStage
+from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_wire_id(value: object) -> object:
@@ -234,10 +237,33 @@ def quote_from_payload(current: Quote, payload: QuotePayload) -> Quote:
             f"Unknown quote state {payload.state!r} for quote {payload.quote_id}"
         )
     base = current if current.stage is stage else with_remote_stage(current, stage)
+    legs = current.legs
+    if payload.legs:
+        try:
+            legs = tuple(
+                QuoteLeg(
+                    instrument_name=leg.instrument_name,
+                    price=float(leg.price),
+                    side=leg.side,
+                    quantity=leg.quantity,
+                )
+                for leg in payload.legs
+            )
+        except ValueError:
+            logger.warning(
+                "Exchange quote %s has unparseable leg prices; preserving local legs",
+                payload.quote_id,
+            )
+    else:
+        logger.warning(
+            "Exchange quote %s has no legs; preserving local legs",
+            payload.quote_id,
+        )
     return replace(
         base,
         request_id=payload.request_id or current.request_id,
         quote_id=payload.quote_id,
+        legs=legs,
         update_time_ms=coalesce(payload.update_time, current.update_time_ms),
         expiry_time_ms=coalesce(payload.expiry_time, current.expiry_time_ms),
         filled_price=coalesce(payload.filled_price, current.filled_price),

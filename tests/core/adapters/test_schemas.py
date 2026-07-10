@@ -16,7 +16,7 @@ from coincall_rfq_maker.core.adapters.schemas import (
     quote_from_payload,
     with_remote_stage,
 )
-from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteStage
+from coincall_rfq_maker.domain.quote import IllegalQuoteTransition, Quote, QuoteLeg, QuoteStage
 
 INSTRUMENT = "BTCUSD-10JUL26-62000-C"
 
@@ -43,12 +43,15 @@ GOLDEN_CREATE_QUOTE_DATA = {
 }
 
 
-def make_quote(stage: QuoteStage = QuoteStage.OPEN) -> Quote:
+def make_quote(
+    stage: QuoteStage = QuoteStage.OPEN,
+    legs: tuple[QuoteLeg, ...] = (),
+) -> Quote:
     return Quote(
         request_id="rfq-1",
         quote_id="q-1",
         stage=stage,
-        legs=(),
+        legs=legs,
         create_time_ms=1000,
         update_time_ms=1100,
         expiry_time_ms=2000,
@@ -132,6 +135,40 @@ def test_quote_from_payload_coalesces_fill_fields() -> None:
     assert quote.filled_quantity == 0.5
     assert quote.fill_time_ms == 1300
     assert quote.block_trade_id == "bt-old"
+
+
+def test_quote_from_payload_uses_valid_payload_legs_and_preserves_local_legs_when_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    current = make_quote(legs=(QuoteLeg(INSTRUMENT, 2.0),))
+    payload = QuotePayload.model_validate(
+        {
+            "quoteId": "q-2",
+            "requestId": "rfq-1",
+            "state": "OPEN",
+            "legs": [{"instrumentName": INSTRUMENT, "price": "1.0"}],
+        }
+    )
+
+    assert quote_from_payload(current, payload).legs == (QuoteLeg(INSTRUMENT, 1.0),)
+
+    empty_legs_payload = QuotePayload.model_validate(
+        {"quoteId": "q-3", "requestId": "rfq-1", "state": "OPEN", "legs": []}
+    )
+    assert quote_from_payload(current, empty_legs_payload).legs == current.legs
+
+    invalid_price_payload = QuotePayload.model_validate(
+        {
+            "quoteId": "q-4",
+            "requestId": "rfq-1",
+            "state": "OPEN",
+            "legs": [{"instrumentName": INSTRUMENT, "price": "abc"}],
+        }
+    )
+    with caplog.at_level("WARNING"):
+        assert quote_from_payload(current, invalid_price_payload).legs == current.legs
+    assert "q-4" in caplog.text
+    assert "unparseable leg prices" in caplog.text
 
 
 def test_find_remote_quote_matches_request_or_quote_id() -> None:

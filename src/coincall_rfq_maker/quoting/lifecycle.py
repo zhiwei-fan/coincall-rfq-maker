@@ -201,7 +201,12 @@ class QuoteLifecycle:
             return
         await self._rest.cancel_quote(quote_id)
 
-    def adopt_open_exchange_quote(self, request_id: str, quote_id: str) -> Quote | None:
+    def adopt_open_exchange_quote(
+        self,
+        request_id: str,
+        quote_id: str,
+        payload: QuotePayload | None = None,
+    ) -> Quote | None:
         """Adopt an exchange-open quote that matches a known local RFQ quote."""
         if not request_id or not quote_id:
             return None
@@ -216,6 +221,8 @@ class QuoteLifecycle:
                 existing.quote_id,
             )
             return None
+        if payload is not None:
+            return self._mirror_remote_quote(existing, payload)
         return self._adopt_open_quote(existing, quote_id)
 
     async def resolve_remote_quote(self, quote: Quote) -> Quote | None:
@@ -351,7 +358,12 @@ class QuoteLifecycle:
         remote_quotes = await self._rest.get_quote_list(request_id=pending.request_id, state="OPEN")
         remote = find_remote_quote(remote_quotes, request_id=pending.request_id)
         if remote is not None:
-            return self._adopt_open_quote(pending, remote.quote_id)
+            logger.info(
+                "Adopting quote %s for RFQ %s from well-formed open-quote payload",
+                remote.quote_id,
+                pending.request_id,
+            )
+            return self._mirror_remote_quote(pending, remote)
 
         quote_id = find_salvaged_quote_id(remote_quotes, request_id=pending.request_id)
         if quote_id is None:
@@ -409,7 +421,10 @@ class QuoteLifecycle:
 
     def _adopt_open_quote(self, quote: Quote, quote_id: str) -> Quote:
         opened = quote if quote.stage is QuoteStage.OPEN else quote.with_stage(QuoteStage.OPEN)
-        opened = replace(opened, quote_id=quote_id)
+        # An adopted quote stores exchange-reported legs when available; malformed payloads use
+        # legs=() to mean price unknown. Attempted legs survive only when the quote id matches.
+        legs = quote.legs if quote.quote_id == quote_id else ()
+        opened = replace(opened, quote_id=quote_id, legs=legs)
         self._store.store(opened)
         logger.info("Adopted exchange quote %s for RFQ %s", quote_id, quote.request_id)
         return opened

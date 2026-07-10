@@ -160,7 +160,7 @@ class Reconciler:
                 adopted = (
                     None
                     if item_request_id is None
-                    else self._quotes.adopt_open_exchange_quote(item_request_id, quote_id)
+                    else self._quotes.adopt_open_exchange_quote(item_request_id, quote_id, item)
                 )
                 if adopted is None:
                     await self._cancel_orphan_exchange_quote(quote_id)
