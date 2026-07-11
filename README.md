@@ -95,6 +95,26 @@ uv run rfq-taker execute --request-id <id> --quote-id <id>   # REAL block trade
 uv run rfq-taker trade --leg <SYMBOL:SIDE:QTY>               # create, watch, confirm & execute
 ```
 
+## Live e2e (beta)
+
+`rfq-e2e` is a beta-only, live harness. It requires maker `API_KEY` / `API_SECRET`
+and dedicated taker `TAKER_API_KEY` / `TAKER_API_SECRET` in `.env`; its maker REST,
+maker WS, and taker REST URLs must use the exact beta hosts. There is no production
+override.
+
+```sh
+uv run rfq-e2e
+```
+
+The command selects one active BTC instrument at least 24 hours from expiry, starts
+the real maker in live mode with its log and SQLite DB isolated under
+`e2e-runs/<runid>/`, creates one real taker RFQ, and waits for the maker's OPEN quote.
+The maker maintains at most one **LIVE** quote for that RFQ and may cancel-and-replace
+it while the harness runs. The harness never accepts a quote or executes a trade; it
+cancels the RFQ and flattens the maker on shutdown. The run directory contains
+`report.json` and `summary.txt`. Exit 0 proves the full path and post-cleanup absence
+of maker-attributed OPEN quotes.
+
 ## Testing
 
 ```sh

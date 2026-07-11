@@ -25,6 +25,7 @@ uv.lock
 
 # Logs
 *.log
+e2e-runs/
 
 # Local runtime SQLite DB (maker DB_PATH default: rfq_maker.db)
 *.db

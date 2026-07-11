@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 rfq-maker = "coincall_rfq_maker.cli:run"
 rfq-taker = "coincall_rfq_maker.taker.cli:run"
+rfq-e2e = "coincall_rfq_maker.e2e.cli:run"
 
 [build-system]
 requires = ["hatchling"]
