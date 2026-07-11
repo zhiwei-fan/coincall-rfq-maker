@@ -2326,3 +2326,14 @@ async def test_terminal_rfq_is_evicted_and_late_events_are_ignored() -> None:
 
     assert orchestrator.rfq_store.get("rfq-1") is None
     assert quotes.cancelled_for == ["rfq-1"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_dispatch_event_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    orchestrator = object.__new__(Orchestrator)
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.orchestration"):
+        async with asyncio.timeout(1.0):
+            await orchestrator.handle_event(object())
+
+    assert "dispatcher received unknown event type object" in caplog.text

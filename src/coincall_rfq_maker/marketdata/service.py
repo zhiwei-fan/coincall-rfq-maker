@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 
 from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.dispatch_queue import EventChannel
 from coincall_rfq_maker.events import PricesRefreshed
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class MarketDataService:
     def __init__(
         self,
         rest_client: CoincallRestClient,
-        event_queue: "asyncio.Queue[object]",
+        event_queue: EventChannel,
         price_move_threshold: float = 0.001,
         force_refresh_seconds: float = FORCE_REFRESH_SECONDS,
     ) -> None:

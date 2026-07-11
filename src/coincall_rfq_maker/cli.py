@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from coincall_rfq_maker.core.adapters.rest import CoincallError, CoincallRestClient
 from coincall_rfq_maker.core.clock import get_timestamp_ms
+from coincall_rfq_maker.dispatch_queue import EventChannel, PriorityEventQueue
 from coincall_rfq_maker.events import ReconcileTick, RepriceTick
 from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
@@ -71,7 +72,7 @@ def load_settings_or_exit() -> MakerSettings:
         raise SystemExit(1) from exc
 
 
-async def _dispatch_loop(events: "asyncio.Queue[object]", orchestrator: Orchestrator) -> None:
+async def _dispatch_loop(events: EventChannel, orchestrator: Orchestrator) -> None:
     while True:
         try:
             event = await events.get()
@@ -94,21 +95,19 @@ async def _dispatch_loop(events: "asyncio.Queue[object]", orchestrator: Orchestr
             events.task_done()
 
 
-async def _shutdown_queue_on_signal(
-    shutdown: asyncio.Event, events: "asyncio.Queue[object]"
-) -> None:
+async def _shutdown_queue_on_signal(shutdown: asyncio.Event, events: EventChannel) -> None:
     await shutdown.wait()
     events.shutdown()
 
 
 async def _quote_refresh_loop(
-    events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
+    events: EventChannel, shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
     await _tick_loop(events, shutdown, interval_seconds, RepriceTick())
 
 
 async def _reconcile_loop(
-    events: "asyncio.Queue[object]", shutdown: asyncio.Event, interval_seconds: float
+    events: EventChannel, shutdown: asyncio.Event, interval_seconds: float
 ) -> None:
     await _tick_loop(events, shutdown, interval_seconds, ReconcileTick())
 
@@ -144,7 +143,7 @@ async def _reconciler_watchdog(orchestrator: Orchestrator, shutdown: asyncio.Eve
 
 
 async def _tick_loop(
-    events: "asyncio.Queue[object]",
+    events: EventChannel,
     shutdown: asyncio.Event,
     interval_seconds: float,
     event: object,
@@ -161,7 +160,7 @@ async def _tick_loop(
                 return
 
 
-async def _enqueue_startup_backfill(events: "asyncio.Queue[object]") -> None:
+async def _enqueue_startup_backfill(events: EventChannel) -> None:
     await events.put(ReconcileTick())
 
 
@@ -287,7 +286,7 @@ async def run_async(settings: MakerSettings) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown.set)
 
-    events: asyncio.Queue[object] = asyncio.Queue()
+    events: EventChannel = PriorityEventQueue()
     maker_credentials = settings.credentials()
     api_secret = maker_credentials.api_secret.get_secret_value()
 

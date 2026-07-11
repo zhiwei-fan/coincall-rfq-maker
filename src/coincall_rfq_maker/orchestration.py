@@ -259,6 +259,8 @@ class Orchestrator:
                 await self.reprice_all_active()
             case ReconcileTick():
                 await self.reconcile_with_exchange()
+            case _:
+                logger.warning("dispatcher received unknown event type %s", type(event).__name__)
 
     async def reconcile_with_exchange(self) -> None:
         await self._reconciler.reconcile_with_exchange()

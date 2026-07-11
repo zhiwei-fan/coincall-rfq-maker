@@ -29,6 +29,7 @@ from coincall_rfq_maker.core.adapters.schemas import (
     rfq_status_from_wire,
 )
 from coincall_rfq_maker.core.adapters.signing import build_ws_signed_url
+from coincall_rfq_maker.dispatch_queue import EventChannel
 from coincall_rfq_maker.domain.rfq import RfqStatus
 from coincall_rfq_maker.events import QuoteUpdated, RfqReceived, RfqTerminated, TradeExecuted
 
@@ -239,7 +240,7 @@ class CoincallWsClient:
         ws_url: str,
         api_key: str,
         api_secret: str,
-        event_queue: "asyncio.Queue[object]",
+        event_queue: EventChannel,
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._ws_url = ws_url
