@@ -190,6 +190,7 @@ def test_kill_switch_trips_after_repeated_failures_and_rejects_everything() -> N
     for _ in range(3):
         gate.record_api_failure()
     assert gate.kill_switch_tripped
+    assert not hasattr(gate, "reset_kill_switch")
     decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
     assert not decision.approved
     assert "kill switch" in decision.reason
@@ -204,13 +205,12 @@ def test_api_success_resets_failure_count_before_trip() -> None:
     assert not gate.kill_switch_tripped
 
 
-def test_failure_total_is_monotonic_across_success_and_reset() -> None:
+def test_failure_total_is_monotonic_across_success() -> None:
     gate = make_gate()
 
     gate.record_api_failure()
     gate.record_api_failure()
     gate.record_api_success()
-    gate.reset_kill_switch()
 
     assert gate.failures_total == 2
     assert gate.consecutive_failures == 0

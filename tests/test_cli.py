@@ -31,6 +31,13 @@ class FakeRestContext:
         pass
 
 
+class CountingRestContext(FakeRestContext):
+    constructor_calls = 0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        type(self).constructor_calls += 1
+
+
 class FakePersistenceContext:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -95,6 +102,11 @@ class ShutdownAfterFailedFlattenQuoteLifecycle:
 
 class FakeRiskGate:
     consecutive_failures = 3
+
+
+class RealExposureProviderStub:
+    def current_exposure(self) -> object:
+        return object()
 
 
 class SignalShutdownWsClient:
@@ -220,6 +232,91 @@ async def test_startup_cancel_all_failure_exits_cleanly(
     assert capsys.readouterr().err == (
         "Startup error: failed to cancel all quotes: cancel-all unavailable\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_live_mode_with_null_exposure_provider_requires_ack_before_exchange_io(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    CountingRestContext.constructor_calls = 0
+    monkeypatch.setattr(cli, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(cli, "CoincallRestClient", CountingRestContext)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        DRY_RUN=False,
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    # Bounded: if the refusal guard is ever broken, run_async starts the real
+    # TaskGroup and would await forever -- the timeout turns that into a fast
+    # failure instead of a hung test run (observed with a gate mutant, 2026-07-11).
+    with pytest.raises(SystemExit) as exc_info:
+        async with asyncio.timeout(5):
+            await cli.run_async(settings)
+
+    assert exc_info.value.code == 2
+    assert "ALLOW_NO_EXPOSURE_LIMITS=true" in capsys.readouterr().err
+    assert CountingRestContext.constructor_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_live_mode_acknowledges_missing_exposure_limits_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(cli, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        DRY_RUN=False,
+        ALLOW_NO_EXPOSURE_LIMITS=True,
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.cli"):
+        await cli.run_async(settings)
+
+    assert (
+        sum("LIVE MODE WITHOUT EXPOSURE LIMITS" in record.message for record in caplog.records) == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_needs_no_exposure_acknowledgment_or_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(cli, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", SignalShutdownWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", NoopOrchestrator)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="coincall_rfq_maker.cli"):
+        await cli.run_async(settings)
+
+    assert "LIVE MODE WITHOUT EXPOSURE LIMITS" not in caplog.text
+
+
+def test_only_null_exposure_provider_needs_live_acknowledgment() -> None:
+    assert cli._needs_exposure_ack(False, cli.NullExposureProvider())
+    assert not cli._needs_exposure_ack(True, cli.NullExposureProvider())
+    assert not cli._needs_exposure_ack(False, RealExposureProviderStub())
 
 
 @pytest.mark.asyncio

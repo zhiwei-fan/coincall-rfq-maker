@@ -132,10 +132,6 @@ class RiskGate:
     def record_api_success(self) -> None:
         self._consecutive_failures = 0
 
-    def reset_kill_switch(self) -> None:
-        self._kill_switch_tripped = False
-        self._consecutive_failures = 0
-
     def trip_kill_switch(self, reason: str) -> None:
         """Trip for an escalation that is not countered by consecutive API failures."""
         if self._kill_switch_tripped:

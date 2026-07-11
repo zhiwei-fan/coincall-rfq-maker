@@ -18,6 +18,8 @@ class MakerSettings(CoincallClientSettings):
     ws_url: str = Field(default="wss://betaws.seizeyouralpha.com/options", alias="WS_URL")
 
     dry_run: bool = Field(default=True, alias="DRY_RUN")
+    # Live-mode acknowledgment that position/greek limits are absent.
+    allow_no_exposure_limits: bool = Field(default=False, alias="ALLOW_NO_EXPOSURE_LIMITS")
     cancel_all_on_start: bool = Field(default=True, alias="CANCEL_ALL_ON_START")
     cancel_all_on_stop: bool = Field(default=True, alias="CANCEL_ALL_ON_STOP")
 

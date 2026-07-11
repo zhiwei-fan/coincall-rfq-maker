@@ -251,9 +251,27 @@ def _all_shutdown_race_failures(exceptions: Sequence[BaseException]) -> bool:
     return all(isinstance(exc, asyncio.QueueShutDown) for exc in exceptions)
 
 
+def _needs_exposure_ack(dry_run: bool, exposure_provider: object) -> bool:
+    """Only a live process wired to the placeholder provider needs operator acknowledgment."""
+    return not dry_run and isinstance(exposure_provider, NullExposureProvider)
+
+
 async def run_async(settings: MakerSettings) -> None:
     setup_logging(settings.log_level, settings.log_file)
     logger.info("Starting rfq-maker (dry_run=%s)", settings.dry_run)
+
+    exposure_provider = NullExposureProvider()
+    if _needs_exposure_ack(settings.dry_run, exposure_provider):
+        if not settings.allow_no_exposure_limits:
+            sys.stderr.write(
+                "Live mode requires ALLOW_NO_EXPOSURE_LIMITS=true because position/greek risk "
+                "is not enforced.\n"
+            )
+            raise SystemExit(2)
+        logger.warning(
+            "LIVE MODE WITHOUT EXPOSURE LIMITS: ALLOW_NO_EXPOSURE_LIMITS=true acknowledged; "
+            "position/greek risk is NOT enforced"
+        )
 
     shutdown = asyncio.Event()
     kill_switch_trip = asyncio.Event()
@@ -281,7 +299,7 @@ async def run_async(settings: MakerSettings) -> None:
             max_leg_qty=settings.max_leg_qty,
             min_time_to_expiry_hours=settings.min_time_to_expiry_hours,
             stale_market_data_seconds=settings.stale_market_data_seconds,
-            exposure_provider=NullExposureProvider(),
+            exposure_provider=exposure_provider,
             on_trip=kill_switch_trip.set,
         )
         quote_lifecycle = QuoteLifecycle(rest, dry_run=settings.dry_run, api_reporter=risk_gate)

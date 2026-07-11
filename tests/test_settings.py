@@ -52,6 +52,14 @@ def test_log_file_reads_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.log_file == "/tmp/test-rfq-maker.log"
 
 
+def test_allow_no_exposure_limits_reads_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALLOW_NO_EXPOSURE_LIMITS", "true")
+
+    settings = MakerSettings(_env_file=None, API_KEY="key", API_SECRET="secret")  # type: ignore[call-arg]
+
+    assert settings.allow_no_exposure_limits is True
+
+
 def test_dry_run_defaults_true_even_when_other_fields_overridden() -> None:
     settings = MakerSettings(_env_file=None, API_KEY="key", API_SECRET="secret", MAX_LEG_QTY=5)  # type: ignore[call-arg]
     assert settings.dry_run is True
