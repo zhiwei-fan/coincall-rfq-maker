@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 
 from coincall_rfq_maker.core.adapters.rest import CoincallRestClient
+from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.instruments import InstrumentParseError, parse_instrument
 
 logger = logging.getLogger(__name__)
@@ -20,12 +21,21 @@ class InstrumentCatalog:
         rest_client: CoincallRestClient,
         negative_cache_seconds: float = NEGATIVE_FETCH_COOLDOWN_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
+        now_ms: Callable[[], int] = get_timestamp_ms,
     ) -> None:
         self._rest = rest_client
         self._negative_cache_seconds = negative_cache_seconds
         self._monotonic = monotonic
+        self._now_ms = now_ms
         self._expirations: dict[str, int] = {}
         self._negative_fetches: dict[str, float] = {}
+
+    def _prune_expired(self) -> None:
+        """Drop entries for options that have already expired; bounds the cache to the live set."""
+        now = self._now_ms()
+        self._expirations = {
+            symbol: expiry for symbol, expiry in self._expirations.items() if expiry > now
+        }
 
     async def expiration_ms(self, symbol: str) -> int | None:
         """Return the exchange expiry for `symbol`, fetching its base catalog on a miss."""
@@ -64,4 +74,5 @@ class InstrumentCatalog:
         expiration = self._expirations.get(symbol)
         if expiration is None:
             self._negative_fetches[base] = self._monotonic()
+        self._prune_expired()
         return expiration
