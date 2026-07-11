@@ -15,6 +15,7 @@ because it makes interleaving races structurally impossible.
 """
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from coincall_rfq_maker.core.adapters.rest import (
@@ -53,6 +54,8 @@ from coincall_rfq_maker.reconciler import Reconciler
 from coincall_rfq_maker.risk.gate import RiskGate
 
 logger = logging.getLogger(__name__)
+
+RFQ_TOMBSTONE_CAPACITY = 10_000
 
 DispatchEvent = (
     RfqReceived
@@ -93,19 +96,42 @@ class RfqStore:
     mutates this.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tombstone_capacity: int = RFQ_TOMBSTONE_CAPACITY) -> None:
+        if tombstone_capacity < 0:
+            raise ValueError("tombstone_capacity must be non-negative")
         self._rfqs: dict[str, Rfq] = {}
         self._received_at_ms: dict[str, int] = {}
         self._instrument_holders: dict[str, set[str]] = {}
+        self._tombstone_capacity = tombstone_capacity
+        self._tombstones: OrderedDict[str, None] = OrderedDict()
 
     def upsert(self, rfq: Rfq, received_at_ms: int | None = None) -> None:
-        if rfq.request_id not in self._rfqs:
+        existing = self._rfqs.get(rfq.request_id)
+        if (
+            rfq.request_id in self._tombstones
+            or (existing is not None and existing.is_terminal_status)
+        ) and not rfq.is_terminal_status:
+            logger.warning(
+                "refusing to resurrect terminal RFQ %s from a stale observation", rfq.request_id
+            )
+            return
+
+        if existing is not None:
+            stale_instruments = set(existing.instrument_names()) - set(rfq.instrument_names())
+            for name in stale_instruments:
+                holders = self._instrument_holders[name]
+                holders.discard(rfq.request_id)
+                if not holders:
+                    del self._instrument_holders[name]
+        else:
             self._received_at_ms[rfq.request_id] = (
                 received_at_ms if received_at_ms is not None else get_timestamp_ms()
             )
         self._rfqs[rfq.request_id] = rfq
         for name in rfq.instrument_names():
             self._instrument_holders.setdefault(name, set()).add(rfq.request_id)
+        if rfq.is_terminal_status:
+            self._record_tombstone(rfq.request_id)
 
     def get(self, request_id: str) -> Rfq | None:
         return self._rfqs.get(request_id)
@@ -137,6 +163,8 @@ class RfqStore:
             return None
         updated = rfq.with_status(status, now_ms)
         self._rfqs[request_id] = updated
+        if updated.is_terminal_status:
+            self._record_tombstone(request_id)
         return updated
 
     def orphaned_instruments(self, request_id: str) -> set[str]:
@@ -158,6 +186,7 @@ class RfqStore:
         return orphaned
 
     def evict(self, request_id: str) -> None:
+        self._record_tombstone(request_id)
         rfq = self._rfqs.pop(request_id, None)
         if rfq is None:
             return
@@ -171,6 +200,14 @@ class RfqStore:
                 self._instrument_holders[name] = holders
             else:
                 del self._instrument_holders[name]
+
+    def _record_tombstone(self, request_id: str) -> None:
+        """Remember terminal RFQs after eviction without unbounded process growth."""
+        if request_id in self._tombstones:
+            return
+        self._tombstones[request_id] = None
+        while len(self._tombstones) > self._tombstone_capacity:
+            self._tombstones.popitem(last=False)
 
 
 class Orchestrator:
