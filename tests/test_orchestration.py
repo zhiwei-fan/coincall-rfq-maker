@@ -30,6 +30,7 @@ from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, 
 from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.orchestration import Orchestrator as _Orchestrator
 from coincall_rfq_maker.orchestration import TransientOutageGate
+from coincall_rfq_maker.persistence.outbox import AuditOutbox
 from coincall_rfq_maker.pricing import engine as pricing_engine
 from coincall_rfq_maker.pricing.engine import BlackScholesModel, LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -218,17 +219,42 @@ class FakeQuoteLifecycle:
         self.evicted_for.append(request_id)
 
 
-class RecordingPersistence:
+class RecordingAuditOutbox:
     def __init__(self) -> None:
         self.quotes: list[Quote] = []
 
-    async def record_rfq(self, *args: object, **kwargs: object) -> None:
+    def enqueue_rfq(self, *args: object, **kwargs: object) -> None:
         pass
 
-    async def record_quote(
+    def enqueue_quote(
         self, quote: Quote, market_snapshot: dict[str, float] | None, now_ms: int
     ) -> None:
         self.quotes.append(quote)
+
+    def enqueue_fill(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+class TerminalQuoteLifecycle:
+    def __init__(self) -> None:
+        self.settled = False
+        self.evicted_for: list[str] = []
+
+    async def settle_filled_rfq(self, request_id: str) -> Quote:
+        self.settled = True
+        return Quote(
+            request_id=request_id,
+            stage=QuoteStage.FILLED,
+            legs=(),
+            create_time_ms=0,
+            quote_id="quote-1",
+        )
+
+    def has_open_or_pending_quote_for_rfq(self, request_id: str) -> bool:
+        return False
+
+    def evict_for_rfq(self, request_id: str) -> None:
+        self.evicted_for.append(request_id)
 
 
 class FakePricingModel:
@@ -1885,14 +1911,14 @@ async def test_rfq_terminated_filled_resolves_remote_filled_quote_without_cancel
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
-    persistence = RecordingPersistence()
+    audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
-        persistence=persistence,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
     await orchestrator.reprice_all_active()
@@ -1920,9 +1946,59 @@ async def test_rfq_terminated_filled_resolves_remote_filled_quote_without_cancel
     assert rest.cancel_calls == []
     assert orchestrator.rfq_store.get("rfq-1") is None
     assert quotes.get_for_rfq("rfq-1") is None
-    assert persistence.quotes[0].stage is QuoteStage.OPEN
-    assert persistence.quotes[1].stage is QuoteStage.FILLED
-    assert persistence.quotes[1].filled_price == 101.0
+    assert audit_outbox.quotes[0].stage is QuoteStage.OPEN
+    assert audit_outbox.quotes[1].stage is QuoteStage.FILLED
+    assert audit_outbox.quotes[1].filled_price == 101.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_rfq_cleanup_survives_audit_quote_write_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingAuditStore:
+        def __init__(self) -> None:
+            self.quote_attempted = asyncio.Event()
+
+        async def record_rfq(self, rfq: Rfq, now_ms: int) -> None:
+            pass
+
+        async def record_quote(
+            self, quote: Quote, market_snapshot: dict[str, float] | None, now_ms: int
+        ) -> None:
+            self.quote_attempted.set()
+            raise RuntimeError("disk unavailable")
+
+        async def record_fill(self, event: object, now_ms: int) -> None:
+            pass
+
+    store = FailingAuditStore()
+    audit_outbox = AuditOutbox(store)  # type: ignore[arg-type]
+    shutdown = asyncio.Event()
+    writer = asyncio.create_task(audit_outbox.run(shutdown))
+    quotes = TerminalQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=object(),  # type: ignore[arg-type]
+        market_data=FakeMarketData(),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    with caplog.at_level(logging.ERROR, logger="coincall_rfq_maker.persistence.outbox"):
+        async with asyncio.timeout(1.0):
+            await orchestrator.handle_event(RfqTerminated("rfq-1", RfqStatus.FILLED))
+            await store.quote_attempted.wait()
+
+    shutdown.set()
+    async with asyncio.timeout(1.0):
+        await writer
+
+    assert quotes.settled is True
+    assert quotes.evicted_for == ["rfq-1"]
+    assert orchestrator.rfq_store.get("rfq-1") is None
+    assert "Failed to write audit quote record" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1930,14 +2006,14 @@ async def test_rfq_terminated_filled_cancels_remote_open_quote_and_evicts() -> N
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
-    persistence = RecordingPersistence()
+    audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
-        persistence=persistence,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
     await orchestrator.reprice_all_active()
@@ -1955,7 +2031,7 @@ async def test_rfq_terminated_filled_cancels_remote_open_quote_and_evicts() -> N
     assert rest.cancel_calls == [quote.quote_id]
     assert orchestrator.rfq_store.get("rfq-1") is None
     assert quotes.get_for_rfq("rfq-1") is None
-    assert persistence.quotes[-1].stage is QuoteStage.CANCELLED
+    assert audit_outbox.quotes[-1].stage is QuoteStage.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1963,14 +2039,14 @@ async def test_rfq_terminated_filled_with_pending_cancel_records_fill_and_evicts
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
-    persistence = RecordingPersistence()
+    audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
-        persistence=persistence,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
     await orchestrator.reprice_all_active()
@@ -2003,10 +2079,10 @@ async def test_rfq_terminated_filled_with_pending_cancel_records_fill_and_evicts
     assert rest.quote_list_calls[-1] == {"quote_id": quote.quote_id}
     assert orchestrator.rfq_store.get("rfq-1") is None
     assert quotes.get_for_rfq("rfq-1") is None
-    assert persistence.quotes[-1].stage is QuoteStage.FILLED
-    assert persistence.quotes[-1].filled_price == 101.0
-    assert persistence.quotes[-1].filled_quantity == 1.0
-    assert persistence.quotes[-1].block_trade_id == "bt-1"
+    assert audit_outbox.quotes[-1].stage is QuoteStage.FILLED
+    assert audit_outbox.quotes[-1].filled_price == 101.0
+    assert audit_outbox.quotes[-1].filled_quantity == 1.0
+    assert audit_outbox.quotes[-1].block_trade_id == "bt-1"
 
 
 @pytest.mark.asyncio
@@ -2014,14 +2090,14 @@ async def test_rfq_terminated_filled_malformed_remote_quote_retains_for_retry() 
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
-    persistence = RecordingPersistence()
+    audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
         pricing_model=FakePricingModel(),
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
-        persistence=persistence,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,  # type: ignore[arg-type]
     )
     orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
     await orchestrator.reprice_all_active()
@@ -2053,21 +2129,21 @@ async def test_rfq_terminated_filled_malformed_remote_quote_retains_for_retry() 
     assert retained.is_terminal_status
     assert current is not None
     assert current.stage is QuoteStage.PENDING_CANCEL
-    assert persistence.quotes == [quote]
+    assert audit_outbox.quotes == [quote]
 
 
 @pytest.mark.asyncio
 async def test_quote_update_for_evicted_rfq_updates_known_quote_and_is_persisted() -> None:
     rest = FakeRest()
     quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
-    persistence = RecordingPersistence()
+    audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(),  # type: ignore[arg-type]
         pricing_model=None,  # type: ignore[arg-type]
         risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
         quote_lifecycle=quotes,
-        persistence=persistence,  # type: ignore[arg-type]
+        audit_outbox=audit_outbox,  # type: ignore[arg-type]
     )
     quote = await quotes.reconcile(make_intent())
     assert quote.quote_id is not None
@@ -2093,7 +2169,7 @@ async def test_quote_update_for_evicted_rfq_updates_known_quote_and_is_persisted
     assert updated.filled_quantity == 1.0
     assert updated.fill_time_ms == 123456
     assert updated.block_trade_id == "bt-1"
-    assert persistence.quotes == [updated]
+    assert audit_outbox.quotes == [updated]
 
 
 @pytest.mark.asyncio

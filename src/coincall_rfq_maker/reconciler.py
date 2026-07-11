@@ -14,7 +14,7 @@ from coincall_rfq_maker.core.adapters.schemas import rfq_from_payload
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStatus
-from coincall_rfq_maker.persistence.store import PersistenceStore
+from coincall_rfq_maker.persistence.outbox import AuditOutbox
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.risk.gate import RiskGate
 
@@ -50,7 +50,7 @@ class Reconciler:
         on_rfq_backfill: RfqBackfillHandler,
         on_terminal_rfq: TerminalRfqHandler,
         on_api_recovery: ApiRecoveryHandler,
-        persistence: PersistenceStore | None = None,
+        audit_outbox: AuditOutbox | None = None,
     ) -> None:
         self._rest = rest_client
         self._rfqs = rfq_store
@@ -59,7 +59,7 @@ class Reconciler:
         self._on_rfq_backfill = on_rfq_backfill
         self._on_terminal_rfq = on_terminal_rfq
         self._on_api_recovery = on_api_recovery
-        self._persistence = persistence
+        self._audit = audit_outbox
         self._orphan_cancel_failures: dict[str, int] = {}
         self.last_cycle_completed_ms: int | None = None
 
@@ -247,5 +247,5 @@ class Reconciler:
         return True
 
     async def _record_terminal_quote(self, quote: Quote | None) -> None:
-        if quote is not None and quote.is_terminal and self._persistence is not None:
-            await self._persistence.record_quote(quote, None, get_timestamp_ms())
+        if quote is not None and quote.is_terminal and self._audit is not None:
+            self._audit.enqueue_quote(quote, None, get_timestamp_ms())

@@ -22,6 +22,7 @@ from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
 from coincall_rfq_maker.observability import setup_logging
 from coincall_rfq_maker.orchestration import Orchestrator, TransientOutageGate
+from coincall_rfq_maker.persistence.outbox import AuditOutbox
 from coincall_rfq_maker.persistence.store import PersistenceStore
 from coincall_rfq_maker.pricing.engine import BlackScholesModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
@@ -287,6 +288,7 @@ async def run_async(settings: MakerSettings) -> None:
         CoincallRestClient(maker_credentials.api_key, api_secret, settings.rest_base_url) as rest,
         PersistenceStore(settings.db_path) as persistence,
     ):
+        audit_outbox = AuditOutbox(persistence)
         market_data = MarketDataService(rest, events, settings.price_move_threshold)
         instrument_catalog = InstrumentCatalog(rest)
         pricing_model = BlackScholesModel(
@@ -311,7 +313,7 @@ async def run_async(settings: MakerSettings) -> None:
             risk_gate,
             quote_lifecycle,
             instrument_catalog,
-            persistence,
+            audit_outbox,
             outage_gate,
         )
         ws_client = CoincallWsClient(
@@ -340,6 +342,7 @@ async def run_async(settings: MakerSettings) -> None:
         task_failure_group: ExceptionGroup[Exception] | None = None
         try:
             async with asyncio.TaskGroup() as tg:
+                tg.create_task(audit_outbox.run(shutdown), name="audit-outbox")
                 tg.create_task(ws_client.run(shutdown), name="ws-client")
                 tg.create_task(
                     market_data.run(shutdown, settings.pricing_refresh_seconds), name="market-data"
@@ -371,6 +374,7 @@ async def run_async(settings: MakerSettings) -> None:
         finally:
             if settings.cancel_all_on_stop:
                 await _cancel_all_on_graceful_stop(quote_lifecycle)
+            await audit_outbox.drain()
 
         if task_failure_group is not None:
             raise task_failure_group

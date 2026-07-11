@@ -45,7 +45,7 @@ from coincall_rfq_maker.events import (
 )
 from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
 from coincall_rfq_maker.marketdata.service import MarketDataService
-from coincall_rfq_maker.persistence.store import PersistenceStore
+from coincall_rfq_maker.persistence.outbox import AuditOutbox
 from coincall_rfq_maker.pricing.engine import PricingModel
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import build_quote_intent
@@ -184,7 +184,7 @@ class Orchestrator:
         risk_gate: RiskGate,
         quote_lifecycle: QuoteLifecycle,
         instrument_catalog: InstrumentCatalog,
-        persistence: PersistenceStore | None = None,
+        audit_outbox: AuditOutbox | None = None,
         outage_gate: TransientOutageGate | None = None,
     ) -> None:
         self._market_data = market_data
@@ -192,7 +192,7 @@ class Orchestrator:
         self._risk_gate = risk_gate
         self._quotes = quote_lifecycle
         self._instruments = instrument_catalog
-        self._persistence = persistence
+        self._audit = audit_outbox
         self._outage_gate = outage_gate if outage_gate is not None else TransientOutageGate()
         self.rfq_store = RfqStore()
         self._reconciler = Reconciler(
@@ -203,7 +203,7 @@ class Orchestrator:
             on_rfq_backfill=self._handle_rfq_received,
             on_terminal_rfq=self._handle_reconciled_terminal_rfq,
             on_api_recovery=self._outage_gate.record_success,
-            persistence=persistence,
+            audit_outbox=audit_outbox,
         )
 
     async def handle_event(self, event: object) -> None:
@@ -240,8 +240,8 @@ class Orchestrator:
                 logger.warning("Skipping unparseable instrument %s on RFQ %s", name, rfq.request_id)
                 continue
             self._market_data.track(underlying)
-        if self._persistence is not None:
-            await self._persistence.record_rfq(rfq, now_ms)
+        if self._audit is not None:
+            self._audit.enqueue_rfq(rfq, now_ms)
         await self._reprice_and_quote(rfq.request_id)
 
     async def _handle_rfq_terminated(self, event: RfqTerminated) -> None:
@@ -251,8 +251,8 @@ class Orchestrator:
             logger.debug("RFQ termination for unknown or evicted RFQ %s ignored", event.request_id)
             return
         settled = await self._settle_terminal_quote(event.request_id, event.status)
-        if self._persistence is not None:
-            await self._persistence.record_rfq(updated, now_ms)
+        if self._audit is not None:
+            self._audit.enqueue_rfq(updated, now_ms)
         if not settled:
             return
         self._cleanup_and_evict_terminal_rfq(event.request_id)
@@ -261,8 +261,8 @@ class Orchestrator:
         try:
             if status is RfqStatus.FILLED:
                 quote = await self._quotes.settle_filled_rfq(request_id)
-                if quote is not None and quote.is_terminal and self._persistence is not None:
-                    await self._persistence.record_quote(quote, None, get_timestamp_ms())
+                if quote is not None and quote.is_terminal and self._audit is not None:
+                    self._audit.enqueue_quote(quote, None, get_timestamp_ms())
             else:
                 await self._quotes.withdraw_for_rfq(request_id)
         except CoincallError:
@@ -297,13 +297,13 @@ class Orchestrator:
             )
             return
         updated = self._quotes.apply_ws_update(event)
-        if updated is not None and self._persistence is not None:
-            await self._persistence.record_quote(updated, None, get_timestamp_ms())
+        if updated is not None and self._audit is not None:
+            self._audit.enqueue_quote(updated, None, get_timestamp_ms())
 
     async def _handle_trade(self, event: TradeExecuted) -> None:
         logger.info("Trade executed: block_trade=%s quote=%s", event.block_trade_id, event.quote_id)
-        if self._persistence is not None:
-            await self._persistence.record_fill(event, get_timestamp_ms())
+        if self._audit is not None:
+            self._audit.enqueue_fill(event, get_timestamp_ms())
 
     async def _handle_prices_refreshed(self, event: PricesRefreshed) -> None:
         for underlying in event.underlyings:
@@ -412,7 +412,7 @@ class Orchestrator:
             rfq = rfq.with_stage(RfqStage.QUOTED)
             self.rfq_store.upsert(rfq)
 
-        if self._persistence is not None:
+        if self._audit is not None:
             snapshot: dict[str, float] = {}
             for name in rfq.instrument_names():
                 maybe_instrument = _safe_parse(name)
@@ -421,7 +421,7 @@ class Orchestrator:
                 underlying_price = self._market_data.get_price(maybe_instrument.underlying)
                 if underlying_price is not None:
                     snapshot[maybe_instrument.underlying] = underlying_price
-            await self._persistence.record_quote(quote, snapshot, now_ms)
+            self._audit.enqueue_quote(quote, snapshot, now_ms)
 
     async def _withdraw_rejected_quote(self, request_id: str, reason: str | None) -> None:
         before = self._quotes.get_for_rfq(request_id)

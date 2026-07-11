@@ -4,6 +4,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, ClassVar, Self
 
+import aiosqlite
 import pytest
 
 from coincall_rfq_maker import cli
@@ -11,7 +12,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallConnectivityError,
     CoincallRequestError,
 )
-from coincall_rfq_maker.events import ReconcileTick, RepriceTick
+from coincall_rfq_maker.events import ReconcileTick, RepriceTick, TradeExecuted
 from coincall_rfq_maker.settings import MakerSettings
 
 
@@ -158,6 +159,37 @@ class NoopOrchestrator:
 
     async def handle_event(self, event: object) -> None:
         pass
+
+
+class AuditEnqueueingOrchestrator:
+    reconciler_last_cycle_ms = None
+    enqueued: ClassVar[asyncio.Event]
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._audit_outbox = args[6]
+
+    async def handle_event(self, event: object) -> None:
+        self._audit_outbox.enqueue_fill(  # type: ignore[union-attr]
+            TradeExecuted(
+                block_trade_id="block-1",
+                quote_id="quote-1",
+                request_id="rfq-1",
+                filled_price=100.0,
+                filled_quantity=1.0,
+                fill_time_ms=1,
+            ),
+            now_ms=2,
+        )
+        type(self).enqueued.set()
+
+
+class ShutdownAfterAuditWsClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def run(self, shutdown: asyncio.Event) -> None:
+        await AuditEnqueueingOrchestrator.enqueued.wait()
+        shutdown.set()
 
 
 class FailsFirstOrchestrator:
@@ -664,6 +696,35 @@ async def test_run_async_warns_only_when_startup_cancel_all_is_disabled(
 
     warning = "CANCEL_ALL_ON_START=false: pre-existing exchange quotes"
     assert (warning in caplog.text) is (not cancel_all_on_start)
+
+
+@pytest.mark.asyncio
+async def test_run_async_drains_outbox_to_sqlite_before_closing_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", ShutdownAfterAuditWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", AuditEnqueueingOrchestrator)
+    AuditEnqueueingOrchestrator.enqueued = asyncio.Event()
+    db_path = tmp_path / "audit.db"
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        DB_PATH=str(db_path),
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=False,
+    )
+
+    async with asyncio.timeout(2.0):
+        await cli.run_async(settings)
+
+    async with aiosqlite.connect(db_path) as connection:
+        cursor = await connection.execute("SELECT block_trade_id FROM fills ORDER BY id")
+        rows = await cursor.fetchall()
+    assert rows == [("block-1",)]
 
 
 @pytest.mark.asyncio
