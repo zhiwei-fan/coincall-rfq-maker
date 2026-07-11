@@ -202,6 +202,28 @@ class FailsFirstOrchestrator:
             raise RuntimeError("bad event")
 
 
+class RecoverableFirstOrchestrator:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.processed_next_event = asyncio.Event()
+
+    async def handle_event(self, event: object) -> None:
+        self.events.append(event)
+        if len(self.events) == 1:
+            raise CoincallRequestError("exchange unavailable")
+        self.processed_next_event.set()
+
+
+class FatalDispatchOrchestrator:
+    reconciler_last_cycle_ms = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def handle_event(self, event: object) -> None:
+        raise RuntimeError("pricing model failed")
+
+
 class ShutdownOnPutQueue:
     def __init__(self) -> None:
         self.puts = 0
@@ -491,6 +513,35 @@ async def test_taskgroup_failure_without_signal_attempts_cancel_all_and_propagat
 
 
 @pytest.mark.asyncio
+async def test_dispatch_failure_unwinds_taskgroup_and_cancels_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingQuoteLifecycle.instances = []
+    RecordingQuoteLifecycle.fail_on_cancel_all = False
+    RecordingQuoteLifecycle.cancel_all_exception = None
+    monkeypatch.setattr(cli, "CoincallRestClient", FakeRestContext)
+    monkeypatch.setattr(cli, "PersistenceStore", FakePersistenceContext)
+    monkeypatch.setattr(cli, "QuoteLifecycle", RecordingQuoteLifecycle)
+    monkeypatch.setattr(cli, "CoincallWsClient", StopAwareWsClient)
+    monkeypatch.setattr(cli, "MarketDataService", StopAwareMarketData)
+    monkeypatch.setattr(cli, "Orchestrator", FatalDispatchOrchestrator)
+    settings = MakerSettings(
+        API_KEY="key",
+        API_SECRET="secret",
+        CANCEL_ALL_ON_START=False,
+        CANCEL_ALL_ON_STOP=True,
+    )
+
+    async with asyncio.timeout(5):
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await cli.run_async(settings)
+
+    assert len(RecordingQuoteLifecycle.instances) == 1
+    assert RecordingQuoteLifecycle.instances[0].cancel_all_calls == 1
+    assert any(isinstance(exc, RuntimeError) for exc in exc_info.value.exceptions)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancel_all_non_coincall_failure_exits_cleanly(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -738,20 +789,39 @@ async def test_startup_backfill_tick_is_enqueued_before_timer_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_loop_logs_bad_event_and_processes_next() -> None:
+async def test_dispatch_loop_reraises_unexpected_handler_error() -> None:
     queue: asyncio.Queue[object] = asyncio.Queue()
     orchestrator = FailsFirstOrchestrator()
+    first = object()
+    await queue.put(first)
+
+    async with asyncio.timeout(5):
+        with pytest.raises(RuntimeError, match="bad event"):
+            await cli._dispatch_loop(queue, orchestrator)  # type: ignore[arg-type]
+
+    assert orchestrator.events == [first]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_loop_recovers_from_coincall_error_and_processes_next(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    orchestrator = RecoverableFirstOrchestrator()
     first = object()
     second = object()
     await queue.put(first)
     await queue.put(second)
 
-    task = asyncio.create_task(cli._dispatch_loop(queue, orchestrator))  # type: ignore[arg-type]
-    await asyncio.wait_for(queue.join(), timeout=1.0)
-    queue.shutdown()
-    await asyncio.wait_for(task, timeout=1.0)
+    with caplog.at_level(logging.ERROR):
+        task = asyncio.create_task(cli._dispatch_loop(queue, orchestrator))  # type: ignore[arg-type]
+        async with asyncio.timeout(5):
+            await orchestrator.processed_next_event.wait()
+            queue.shutdown()
+            await task
 
     assert orchestrator.events == [first, second]
+    assert "Coincall error while dispatching" in caplog.text
 
 
 def test_flatten_retry_delay_backs_off_and_stays_capped() -> None:

@@ -36,7 +36,7 @@ from coincall_rfq_maker.pricing.engine import BlackScholesModel, LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.reconciler import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS
-from coincall_rfq_maker.risk.gate import RiskDecision, RiskGate
+from coincall_rfq_maker.risk.gate import ApprovedQuotePlan, RiskDecision, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 
@@ -292,7 +292,7 @@ class FailingInstrumentRest(FakeRest):
 
 class RecordingQuoteLifecycle(QuoteLifecycle):
     def __init__(self, rest_client: object) -> None:
-        super().__init__(rest_client, dry_run=False)  # type: ignore[arg-type]
+        super().__init__(rest_client, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
         self.withdrawn_for: list[str] = []
 
     async def withdraw_for_rfq(self, request_id: str) -> Quote | None:
@@ -303,13 +303,20 @@ class RecordingQuoteLifecycle(QuoteLifecycle):
 class RecordingRiskGate:
     def __init__(self, decision: RiskDecision | None = None) -> None:
         self.calls: list[str] = []
-        self.decision = decision or RiskDecision(approved=True)
+        self.decision = decision
         self._consecutive_failures = 0
         self._failures_total = 0
         self.kill_switch_tripped = False
 
     def evaluate(self, *args: object, **kwargs: object) -> RiskDecision:
-        return self.decision
+        if self.decision is not None:
+            return self.decision
+        intent = args[1]
+        assert isinstance(intent, QuoteIntent)
+        return RiskDecision(
+            approved=True,
+            plan=ApprovedQuotePlan(intent=intent, decided_at_ms=get_timestamp_ms()),
+        )
 
     def record_api_failure(self) -> None:
         self.calls.append("failure")
@@ -355,11 +362,26 @@ def make_rfq_payload(request_id: str = "rfq-1") -> dict[str, Any]:
     }
 
 
-def make_intent(request_id: str = "rfq-1", price: float = 100.0) -> QuoteIntent:
-    return QuoteIntent(
-        request_id=request_id,
-        legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=price),),
+def make_intent(request_id: str = "rfq-1", price: float = 100.0) -> ApprovedQuotePlan:
+    return ApprovedQuotePlan(
+        intent=QuoteIntent(
+            request_id=request_id,
+            legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=price),),
+        ),
+        decided_at_ms=0,
     )
+
+
+def approved_plan(intent: QuoteIntent) -> ApprovedQuotePlan:
+    return ApprovedQuotePlan(intent=intent, decided_at_ms=0)
+
+
+class NoopApiReporter:
+    def record_api_failure(self) -> None:
+        pass
+
+    def record_api_success(self) -> None:
+        pass
 
 
 @pytest.mark.asyncio
@@ -586,7 +608,7 @@ async def test_reconciler_cancels_unknown_exchange_open_quote() -> None:
         "code": 0,
         "data": [{"requestId": "rfq-ghost", "quoteId": "q-orphan", "state": "OPEN"}],
     }
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(),  # type: ignore[arg-type]
@@ -759,7 +781,7 @@ async def test_reconciler_adopts_unknown_exchange_quote_for_local_pending_create
     rest = FakeRest(open_request_ids=["rfq-1"])
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(),  # type: ignore[arg-type]
@@ -799,7 +821,7 @@ async def test_reconciler_adopts_unknown_exchange_quote_for_local_pending_create
 async def test_reconciler_resolves_pending_cancel_despite_stale_market_data() -> None:
     rest = FakeRest(open_request_ids=["rfq-1"])
     market_data = FakeMarketData(price=50_000.0, age_seconds=300.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -850,7 +872,7 @@ async def test_reconciler_adopts_filled_exchange_quote_for_pending_create() -> N
     rest = FakeRest(open_request_ids=["rfq-1"])
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(),  # type: ignore[arg-type]
@@ -900,7 +922,7 @@ async def test_reconciler_adopts_filled_exchange_quote_for_pending_create() -> N
 async def test_reconciler_resolves_local_open_quote_absent_from_exchange_open_list() -> None:
     rest = FakeRest(open_request_ids=["rfq-1"])
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -945,7 +967,7 @@ async def test_reconciler_resolves_local_open_quote_absent_from_exchange_open_li
 async def test_reconciler_treats_salvaged_malformed_quote_ids_as_remote_open() -> None:
     rest = FakeRest(open_request_ids=["rfq-1"])
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -987,7 +1009,7 @@ async def test_reconciler_treats_salvaged_malformed_quote_ids_as_remote_open() -
 @pytest.mark.asyncio
 async def test_reconciler_skips_malformed_resolved_quote_and_continues() -> None:
     rest = FakeRest(open_request_ids=["rfq-1", "rfq-2"])
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(),  # type: ignore[arg-type]
@@ -1081,7 +1103,7 @@ async def test_risk_reject_cancels_existing_open_quote() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     risk_gate = RecordingRiskGate()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -1103,6 +1125,23 @@ async def test_risk_reject_cancels_existing_open_quote() -> None:
     assert current.stage is QuoteStage.CANCELLED
     assert rest.cancel_calls == [quote.quote_id]
     assert len(rest.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_risk_decision_never_reaches_reconcile() -> None:
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=FakeRest(),  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=50_000.0),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),
+        risk_gate=RecordingRiskGate(RiskDecision(approved=False, reason="limit")),  # type: ignore[arg-type]
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    await orchestrator.reprice_all_active()
+
+    assert quotes.reconcile_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1141,7 +1180,7 @@ async def test_exchange_expiry_on_expiry_day_submits_a_quote(
 
     monkeypatch.setattr(pricing_engine, "datetime", FrozenDateTime)
     rest = FakeRest()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = _Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(price=60_000.0),  # type: ignore[arg-type]
@@ -1169,9 +1208,11 @@ async def test_expiry_mismatch_withdraws_without_submitting() -> None:
     rest = FakeRest()
     quotes = RecordingQuoteLifecycle(rest)
     existing = await quotes.reconcile(
-        QuoteIntent(
-            request_id="rfq-1",
-            legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+        approved_plan(
+            QuoteIntent(
+                request_id="rfq-1",
+                legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+            )
         )
     )
     assert existing.quote_id is not None
@@ -1206,9 +1247,11 @@ async def test_missing_exchange_expiry_metadata_never_calls_pricing_and_withdraw
     rest = FailingInstrumentRest()
     quotes = RecordingQuoteLifecycle(rest)
     existing = await quotes.reconcile(
-        QuoteIntent(
-            request_id="rfq-1",
-            legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+        approved_plan(
+            QuoteIntent(
+                request_id="rfq-1",
+                legs=(QuoteLegIntent("BTCUSD-09JUL26-56000-C", 100.0),),
+            )
         )
     )
     assert existing.quote_id is not None
@@ -1245,7 +1288,7 @@ async def test_risk_reject_with_pending_create_cancels_quote_that_later_opened()
     rest.quote_list_response = {"code": 0, "data": []}
     market_data = FakeMarketData(price=50_000.0)
     risk_gate = RecordingRiskGate()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -1284,7 +1327,7 @@ async def test_risk_reject_with_pending_cancel_resolves_and_cancels_if_still_ope
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     risk_gate = RecordingRiskGate()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -1326,7 +1369,7 @@ async def test_risk_reject_does_not_log_withdrawal_for_already_terminal_quote(
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
     risk_gate = RecordingRiskGate()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -1399,9 +1442,11 @@ async def test_noop_reconcile_records_neither_gate_outcome(
     risk_gate = RecordingRiskGate()
     quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=risk_gate)  # type: ignore[arg-type]
     await quotes.reconcile(
-        QuoteIntent(
-            request_id="rfq-1",
-            legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=100.0),),
+        approved_plan(
+            QuoteIntent(
+                request_id="rfq-1",
+                legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=100.0),),
+            )
         )
     )
     risk_gate.calls.clear()
@@ -1588,7 +1633,7 @@ async def test_unverified_ambiguous_create_uses_cooldown_without_tripping_kill_s
 @pytest.mark.asyncio
 async def test_shutdown_cancel_all_bypasses_active_outage_cooldown() -> None:
     rest = FakeRest()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=FakeMarketData(price=50_000.0),  # type: ignore[arg-type]
@@ -1872,7 +1917,7 @@ async def test_reconcile_tick_dispatch_reconciles_exchange_state() -> None:
 async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evicted() -> None:
     rest = FakeRest(open_request_ids=[])
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
         market_data=market_data,  # type: ignore[arg-type]
@@ -1910,7 +1955,7 @@ async def test_terminal_cancel_failure_keeps_rfq_and_reconcile_retries_until_evi
 async def test_rfq_terminated_filled_resolves_remote_filled_quote_without_cancel() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
@@ -2005,7 +2050,7 @@ async def test_terminal_rfq_cleanup_survives_audit_quote_write_failure(
 async def test_rfq_terminated_filled_cancels_remote_open_quote_and_evicts() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
@@ -2038,7 +2083,7 @@ async def test_rfq_terminated_filled_cancels_remote_open_quote_and_evicts() -> N
 async def test_rfq_terminated_filled_with_pending_cancel_records_fill_and_evicts() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
@@ -2089,7 +2134,7 @@ async def test_rfq_terminated_filled_with_pending_cancel_records_fill_and_evicts
 async def test_rfq_terminated_filled_malformed_remote_quote_retains_for_retry() -> None:
     rest = FakeRest()
     market_data = FakeMarketData(price=50_000.0)
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]
@@ -2135,7 +2180,7 @@ async def test_rfq_terminated_filled_malformed_remote_quote_retains_for_retry() 
 @pytest.mark.asyncio
 async def test_quote_update_for_evicted_rfq_updates_known_quote_and_is_persisted() -> None:
     rest = FakeRest()
-    quotes = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
     audit_outbox = RecordingAuditOutbox()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]

@@ -19,7 +19,7 @@ from coincall_rfq_maker.domain.quote import Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
-from coincall_rfq_maker.risk.gate import RiskGate
+from coincall_rfq_maker.risk.gate import ApprovedQuotePlan, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 
@@ -99,10 +99,14 @@ def _quote_payloads(response: dict[str, Any]) -> QuoteListSnapshot:
     return _parse_quote_list(response)
 
 
-def make_intent(price: float = 100.0) -> QuoteIntent:
+def make_raw_intent(price: float = 100.0) -> QuoteIntent:
     return QuoteIntent(
         request_id="rfq-1", legs=(QuoteLegIntent(instrument_name=INSTRUMENT, price=price),)
     )
+
+
+def make_intent(price: float = 100.0) -> ApprovedQuotePlan:
+    return ApprovedQuotePlan(intent=make_raw_intent(price), decided_at_ms=0)
 
 
 def quote_payload(quote_id: str, price: float) -> dict[str, Any]:
@@ -129,9 +133,24 @@ async def test_dry_run_creates_nothing_over_rest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconcile_requires_a_risk_approved_plan() -> None:
+    lifecycle = QuoteLifecycle(FakeRestClient(), dry_run=True)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="quote submission requires a risk-approved plan"):
+        await lifecycle.reconcile(make_raw_intent())  # type: ignore[arg-type]
+
+
+def test_live_mode_requires_api_reporter() -> None:
+    with pytest.raises(ValueError, match="live mode requires an api_reporter"):
+        QuoteLifecycle(FakeRestClient(), dry_run=False)  # type: ignore[arg-type]
+
+    QuoteLifecycle(FakeRestClient(), dry_run=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_live_create_calls_rest_and_stores_open_quote() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.stage is QuoteStage.OPEN
     assert quote.quote_id == "q-1"
@@ -142,7 +161,7 @@ async def test_live_create_calls_rest_and_stores_open_quote() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_is_idempotent_when_price_unchanged() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     first = await lifecycle.reconcile(make_intent(price=100.0))
     second = await lifecycle.reconcile(make_intent(price=100.0))
     assert first.quote_id == second.quote_id
@@ -153,7 +172,7 @@ async def test_reconcile_is_idempotent_when_price_unchanged() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_replaces_when_price_changes() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     first = await lifecycle.reconcile(make_intent(price=100.0))
     second = await lifecycle.reconcile(make_intent(price=105.0))
     assert rest.cancel_calls == [first.quote_id]
@@ -164,7 +183,7 @@ async def test_reconcile_replaces_when_price_changes() -> None:
 @pytest.mark.asyncio
 async def test_cancel_failure_reverts_open_and_does_not_create_replacement() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     first = await lifecycle.reconcile(make_intent(price=100.0))
     rest.cancel_error = CoincallApiError(500, None, "cancel failed")
 
@@ -183,7 +202,7 @@ async def test_cancel_failure_reverts_open_and_does_not_create_replacement() -> 
 async def test_create_failure_propagates_without_synthetic_cancelled_quote() -> None:
     rest = FakeRestClient()
     rest.create_error = CoincallApiError(503, None, "unavailable")
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     with pytest.raises(CoincallApiError):
         await lifecycle.reconcile(make_intent())
@@ -222,7 +241,7 @@ async def test_conflicting_create_cancels_mismatch_then_recreates_once() -> None
         ]
     )
     rest.quote_list_response = quote_payload("q-1", 99.0)
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     quote = await lifecycle.reconcile(make_intent())
 
@@ -281,7 +300,7 @@ async def test_ambiguous_create_adopts_open_exchange_quote() -> None:
         "code": 0,
         "data": [{"requestId": "rfq-1", "quoteId": "exchange-q-1"}],
     }
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     quote = await lifecycle.reconcile(make_intent())
 
@@ -305,7 +324,7 @@ async def test_ambiguous_create_adopts_salvaged_quote_id_from_malformed_item() -
             }
         ],
     }
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     quote = await lifecycle.reconcile(make_intent())
 
@@ -322,7 +341,7 @@ async def test_ambiguous_create_does_not_adopt_empty_quote_id() -> None:
         "code": 0,
         "data": [{"requestId": "rfq-1", "quoteId": "", "state": "OPEN"}],
     }
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     with pytest.raises(CoincallAmbiguousError) as exc_info:
         await lifecycle.reconcile(make_intent())
@@ -341,7 +360,7 @@ async def test_ambiguous_create_not_listed_remains_ambiguous() -> None:
     rest = FakeRestClient()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
 
     with pytest.raises(CoincallAmbiguousError) as exc_info:
         await lifecycle.reconcile(make_intent())
@@ -447,7 +466,7 @@ async def test_noop_withdraw_cancel_and_dry_run_cancel_all_record_no_success() -
 @pytest.mark.asyncio
 async def test_ambiguous_cancel_keeps_quote_open_when_exchange_still_lists_it() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     rest.cancel_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {
@@ -468,7 +487,7 @@ async def test_ambiguous_cancel_keeps_quote_open_when_exchange_still_lists_it() 
 @pytest.mark.asyncio
 async def test_ambiguous_cancel_mirrors_filled_exchange_state() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     rest.cancel_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {
@@ -502,7 +521,7 @@ async def test_ambiguous_cancel_mirrors_filled_exchange_state() -> None:
 @pytest.mark.asyncio
 async def test_ambiguous_cancel_missing_quote_stays_pending_cancel() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     rest.cancel_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
@@ -519,7 +538,7 @@ async def test_ambiguous_cancel_missing_quote_stays_pending_cancel() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_pending_cancel_rechecks_exchange_before_create_when_still_open() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent(price=100.0))
     rest.cancel_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
@@ -545,7 +564,7 @@ async def test_reconcile_pending_cancel_rechecks_exchange_before_create_when_sti
 @pytest.mark.asyncio
 async def test_reconcile_pending_cancel_mirrors_filled_without_creating_fresh_quote() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent(price=100.0))
     assert quote.quote_id is not None
     rest.cancel_error = CoincallAmbiguousError("timeout")
@@ -579,7 +598,7 @@ async def test_reconcile_pending_cancel_mirrors_filled_without_creating_fresh_qu
 @pytest.mark.asyncio
 async def test_reconcile_filled_existing_quote_does_not_create_replacement() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent(price=100.0))
     assert quote.quote_id is not None
     updated = lifecycle.apply_ws_update(
@@ -604,7 +623,7 @@ async def test_reconcile_filled_existing_quote_does_not_create_replacement() -> 
 @pytest.mark.asyncio
 async def test_reconcile_expired_existing_quote_still_creates_replacement() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent(price=100.0))
     assert quote.quote_id is not None
     updated = lifecycle.apply_ws_update(
@@ -625,7 +644,7 @@ async def test_reconcile_pending_create_reverifies_and_adopts_without_second_cre
     rest = FakeRestClient()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     with pytest.raises(CoincallRequestError):
         await lifecycle.reconcile(make_intent())
     assert lifecycle.get_for_rfq("rfq-1").stage is QuoteStage.PENDING_CREATE  # type: ignore[union-attr]
@@ -657,7 +676,7 @@ async def test_pending_create_adoption_mirrors_exchange_legs_before_repricing() 
             }
         ],
     }
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     lifecycle._store.store(
         Quote(
             request_id="rfq-1",
@@ -679,7 +698,7 @@ async def test_pending_create_adoption_mirrors_exchange_legs_before_repricing() 
 @pytest.mark.asyncio
 async def test_payloadless_adoption_uses_price_unknown_sentinel_and_reprices() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     lifecycle._store.store(
         Quote(
             request_id="rfq-1",
@@ -805,7 +824,7 @@ async def test_withdraw_pending_create_verifies_open_quote_then_cancels() -> Non
     rest = FakeRestClient()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     with pytest.raises(CoincallRequestError):
         await lifecycle.reconcile(make_intent())
 
@@ -865,7 +884,7 @@ async def test_withdraw_pending_create_after_grace_marks_cancelled(
     now = 1_000_000
     monkeypatch.setattr("coincall_rfq_maker.quoting.lifecycle.current_time_ms", lambda: now)
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     lifecycle._store.store(
         Quote(
             request_id="rfq-1",
@@ -889,7 +908,7 @@ async def test_withdraw_pending_create_cancels_quote_that_lands_within_grace(
     now = 1_000_000
     monkeypatch.setattr("coincall_rfq_maker.quoting.lifecycle.current_time_ms", lambda: now)
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     lifecycle._store.store(
         Quote(
             request_id="rfq-1",
@@ -938,7 +957,7 @@ async def test_dry_run_withdraw_pending_create_cancels_without_rest_call() -> No
 @pytest.mark.asyncio
 async def test_withdraw_pending_cancel_cancels_again_when_remote_still_open() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
     rest.cancel_error = CoincallAmbiguousError("timeout")
@@ -967,7 +986,7 @@ async def test_settle_filled_pending_create_resolves_remote_quote_by_request_id(
     rest = FakeRestClient()
     rest.create_error = CoincallAmbiguousError("timeout")
     rest.quote_list_response = {"code": 0, "data": []}
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     with pytest.raises(CoincallRequestError):
         await lifecycle.reconcile(make_intent())
 
@@ -999,7 +1018,7 @@ async def test_settle_filled_remote_open_quote_is_cancelled(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
     rest.quote_list_response = {
@@ -1042,7 +1061,7 @@ async def test_settle_filled_dry_run_withdraws_locally_without_rest_calls() -> N
 @pytest.mark.asyncio
 async def test_adopt_open_exchange_quote_refuses_different_quote_id_displacement() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
 
     adopted = lifecycle.adopt_open_exchange_quote("rfq-1", "exchange-q-other")
@@ -1057,7 +1076,7 @@ async def test_adopt_open_exchange_quote_refuses_different_quote_id_displacement
 @pytest.mark.asyncio
 async def test_evict_for_rfq_clears_request_and_all_quote_id_indexes() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
     lifecycle._store._by_quote_id["stale-alias"] = quote
@@ -1073,7 +1092,7 @@ async def test_evict_for_rfq_clears_request_and_all_quote_id_indexes() -> None:
 @pytest.mark.asyncio
 async def test_cancel_for_rfq_cancels_open_quote() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     await lifecycle.cancel_for_rfq("rfq-1")
     assert rest.cancel_calls == [quote.quote_id]
@@ -1082,7 +1101,7 @@ async def test_cancel_for_rfq_cancels_open_quote() -> None:
 @pytest.mark.asyncio
 async def test_apply_ws_update_transitions_quote_to_filled() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     event = QuoteUpdated(
         quote_id=quote.quote_id or "",
@@ -1101,7 +1120,7 @@ async def test_apply_ws_update_same_stage_is_idempotent_and_merges_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
 
@@ -1131,7 +1150,7 @@ async def test_apply_ws_update_same_stage_is_idempotent_and_merges_fields(
 @pytest.mark.asyncio
 async def test_apply_ws_update_same_stage_without_new_fields_is_noop() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
 
@@ -1147,7 +1166,7 @@ async def test_apply_ws_update_same_stage_without_new_fields_is_noop() -> None:
 @pytest.mark.asyncio
 async def test_apply_ws_update_same_stage_with_identical_fields_is_noop() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
     filled = lifecycle.apply_ws_update(
@@ -1185,7 +1204,7 @@ async def test_apply_ws_update_genuine_illegal_transition_warns_and_is_ignored(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     quote = await lifecycle.reconcile(make_intent())
     assert quote.quote_id is not None
     await lifecycle.cancel_for_rfq("rfq-1")
@@ -1205,6 +1224,6 @@ async def test_apply_ws_update_genuine_illegal_transition_warns_and_is_ignored(
 @pytest.mark.asyncio
 async def test_apply_ws_update_for_unknown_quote_is_ignored() -> None:
     rest = FakeRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     event = QuoteUpdated(quote_id="ghost", request_id="rfq-x", stage=QuoteStage.OPEN)
     assert lifecycle.apply_ws_update(event) is None

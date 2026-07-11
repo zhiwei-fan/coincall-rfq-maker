@@ -377,9 +377,10 @@ class Orchestrator:
 
         now_ms = get_timestamp_ms()
         decision = self._risk_gate.evaluate(rfq, intent, ages, now_ms)
-        if not decision.approved:
-            logger.warning("Not quoting RFQ %s: %s", request_id, decision.reason)
-            await self._withdraw_rejected_quote(request_id, decision.reason)
+        if not decision.approved or decision.plan is None:
+            reason = decision.reason or "risk approval did not produce a plan"
+            logger.warning("Not quoting RFQ %s: %s", request_id, reason)
+            await self._withdraw_rejected_quote(request_id, reason)
             return
 
         if self._outage_gate.in_cooldown(now_ms):
@@ -392,7 +393,7 @@ class Orchestrator:
 
         with track_exchange_io() as exchange_io:
             try:
-                quote = await self._quotes.reconcile(intent)
+                quote = await self._quotes.reconcile(decision.plan)
             except CoincallError as exc:
                 kind = classify_api_failure(exc)
                 if kind in {ApiFailureKind.TRANSIENT, ApiFailureKind.AMBIGUOUS}:

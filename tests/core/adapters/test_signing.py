@@ -16,11 +16,20 @@ from coincall_rfq_maker.core.adapters.signing import (
 )
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
+from coincall_rfq_maker.risk.gate import ApprovedQuotePlan
 
 API_KEY = "test-key"
 API_SECRET = "test-secret"
 TS = 1750000000000
 DIFF = 5000
+
+
+class NoopApiReporter:
+    def record_api_failure(self) -> None:
+        pass
+
+    def record_api_success(self) -> None:
+        pass
 
 
 def test_get_prehash_with_params() -> None:
@@ -86,17 +95,20 @@ async def test_create_quote_callsite_payload_prehash_golden() -> None:
             return CreateQuoteResult(quote_id="q-1")
 
     rest = CapturingRestClient()
-    lifecycle = QuoteLifecycle(rest, dry_run=False)  # type: ignore[arg-type]
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
 
     await lifecycle.reconcile(
-        QuoteIntent(
-            request_id="rfq-1",
-            legs=(
-                QuoteLegIntent(
-                    instrument_name="BTCUSD-21AUG25-120000-C",
-                    price=100.0,
+        ApprovedQuotePlan(
+            intent=QuoteIntent(
+                request_id="rfq-1",
+                legs=(
+                    QuoteLegIntent(
+                        instrument_name="BTCUSD-21AUG25-120000-C",
+                        price=100.0,
+                    ),
                 ),
             ),
+            decided_at_ms=0,
         )
     )
 

@@ -48,9 +48,18 @@ def _validated_finite_positive_config(name: str, value: float) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovedQuotePlan:
+    """A quote intent that passed the pre-trade risk gate."""
+
+    intent: QuoteIntent
+    decided_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class RiskDecision:
     approved: bool
     reason: str | None = None
+    plan: ApprovedQuotePlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +229,14 @@ class RiskGate:
                     f"market data for {intent_leg.instrument_name} stale ({age:.1f}s)"
                 )
 
-        return RiskDecision(approved=True)
+        return self._approve(intent, now_ms)
+
+    @staticmethod
+    def _approve(intent: QuoteIntent, now_ms: int) -> RiskDecision:
+        return RiskDecision(
+            approved=True,
+            plan=ApprovedQuotePlan(intent=intent, decided_at_ms=now_ms),
+        )
 
     @staticmethod
     def _reject(reason: str) -> RiskDecision:

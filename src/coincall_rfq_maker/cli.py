@@ -81,8 +81,15 @@ async def _dispatch_loop(events: "asyncio.Queue[object]", orchestrator: Orchestr
             await orchestrator.handle_event(event)
         except asyncio.QueueShutDown:
             raise
+        except CoincallError:
+            logger.exception("Coincall error while dispatching %s", type(event).__name__)
         except Exception:
-            logger.exception("Unhandled exception while dispatching %s", type(event).__name__)
+            logger.critical(
+                "Unexpected error; failing closed while dispatching %s",
+                type(event).__name__,
+                exc_info=True,
+            )
+            raise
         finally:
             events.task_done()
 

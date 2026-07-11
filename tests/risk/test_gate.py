@@ -4,7 +4,12 @@ import pytest
 
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStatus, Side
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
-from coincall_rfq_maker.risk.gate import ExposureSnapshot, NullExposureProvider, RiskGate
+from coincall_rfq_maker.risk.gate import (
+    ApprovedQuotePlan,
+    ExposureSnapshot,
+    NullExposureProvider,
+    RiskGate,
+)
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 NOW_MS = 1_000_000
@@ -183,6 +188,19 @@ def test_rejects_below_min_time_to_expiry() -> None:
     decision = gate.evaluate(rfq, make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
     assert not decision.approved
     assert "expiry" in decision.reason
+
+
+def test_approval_mints_a_plan_and_rejection_does_not() -> None:
+    intent = make_intent()
+    approved = make_gate().evaluate(make_rfq(), intent, {INSTRUMENT: 1.0}, NOW_MS)
+    rejected = make_gate(max_leg_qty=0.5).evaluate(make_rfq(), intent, {INSTRUMENT: 1.0}, NOW_MS)
+
+    assert approved.approved
+    assert isinstance(approved.plan, ApprovedQuotePlan)
+    assert approved.plan.intent is intent
+    assert approved.plan.decided_at_ms == NOW_MS
+    assert not rejected.approved
+    assert rejected.plan is None
 
 
 def test_kill_switch_trips_after_repeated_failures_and_rejects_everything() -> None:

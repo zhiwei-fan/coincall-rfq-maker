@@ -26,6 +26,7 @@ from coincall_rfq_maker.core.adapters.rest import (
 from coincall_rfq_maker.domain.quote import QuoteStage
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
+from coincall_rfq_maker.risk.gate import ApprovedQuotePlan
 
 
 class TimeoutContext:
@@ -162,15 +163,26 @@ class SequencedPostGetSession:
         return ResponseContext(status, response)
 
 
-def _quote_intent(price: float = 100.0) -> QuoteIntent:
-    return QuoteIntent(
-        request_id="rfq-1",
-        legs=(
-            QuoteLegIntent(
-                instrument_name="BTCUSD-21AUG25-120000-C",
-                price=price,
+class NoopApiReporter:
+    def record_api_failure(self) -> None:
+        pass
+
+    def record_api_success(self) -> None:
+        pass
+
+
+def _quote_intent(price: float = 100.0) -> ApprovedQuotePlan:
+    return ApprovedQuotePlan(
+        intent=QuoteIntent(
+            request_id="rfq-1",
+            legs=(
+                QuoteLegIntent(
+                    instrument_name="BTCUSD-21AUG25-120000-C",
+                    price=price,
+                ),
             ),
         ),
+        decided_at_ms=0,
     )
 
 
@@ -359,7 +371,7 @@ async def test_5xx_create_drives_lifecycle_ambiguous_verification() -> None:
     )
     client = CoincallRestClient("key", "secret")
     client._session = session  # type: ignore[assignment]
-    lifecycle = QuoteLifecycle(client, dry_run=False)
+    lifecycle = QuoteLifecycle(client, dry_run=False, api_reporter=NoopApiReporter())
 
     quote = await lifecycle.reconcile(_quote_intent())
 
@@ -387,7 +399,7 @@ async def test_5xx_cancel_drives_lifecycle_ambiguous_verification() -> None:
     )
     client = CoincallRestClient("key", "secret")
     client._session = session  # type: ignore[assignment]
-    lifecycle = QuoteLifecycle(client, dry_run=False)
+    lifecycle = QuoteLifecycle(client, dry_run=False, api_reporter=NoopApiReporter())
     await lifecycle.reconcile(_quote_intent())
 
     await lifecycle.cancel_for_rfq("rfq-1")

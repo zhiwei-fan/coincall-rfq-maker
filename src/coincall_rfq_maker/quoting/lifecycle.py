@@ -27,6 +27,7 @@ from coincall_rfq_maker.events import QuoteUpdated
 from coincall_rfq_maker.quoting.api_accounting import ApiOutcomeBoundary, ApiOutcomeReporter
 from coincall_rfq_maker.quoting.store import QuoteStore
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, matches
+from coincall_rfq_maker.risk.gate import ApprovedQuotePlan
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class QuoteLifecycle:
         dry_run: bool = True,
         api_reporter: ApiOutcomeReporter | None = None,
     ) -> None:
+        if not dry_run and api_reporter is None:
+            raise ValueError("live mode requires an api_reporter (kill-switch accounting)")
         self._rest = rest_client
         self._dry_run = dry_run
         self._store = QuoteStore()
@@ -70,8 +73,10 @@ class QuoteLifecycle:
     def evict_for_rfq(self, request_id: str) -> None:
         self._store.evict_for_rfq(request_id)
 
-    async def reconcile(self, intent: QuoteIntent) -> Quote:
-        return await self._api_boundary.run(lambda: self._reconcile(intent))
+    async def reconcile(self, plan: ApprovedQuotePlan) -> Quote:
+        if not isinstance(plan, ApprovedQuotePlan):
+            raise TypeError("quote submission requires a risk-approved plan")
+        return await self._api_boundary.run(lambda: self._reconcile(plan.intent))
 
     async def _reconcile(self, intent: QuoteIntent) -> Quote:
         """Idempotently ensure our live quote for `intent.request_id` matches `intent`."""
