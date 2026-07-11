@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -17,11 +17,16 @@ from coincall_rfq_maker.core.adapters.schemas import CreateQuoteResult, QuoteLis
 from coincall_rfq_maker.core.clock import current_time_ms
 from coincall_rfq_maker.domain.quote import Quote, QuoteLeg, QuoteStage
 from coincall_rfq_maker.events import QuoteUpdated
-from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
+from coincall_rfq_maker.quoting.lifecycle import (
+    _DISPATCHABLE_QUOTE_STAGES,
+    QuoteLifecycle,
+    UnhandledQuoteStageError,
+)
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.risk.gate import ApprovedQuotePlan, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
+PHANTOM_STAGE = cast(QuoteStage, "phantom_7th_stage")  # dataclasses don't enforce field types
 
 
 class FakeRestClient:
@@ -1227,3 +1232,195 @@ async def test_apply_ws_update_for_unknown_quote_is_ignored() -> None:
     lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=RecordingApiReporter())  # type: ignore[arg-type]
     event = QuoteUpdated(quote_id="ghost", request_id="rfq-x", stage=QuoteStage.OPEN)
     assert lifecycle.apply_ws_update(event) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", list(QuoteStage))
+async def test_withdraw_is_total_over_every_quote_stage(stage: QuoteStage) -> None:
+    expected = {
+        QuoteStage.CANCELLED: ("terminal", "q-t"),
+        QuoteStage.FILLED: ("terminal", "q-t"),
+        QuoteStage.EXPIRED: ("terminal", "q-t"),
+        QuoteStage.OPEN: ("open", "q-open"),
+        QuoteStage.PENDING_CREATE: ("pending_create", None),
+        QuoteStage.PENDING_CANCEL: ("pending_cancel", "q-pc"),
+    }
+    outcome, quote_id = expected[stage]
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    seeded = Quote(
+        request_id="rfq-1",
+        stage=stage,
+        legs=(),
+        create_time_ms=current_time_ms() - 200_000 if stage is QuoteStage.PENDING_CREATE else 0,
+        quote_id=quote_id,
+    )
+    lifecycle._store.store(seeded)
+    if stage is QuoteStage.PENDING_CANCEL:
+        rest.quote_list_response = {
+            "code": 0,
+            "data": [
+                {
+                    "requestId": "rfq-1",
+                    "quoteId": "q-pc",
+                    "state": "CANCELLED",
+                }
+            ],
+        }
+
+    withdrawn = await lifecycle.withdraw_for_rfq("rfq-1")
+
+    if outcome == "terminal":
+        assert withdrawn is seeded
+        assert rest.cancel_calls == []
+        assert rest.quote_list_calls == []
+    elif outcome == "open":
+        assert withdrawn is not None
+        assert withdrawn.stage is QuoteStage.CANCELLED
+        assert rest.cancel_calls == ["q-open"]
+        assert rest.quote_list_calls == []
+    elif outcome == "pending_create":
+        assert withdrawn is not None
+        assert withdrawn.stage is QuoteStage.CANCELLED
+        assert len(rest.quote_list_calls) == 1
+        assert rest.cancel_calls == []
+    else:
+        assert outcome == "pending_cancel"
+        assert withdrawn is not None
+        assert withdrawn.is_terminal
+        assert rest.quote_list_calls == [{"quote_id": "q-pc"}]
+        assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", list(QuoteStage))
+async def test_reconcile_is_total_over_every_quote_stage(stage: QuoteStage) -> None:
+    expected = {
+        QuoteStage.FILLED: ("filled", "q-f"),
+        QuoteStage.OPEN: ("open", "q-o"),
+        QuoteStage.CANCELLED: ("create", "q-t"),
+        QuoteStage.EXPIRED: ("create", "q-t"),
+        QuoteStage.PENDING_CREATE: ("pending_create", None),
+        QuoteStage.PENDING_CANCEL: ("ambiguous", None),
+    }
+    outcome, quote_id = expected[stage]
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    seeded = Quote(
+        request_id="rfq-1",
+        stage=stage,
+        legs=(QuoteLeg(INSTRUMENT, 2.0),),
+        create_time_ms=0,
+        quote_id=quote_id,
+    )
+    lifecycle._store.store(seeded)
+
+    if outcome == "ambiguous":
+        with pytest.raises(CoincallAmbiguousError):
+            await lifecycle.reconcile(make_intent(price=2.0))
+        assert rest.create_calls == []
+        assert rest.cancel_calls == []
+        assert rest.quote_list_calls == []
+        return
+
+    if outcome == "pending_create":
+        rest.quote_list_response = {"code": 0, "data": []}
+
+    reconciled = await lifecycle.reconcile(make_intent(price=2.0))
+
+    if outcome in {"filled", "open"}:
+        assert reconciled is seeded
+        assert rest.create_calls == []
+        assert rest.cancel_calls == []
+        assert rest.quote_list_calls == []
+    elif outcome == "create":
+        assert len(rest.create_calls) == 1
+        assert reconciled.stage is QuoteStage.OPEN
+    else:
+        assert outcome == "pending_create"
+        assert len(rest.quote_list_calls) == 1
+        assert len(rest.create_calls) == 1
+        assert reconciled.stage is QuoteStage.OPEN
+
+
+@pytest.mark.asyncio
+async def test_withdraw_unknown_quote_stage_fails_closed_before_rest_io() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=PHANTOM_STAGE,
+            legs=(QuoteLeg(INSTRUMENT, 2.0),),
+            create_time_ms=0,
+            quote_id="q-x",
+        )
+    )
+
+    with pytest.raises(UnhandledQuoteStageError):
+        await lifecycle.withdraw_for_rfq("rfq-1")
+
+    assert rest.create_calls == []
+    assert rest.cancel_calls == []
+    assert rest.quote_list_calls == []
+    assert reporter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unknown_quote_stage_fails_closed_without_overwriting_store() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=PHANTOM_STAGE,
+            legs=(QuoteLeg(INSTRUMENT, 2.0),),
+            create_time_ms=0,
+            quote_id="q-x",
+        )
+    )
+
+    with pytest.raises(UnhandledQuoteStageError):
+        await lifecycle.reconcile(make_intent())
+
+    assert rest.create_calls == []
+    assert rest.cancel_calls == []
+    assert rest.quote_list_calls == []
+    current = lifecycle._store.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is PHANTOM_STAGE
+    assert reporter.calls == []
+
+
+def test_adopt_open_exchange_quote_refuses_unknown_quote_stage() -> None:
+    rest = FakeRestClient()
+    reporter = RecordingApiReporter()
+    lifecycle = QuoteLifecycle(rest, dry_run=False, api_reporter=reporter)  # type: ignore[arg-type]
+    lifecycle._store.store(
+        Quote(
+            request_id="rfq-1",
+            stage=PHANTOM_STAGE,
+            legs=(QuoteLeg(INSTRUMENT, 2.0),),
+            create_time_ms=0,
+            quote_id="q-x",
+        )
+    )
+
+    assert lifecycle.adopt_open_exchange_quote("rfq-1", "q-new") is None
+
+
+def test_dispatchable_stage_allowlist_enumerates_exactly_the_known_stages() -> None:
+    assert _DISPATCHABLE_QUOTE_STAGES == frozenset(  # noqa: SIM300
+        {
+            QuoteStage.PENDING_CREATE,
+            QuoteStage.OPEN,
+            QuoteStage.PENDING_CANCEL,
+            QuoteStage.CANCELLED,
+            QuoteStage.FILLED,
+            QuoteStage.EXPIRED,
+        }
+    )

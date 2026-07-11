@@ -29,6 +29,37 @@ from coincall_rfq_maker.quoting.store import QuoteStore
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, matches
 from coincall_rfq_maker.risk.gate import ApprovedQuotePlan
 
+
+class UnhandledQuoteStageError(RuntimeError):
+    """A quote stage reached a lifecycle dispatcher with no explicit handling for it.
+
+    Deliberately NOT a CoincallError: orchestration's `except CoincallError` handlers
+    (orchestration.py:307/:440/:474) must not swallow it as exchange weather. It escapes
+    the dispatcher task, unwinds the TaskGroup, and CANCEL_ALL_ON_STOP flattens — the
+    fail-closed endgame for a programming error.
+    """
+
+    def __init__(self, dispatcher: str, request_id: str, stage: object) -> None:
+        super().__init__(
+            f"{dispatcher} has no explicit handling for quote stage {stage!r}"
+            f" (RFQ {request_id}); refusing to act on un-understood state"
+        )
+
+
+# Every stage _reconcile knows how to dispatch. MUST stay a literal enumeration —
+# `frozenset(QuoteStage)` would silently absorb a future 7th member (the dead-knob
+# pattern); the literal forces this file to be revisited when the enum grows.
+_DISPATCHABLE_QUOTE_STAGES = frozenset(
+    {
+        QuoteStage.PENDING_CREATE,
+        QuoteStage.OPEN,
+        QuoteStage.PENDING_CANCEL,
+        QuoteStage.CANCELLED,
+        QuoteStage.FILLED,
+        QuoteStage.EXPIRED,
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 # Matches reconciler.RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS (120s). One read proves nothing,
@@ -81,6 +112,8 @@ class QuoteLifecycle:
     async def _reconcile(self, intent: QuoteIntent) -> Quote:
         """Idempotently ensure our live quote for `intent.request_id` matches `intent`."""
         existing = self._store.get_for_rfq(intent.request_id)
+        if existing is not None and existing.stage not in _DISPATCHABLE_QUOTE_STAGES:
+            raise UnhandledQuoteStageError("_reconcile", intent.request_id, existing.stage)
         if existing is not None and existing.stage is QuoteStage.FILLED:
             return existing
         if existing is not None and existing.stage is QuoteStage.PENDING_CANCEL:
@@ -164,7 +197,7 @@ class QuoteLifecycle:
             if resolved.is_open:
                 return await self._cancel(resolved)
             return resolved
-        return existing
+        raise UnhandledQuoteStageError("_withdraw_for_rfq", request_id, existing.stage)
 
     async def settle_filled_rfq(self, request_id: str) -> Quote | None:
         return await self._api_boundary.run(lambda: self._settle_filled_rfq(request_id))
