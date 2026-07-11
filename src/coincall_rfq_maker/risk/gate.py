@@ -36,6 +36,13 @@ def _finite_positive(value: str) -> float | None:
     return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
+def _finite_expiry_ms(value: object) -> float | None:
+    """Return the expiry as a float only when it proves to be a finite real number."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def _validated_finite_positive_config(name: str, value: float) -> float:
     if (
         not isinstance(value, (int, float))
@@ -156,9 +163,13 @@ class RiskGate:
         intent: QuoteIntent,
         market_data_ages_seconds: Mapping[str, float],
         now_ms: int,
+        *,
+        option_expiries: Mapping[str, int],
     ) -> RiskDecision:
         try:
-            return self._evaluate(rfq, intent, market_data_ages_seconds, now_ms)
+            return self._evaluate(
+                rfq, intent, market_data_ages_seconds, now_ms, option_expiries=option_expiries
+            )
         except Exception as exc:  # fail closed on any unexpected error
             return self._reject(f"risk evaluation error: {exc}")
 
@@ -168,6 +179,8 @@ class RiskGate:
         intent: QuoteIntent,
         market_data_ages_seconds: Mapping[str, float],
         now_ms: int,
+        *,
+        option_expiries: Mapping[str, int],
     ) -> RiskDecision:
         if self._kill_switch_tripped:
             return self._reject("kill switch tripped")
@@ -177,12 +190,27 @@ class RiskGate:
             reason = exposure.reason or "unusable or stale exposure data"
             return self._reject(f"exposure data unavailable: {reason}")
 
-        time_to_expiry_hours = (rfq.expiry_time_ms - now_ms) / 1000 / 3600
-        if time_to_expiry_hours < self._min_tte_hours:
-            return self._reject(
-                f"RFQ {rfq.request_id} time-to-expiry {time_to_expiry_hours:.2f}h "
-                f"below minimum {self._min_tte_hours}h"
-            )
+        # Gate on each OPTION's remaining life. rfq.expiry_time_ms is the RFQ's own
+        # validity window (the taker's quote deadline) and says nothing about the
+        # instrument's risk; the gate must never read it.
+        checked_expiries: set[str] = set()
+        for leg in rfq.legs:
+            name = leg.instrument_name
+            if name in checked_expiries:
+                continue
+            checked_expiries.add(name)
+            raw_expiry = option_expiries.get(name)
+            if raw_expiry is None:
+                return self._reject(f"missing option expiry for leg {name}")
+            expiry_ms = _finite_expiry_ms(raw_expiry)
+            if expiry_ms is None:
+                return self._reject(f"leg {name} has invalid option expiry {raw_expiry!r}")
+            time_to_expiry_hours = (expiry_ms - now_ms) / 1000 / 3600
+            if time_to_expiry_hours < self._min_tte_hours:
+                return self._reject(
+                    f"leg {name} option time-to-expiry {time_to_expiry_hours:.2f}h "
+                    f"below minimum {self._min_tte_hours}h"
+                )
 
         quantities: list[float] = []
         for leg in rfq.legs:

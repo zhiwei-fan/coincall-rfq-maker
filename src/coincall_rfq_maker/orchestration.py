@@ -361,6 +361,7 @@ class Orchestrator:
 
         leg_prices = {}
         ages: dict[str, float] = {}
+        option_expiries: dict[str, int] = {}
         for name in rfq.instrument_names():
             try:
                 parsed = parse_instrument(name)
@@ -405,6 +406,7 @@ class Orchestrator:
                 return
             leg_prices[name] = leg_price
             ages[name] = self._market_data.age_seconds(instrument.underlying)
+            option_expiries[name] = expiration_ms
 
         intent = build_quote_intent(rfq, leg_prices)
         if intent is None:
@@ -415,7 +417,9 @@ class Orchestrator:
             self.rfq_store.upsert(rfq)
 
         now_ms = get_timestamp_ms()
-        decision = self._risk_gate.evaluate(rfq, intent, ages, now_ms)
+        decision = self._risk_gate.evaluate(
+            rfq, intent, ages, now_ms, option_expiries=option_expiries
+        )
         if not decision.approved or decision.plan is None:
             reason = decision.reason or "risk approval did not produce a plan"
             logger.warning("Not quoting RFQ %s: %s", request_id, reason)

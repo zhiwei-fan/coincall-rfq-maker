@@ -39,6 +39,7 @@ def test_valid_settings_apply_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.bid_vol == 0.20
     assert settings.ask_vol == 2.00
     assert settings.risk_free_rate == 0.05
+    assert settings.min_time_to_expiry_hours == 1.0
     assert settings.stale_market_data_seconds == 30.0
     assert settings.db_path == "rfq_maker.db"
     assert settings.log_file == "rfq_maker.log"

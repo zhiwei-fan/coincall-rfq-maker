@@ -43,7 +43,9 @@ from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
 from coincall_rfq_maker.reconciler import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS, Reconciler
 from coincall_rfq_maker.risk.gate import ApprovedQuotePlan, RiskDecision, RiskGate
 
-INSTRUMENT = "BTCUSD-21AUG25-120000-C"
+INSTRUMENT = "BTCUSD-21AUG49-120000-C"  # far-future: the gate now floors on OPTION expiry
+# It is derived from this symbol by FakeInstrumentCatalog, and several tests run a real RiskGate
+# at wall-clock now.
 
 
 class FakeInstrumentCatalog:
@@ -388,6 +390,33 @@ def make_rfq(request_id: str) -> Rfq:
         create_time_ms=0,
         expiry_time_ms=4_000_000_000_000,
     )
+
+
+@pytest.mark.asyncio
+async def test_reprice_gates_on_catalog_option_expiry_not_rfq_window(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    risk_gate = RiskGate(
+        max_quote_notional_usd=1_000_000.0,
+        max_leg_qty=100.0,
+        min_time_to_expiry_hours=400_000.0,
+        stale_market_data_seconds=30.0,
+    )
+    quotes = FakeQuoteLifecycle()
+    orchestrator = Orchestrator(
+        rest_client=FakeRest(),  # type: ignore[arg-type]
+        market_data=FakeMarketData(price=50_000.0),  # type: ignore[arg-type]
+        pricing_model=FakePricingModel(),  # type: ignore[arg-type]
+        risk_gate=risk_gate,
+        quote_lifecycle=quotes,  # type: ignore[arg-type]
+    )
+    orchestrator.rfq_store.upsert(make_rfq("rfq-1"))
+
+    with caplog.at_level(logging.WARNING):
+        await orchestrator.reprice_all_active()
+
+    assert quotes.reconcile_calls == 0
+    assert "option time-to-expiry" in caplog.text
 
 
 def make_rfq_payload(request_id: str = "rfq-1") -> dict[str, Any]:

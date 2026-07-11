@@ -13,6 +13,7 @@ from coincall_rfq_maker.risk.gate import (
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
 NOW_MS = 1_000_000
+OPTION_EXPIRY_MS = NOW_MS + 6 * 24 * 3600 * 1000  # 6 days out, the live-evidence shape
 
 
 class UnusableExposureProvider:
@@ -49,7 +50,13 @@ def make_intent(price: float = 100.0) -> QuoteIntent:
 
 def test_approves_within_all_limits() -> None:
     gate = make_gate()
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert decision.approved
     assert decision.reason is None
 
@@ -63,7 +70,13 @@ def test_null_exposure_provider_preserves_approval_path() -> None:
         exposure_provider=NullExposureProvider(),
     )
 
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert decision.approved
     assert decision.reason is None
@@ -78,7 +91,13 @@ def test_unusable_exposure_provider_fails_closed_with_distinct_reason() -> None:
         exposure_provider=UnusableExposureProvider(),
     )
 
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert not decision.approved
     assert decision.reason == "exposure data unavailable: stale snapshot"
@@ -86,21 +105,39 @@ def test_unusable_exposure_provider_fails_closed_with_distinct_reason() -> None:
 
 def test_rejects_leg_qty_over_max() -> None:
     gate = make_gate(max_leg_qty=0.5)
-    decision = gate.evaluate(make_rfq(quantity="1"), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(quantity="1"),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert not decision.approved
     assert "quantity" in decision.reason
 
 
 @pytest.mark.parametrize("quantity", ["nan", "inf", "-1", "0"])
 def test_rejects_non_finite_or_non_positive_leg_quantity(quantity: str) -> None:
-    decision = make_gate().evaluate(make_rfq(quantity), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = make_gate().evaluate(
+        make_rfq(quantity),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert not decision.approved
     assert decision.reason is not None and "quantity" in decision.reason
 
 
 def test_approves_finite_positive_leg_quantity() -> None:
-    decision = make_gate().evaluate(make_rfq("0.01"), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = make_gate().evaluate(
+        make_rfq("0.01"),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert decision.approved
 
@@ -118,7 +155,11 @@ def test_rejects_notional_cancellation_by_negative_quantity() -> None:
     )
 
     decision = make_gate(max_quote_notional_usd=500.0).evaluate(
-        rfq, make_intent(price=100.0), {INSTRUMENT: 1.0}, NOW_MS
+        rfq,
+        make_intent(price=100.0),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
     )
 
     assert not decision.approved
@@ -153,7 +194,13 @@ def test_rejects_invalid_kill_switch_threshold(value: object) -> None:
 
 @pytest.mark.parametrize("price", [float("nan"), math.inf, -1.0, 0.0])
 def test_rejects_non_finite_or_non_positive_intent_price(price: float) -> None:
-    decision = make_gate().evaluate(make_rfq(), make_intent(price), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = make_gate().evaluate(
+        make_rfq(),
+        make_intent(price),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert not decision.approved
     assert decision.reason is not None and "price" in decision.reason
@@ -162,7 +209,11 @@ def test_rejects_non_finite_or_non_positive_intent_price(price: float) -> None:
 def test_rejects_notional_over_max() -> None:
     gate = make_gate(max_quote_notional_usd=10.0)
     decision = gate.evaluate(
-        make_rfq(quantity="1"), make_intent(price=100.0), {INSTRUMENT: 1.0}, NOW_MS
+        make_rfq(quantity="1"),
+        make_intent(price=100.0),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
     )
     assert not decision.approved
     assert "notional" in decision.reason
@@ -170,30 +221,188 @@ def test_rejects_notional_over_max() -> None:
 
 def test_rejects_stale_market_data() -> None:
     gate = make_gate(stale_market_data_seconds=5.0)
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 999.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 999.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert not decision.approved
     assert "stale" in decision.reason
 
 
 def test_rejects_missing_market_data_age_for_intent_leg() -> None:
     gate = make_gate()
-    decision = gate.evaluate(make_rfq(), make_intent(), {}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(), make_intent(), {}, NOW_MS, option_expiries={INSTRUMENT: OPTION_EXPIRY_MS}
+    )
     assert not decision.approved
     assert decision.reason == f"missing market data age for {INSTRUMENT}"
 
 
-def test_rejects_below_min_time_to_expiry() -> None:
-    gate = make_gate(min_time_to_expiry_hours=2.0)
-    rfq = make_rfq(expiry_time_ms=NOW_MS + 60 * 1000)  # 1 minute out
-    decision = gate.evaluate(rfq, make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+def test_approves_short_rfq_window_when_option_expiry_is_far() -> None:
+    decision = make_gate().evaluate(
+        make_rfq(expiry_time_ms=NOW_MS + 30 * 60 * 1000),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
+
+    assert decision.approved
+
+
+def test_rejects_option_expiring_inside_floor_despite_long_rfq_window() -> None:
+    decision = make_gate(min_time_to_expiry_hours=2.0).evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: NOW_MS + 60 * 1000},
+    )
+
     assert not decision.approved
-    assert "expiry" in decision.reason
+    assert decision.reason is not None and "option time-to-expiry" in decision.reason
+    assert decision.reason is not None and INSTRUMENT in decision.reason
+
+
+def test_gate_ignores_rfq_window_field_entirely() -> None:
+    decision = make_gate().evaluate(
+        make_rfq(expiry_time_ms=NOW_MS - 1),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
+
+    assert decision.approved
+
+
+def test_rejects_missing_option_expiry_for_leg() -> None:
+    decision = make_gate().evaluate(
+        make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS, option_expiries={}
+    )
+
+    assert not decision.approved
+    assert decision.reason == f"missing option expiry for leg {INSTRUMENT}"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "1783584000000", True])
+def test_rejects_invalid_option_expiry_values(value: object) -> None:
+    decision = make_gate().evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: value},  # type: ignore[dict-item]
+    )
+
+    assert not decision.approved
+    assert decision.reason is not None and "invalid option expiry" in decision.reason
+
+
+def test_min_tte_boundary_is_exact_in_ms() -> None:
+    gate = make_gate(min_time_to_expiry_hours=2.0)
+
+    approved = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: NOW_MS + 7_200_000},
+    )
+    rejected = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: NOW_MS + 7_199_999},
+    )
+
+    assert approved.approved
+    assert not rejected.approved
+
+
+def test_multi_leg_rejects_if_any_leg_inside_floor() -> None:
+    other = "BTCUSD-21AUG25-130000-P"
+    rfq = Rfq(
+        request_id="rfq-1",
+        status=RfqStatus.ACTIVE,
+        legs=(
+            RfqLeg(instrument_name=INSTRUMENT, side=Side.BUY, quantity="1"),
+            RfqLeg(instrument_name=other, side=Side.BUY, quantity="1"),
+        ),
+        create_time_ms=0,
+        expiry_time_ms=NOW_MS + 10 * 3600 * 1000,
+    )
+    intent = QuoteIntent(
+        request_id="rfq-1",
+        legs=(
+            QuoteLegIntent(instrument_name=INSTRUMENT, price=100.0),
+            QuoteLegIntent(instrument_name=other, price=100.0),
+        ),
+    )
+
+    decision = make_gate().evaluate(
+        rfq,
+        intent,
+        {INSTRUMENT: 1.0, other: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS, other: NOW_MS + 30 * 60 * 1000},
+    )
+
+    assert not decision.approved
+    assert decision.reason is not None and other in decision.reason
+
+
+def test_multi_leg_approves_when_all_legs_outside_floor() -> None:
+    other = "BTCUSD-21AUG25-130000-P"
+    rfq = Rfq(
+        request_id="rfq-1",
+        status=RfqStatus.ACTIVE,
+        legs=(
+            RfqLeg(instrument_name=INSTRUMENT, side=Side.BUY, quantity="1"),
+            RfqLeg(instrument_name=other, side=Side.BUY, quantity="1"),
+        ),
+        create_time_ms=0,
+        expiry_time_ms=NOW_MS + 10 * 3600 * 1000,
+    )
+    intent = QuoteIntent(
+        request_id="rfq-1",
+        legs=(
+            QuoteLegIntent(instrument_name=INSTRUMENT, price=100.0),
+            QuoteLegIntent(instrument_name=other, price=100.0),
+        ),
+    )
+
+    decision = make_gate().evaluate(
+        rfq,
+        intent,
+        {INSTRUMENT: 1.0, other: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS, other: OPTION_EXPIRY_MS},
+    )
+
+    assert decision.approved
 
 
 def test_approval_mints_a_plan_and_rejection_does_not() -> None:
     intent = make_intent()
-    approved = make_gate().evaluate(make_rfq(), intent, {INSTRUMENT: 1.0}, NOW_MS)
-    rejected = make_gate(max_leg_qty=0.5).evaluate(make_rfq(), intent, {INSTRUMENT: 1.0}, NOW_MS)
+    approved = make_gate().evaluate(
+        make_rfq(),
+        intent,
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
+    rejected = make_gate(max_leg_qty=0.5).evaluate(
+        make_rfq(),
+        intent,
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
 
     assert approved.approved
     assert isinstance(approved.plan, ApprovedQuotePlan)
@@ -209,7 +418,13 @@ def test_kill_switch_trips_after_repeated_failures_and_rejects_everything() -> N
         gate.record_api_failure()
     assert gate.kill_switch_tripped
     assert not hasattr(gate, "reset_kill_switch")
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert not decision.approved
     assert "kill switch" in decision.reason
 
@@ -262,7 +477,13 @@ def test_explicit_kill_switch_trip_is_idempotent_and_preserves_streak() -> None:
 def test_fail_closed_on_missing_leg_price() -> None:
     gate = make_gate()
     empty_intent = QuoteIntent(request_id="rfq-1", legs=())
-    decision = gate.evaluate(make_rfq(), empty_intent, {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        empty_intent,
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert not decision.approved
 
 
@@ -281,6 +502,12 @@ def test_falsey_exposure_provider_is_not_replaced_by_null_provider() -> None:
         stale_market_data_seconds=30.0,
         exposure_provider=FalseyUnusableExposureProvider(),
     )
-    decision = gate.evaluate(make_rfq(), make_intent(), {INSTRUMENT: 1.0}, NOW_MS)
+    decision = gate.evaluate(
+        make_rfq(),
+        make_intent(),
+        {INSTRUMENT: 1.0},
+        NOW_MS,
+        option_expiries={INSTRUMENT: OPTION_EXPIRY_MS},
+    )
     assert not decision.approved
     assert decision.reason is not None and "exposure" in decision.reason
