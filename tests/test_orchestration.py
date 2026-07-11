@@ -28,14 +28,19 @@ from coincall_rfq_maker.domain.quote import Quote, QuoteStage
 from coincall_rfq_maker.domain.rfq import Rfq, RfqLeg, RfqStage, RfqStatus, Side
 from coincall_rfq_maker.events import QuoteUpdated, ReconcileTick, RepriceTick, RfqTerminated
 from coincall_rfq_maker.marketdata.instruments import InstrumentCatalog
-from coincall_rfq_maker.orchestration import Orchestrator as _Orchestrator
-from coincall_rfq_maker.orchestration import TransientOutageGate
+from coincall_rfq_maker.orchestration import (
+    Orchestrator as _Orchestrator,
+)
+from coincall_rfq_maker.orchestration import (
+    RfqStore,
+    TransientOutageGate,
+)
 from coincall_rfq_maker.persistence.outbox import AuditOutbox
 from coincall_rfq_maker.pricing import engine as pricing_engine
 from coincall_rfq_maker.pricing.engine import BlackScholesModel, LegPrice
 from coincall_rfq_maker.quoting.lifecycle import QuoteLifecycle
 from coincall_rfq_maker.quoting.strategy import QuoteIntent, QuoteLegIntent
-from coincall_rfq_maker.reconciler import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS
+from coincall_rfq_maker.reconciler import RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS, Reconciler
 from coincall_rfq_maker.risk.gate import ApprovedQuotePlan, RiskDecision, RiskGate
 
 INSTRUMENT = "BTCUSD-21AUG25-120000-C"
@@ -63,6 +68,9 @@ class FakeRest:
         self._open_request_ids = open_request_ids
         self.rfq_list_response: dict[str, Any] | None = None
         self.rfq_list_items: list[dict[str, Any]] | None = None
+        self.rfq_list_by_id_items: dict[str, list[dict[str, Any]]] = {}
+        self.rfq_list_by_id_errors: dict[str, Exception] = {}
+        self.rfq_list_calls: list[dict[str, Any]] = []
         self.get_rfq_error: Exception | None = None
         self.get_quote_error: Exception | None = None
         self.create_calls: list[tuple[str, list[dict[str, str]]]] = []
@@ -77,8 +85,14 @@ class FakeRest:
 
     async def get_rfq_list(self, **kwargs: Any) -> RfqListSnapshot:
         _mark_exchange_io_attempted()
+        self.rfq_list_calls.append(kwargs)
         if self.get_rfq_error is not None:
             raise self.get_rfq_error
+        request_id = kwargs.get("request_id")
+        if request_id is not None:
+            if request_id in self.rfq_list_by_id_errors:
+                raise self.rfq_list_by_id_errors[request_id]
+            return _rfq_payloads(self.rfq_list_by_id_items.get(request_id, []))
         if self.rfq_list_response is not None:
             return _parse_rfq_list(self.rfq_list_response)
         if self.rfq_list_items is not None:
@@ -339,6 +353,33 @@ class RecordingRiskGate:
         self.kill_switch_tripped = True
 
 
+def absent_rfq_reconciler(
+    rest: FakeRest,
+    quotes: FakeQuoteLifecycle | QuoteLifecycle | None = None,
+) -> tuple[Reconciler, RfqStore, RecordingRiskGate, list[tuple[str, RfqStatus]]]:
+    store = RfqStore()
+    store.upsert(make_rfq("rfq-1"), received_at_ms=0)
+    risk_gate = RecordingRiskGate()
+    terminal_rfqs: list[tuple[str, RfqStatus]] = []
+
+    async def on_backfill(rfq: Rfq) -> None:
+        raise AssertionError(f"unexpected RFQ backfill: {rfq.request_id}")
+
+    async def on_terminal(request_id: str, status: RfqStatus) -> None:
+        terminal_rfqs.append((request_id, status))
+
+    instance = Reconciler(
+        rest_client=rest,  # type: ignore[arg-type]
+        rfq_store=store,
+        quote_lifecycle=quotes if quotes is not None else FakeQuoteLifecycle(),  # type: ignore[arg-type]
+        risk_gate=risk_gate,  # type: ignore[arg-type]
+        on_rfq_backfill=on_backfill,
+        on_terminal_rfq=on_terminal,
+        on_api_recovery=lambda: None,
+    )
+    return instance, store, risk_gate, terminal_rfqs
+
+
 def make_rfq(request_id: str) -> Rfq:
     return Rfq(
         request_id=request_id,
@@ -385,27 +426,14 @@ class NoopApiReporter:
 
 
 @pytest.mark.asyncio
-async def test_reconciler_marks_locally_active_rfq_terminal_when_exchange_disagrees() -> None:
-    rest = FakeRest(open_request_ids=["rfq-1"])  # exchange only knows about rfq-1
-    market_data = FakeMarketData()
-    quotes = FakeQuoteLifecycle()
-    orchestrator = Orchestrator(
-        rest_client=rest,  # type: ignore[arg-type]
-        market_data=market_data,  # type: ignore[arg-type]
-        pricing_model=None,  # type: ignore[arg-type]
-        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
-        quote_lifecycle=quotes,  # type: ignore[arg-type]
-    )
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=0)
-    orchestrator.rfq_store.upsert(
-        make_rfq("rfq-2"), received_at_ms=0
-    )  # exchange has already dropped this one
+async def test_reconciler_resolves_absent_rfq_as_filled_not_expired() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.rfq_list_by_id_items["rfq-1"] = [{"requestId": "rfq-1", "state": "FILLED", "legs": []}]
+    instance, _, _, terminal_rfqs = absent_rfq_reconciler(rest)
 
-    await orchestrator.reconcile_with_exchange()
+    await instance.reconcile_with_exchange()
 
-    assert orchestrator.rfq_store.get("rfq-1").is_terminal_status is False  # type: ignore[union-attr]
-    assert orchestrator.rfq_store.get("rfq-2") is None
-    assert quotes.cancelled_for == ["rfq-2"]
+    assert terminal_rfqs == [("rfq-1", RfqStatus.FILLED)]
 
 
 @pytest.mark.asyncio
@@ -431,26 +459,85 @@ async def test_reconciler_graces_just_received_rfq_absent_from_exchange_snapshot
 
 
 @pytest.mark.asyncio
-async def test_reconciler_expires_absent_rfq_after_grace_period(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_reconciler_resolves_absent_rfq_as_cancelled() -> None:
     rest = FakeRest(open_request_ids=[])
-    quotes = FakeQuoteLifecycle()
-    orchestrator = Orchestrator(
-        rest_client=rest,  # type: ignore[arg-type]
-        market_data=FakeMarketData(),  # type: ignore[arg-type]
-        pricing_model=None,  # type: ignore[arg-type]
-        risk_gate=RecordingRiskGate(),  # type: ignore[arg-type]
-        quote_lifecycle=quotes,  # type: ignore[arg-type]
-    )
-    monkeypatch.setattr(reconciler, "get_timestamp_ms", lambda: 1_000_000)
-    received_at_ms = 1_000_000 - int((RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS + 1) * 1000)
-    orchestrator.rfq_store.upsert(make_rfq("rfq-1"), received_at_ms=received_at_ms)
+    rest.rfq_list_by_id_items["rfq-1"] = [{"requestId": "rfq-1", "state": "CANCELLED", "legs": []}]
+    instance, _, _, terminal_rfqs = absent_rfq_reconciler(rest)
 
-    await orchestrator.reconcile_with_exchange()
+    await instance.reconcile_with_exchange()
 
-    assert orchestrator.rfq_store.get("rfq-1") is None
-    assert quotes.cancelled_for == ["rfq-1"]
+    assert terminal_rfqs == [("rfq-1", RfqStatus.CANCELLED)]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_defers_unresolved_absent_rfq_across_cycles() -> None:
+    instance, store, _, terminal_rfqs = absent_rfq_reconciler(FakeRest(open_request_ids=[]))
+
+    await instance.reconcile_with_exchange()
+    await instance.reconcile_with_exchange()
+
+    assert terminal_rfqs == []
+    current = store.get("rfq-1")
+    assert current is not None
+    assert current.status is RfqStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_reconciler_defers_absent_rfq_that_is_active_by_id() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.rfq_list_by_id_items["rfq-1"] = [{"requestId": "rfq-1", "state": "ACTIVE", "legs": []}]
+    instance, store, _, terminal_rfqs = absent_rfq_reconciler(rest)
+
+    await instance.reconcile_with_exchange()
+
+    assert terminal_rfqs == []
+    current = store.get("rfq-1")
+    assert current is not None
+    assert current.status is RfqStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_reconciler_by_id_failure_strikes_and_defers_absent_rfq() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.rfq_list_by_id_errors["rfq-1"] = CoincallApiError(400, None, "bad request")
+    instance, store, risk_gate, terminal_rfqs = absent_rfq_reconciler(rest)
+
+    await instance.reconcile_with_exchange()
+
+    assert terminal_rfqs == []
+    assert store.get("rfq-1") is not None
+    assert risk_gate.failures_total == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciler_resolves_held_quote_for_absent_rfq_in_same_cycle() -> None:
+    rest = FakeRest(open_request_ids=[])
+    rest.rfq_list_by_id_items["rfq-1"] = [{"requestId": "rfq-1", "state": "FILLED", "legs": []}]
+    quotes = QuoteLifecycle(rest, dry_run=False, api_reporter=NoopApiReporter())  # type: ignore[arg-type]
+    created = await quotes.reconcile(make_intent())
+    assert created.quote_id is not None
+    rest.quote_list_responses = [
+        {"code": 0, "data": []},
+        {
+            "code": 0,
+            "data": [
+                {
+                    "requestId": "rfq-1",
+                    "quoteId": created.quote_id,
+                    "state": "FILLED",
+                    "filledPrice": 101.0,
+                }
+            ],
+        },
+    ]
+    instance, _, _, terminal_rfqs = absent_rfq_reconciler(rest, quotes)
+
+    await instance.reconcile_with_exchange()
+
+    assert terminal_rfqs == [("rfq-1", RfqStatus.FILLED)]
+    current = quotes.get_for_rfq("rfq-1")
+    assert current is not None
+    assert current.stage is QuoteStage.FILLED
 
 
 @pytest.mark.asyncio
@@ -1897,6 +1984,7 @@ async def test_reprice_tick_dispatch_reprices_active_rfqs() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_tick_dispatch_reconciles_exchange_state() -> None:
     rest = FakeRest(open_request_ids=[])
+    rest.rfq_list_by_id_items["rfq-1"] = [{"requestId": "rfq-1", "state": "CANCELLED", "legs": []}]
     quotes = FakeQuoteLifecycle()
     orchestrator = Orchestrator(
         rest_client=rest,  # type: ignore[arg-type]

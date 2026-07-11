@@ -10,7 +10,7 @@ from coincall_rfq_maker.core.adapters.rest import (
     CoincallRestClient,
     classify_api_failure,
 )
-from coincall_rfq_maker.core.adapters.schemas import rfq_from_payload
+from coincall_rfq_maker.core.adapters.schemas import rfq_from_payload, rfq_status_from_wire
 from coincall_rfq_maker.core.clock import get_timestamp_ms
 from coincall_rfq_maker.domain.quote import Quote
 from coincall_rfq_maker.domain.rfq import Rfq, RfqStatus
@@ -154,11 +154,41 @@ class Reconciler:
                     RFQ_ABSENT_FROM_OPEN_GRACE_SECONDS,
                 )
                 continue
+            # Absence proves NOT-OPEN, never a particular terminal state; only a by-id read
+            # can produce the concrete status used for a local terminal transition.
+            resolved_status = await self._resolve_absent_rfq_status(rfq.request_id)
+            if resolved_status is None:
+                logger.info(
+                    "Reconciler: absent RFQ %s unresolved; deferring to next cycle",
+                    rfq.request_id,
+                )
+                continue
+            if resolved_status is RfqStatus.ACTIVE:
+                logger.debug(
+                    "Reconciler: absent RFQ %s still ACTIVE by id; deferring",
+                    rfq.request_id,
+                )
+                continue
             logger.info(
-                "Reconciler: RFQ %s no longer open on exchange, marking terminal",
+                "Reconciler: resolved absent RFQ %s to %s",
                 rfq.request_id,
+                resolved_status,
             )
-            await self._on_terminal_rfq(rfq.request_id, RfqStatus.EXPIRED)
+            await self._on_terminal_rfq(rfq.request_id, resolved_status)
+
+    async def _resolve_absent_rfq_status(self, request_id: str) -> RfqStatus | None:
+        try:
+            snapshot = await self._rest.get_rfq_list(request_id=request_id)
+        except CoincallError as exc:
+            logger.exception("Reconciler failed to resolve absent RFQ %s by id", request_id)
+            if classify_api_failure(exc) is ApiFailureKind.PERSISTENT:
+                self._risk_gate.record_api_failure()
+            return None
+
+        for payload in snapshot.payloads:
+            if payload.request_id == request_id:
+                return rfq_status_from_wire(payload.state)
+        return None
 
     async def _reconcile_quote_state(self) -> bool:
         # Same complete-snapshot assumption as reconcile_with_exchange: quoteList OPEN does
